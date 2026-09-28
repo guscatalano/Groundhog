@@ -1,0 +1,15 @@
+# Shared base: tools every machine gets. Other Groundhogfiles pull this in with `extends`.
+version: 1
+
+apps:
+  - Git.Git
+  - Microsoft.PowerShell
+  - Microsoft.WindowsTerminal
+
+registry:
+  # Show file extensions in Explorer, for this user and for profiles created later.
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced
+    name: HideFileExt
+    type: dword
+    value: 0
+    scope: [current-user, default-user]

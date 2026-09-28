@@ -1,0 +1,7 @@
+# Link the C runtime statically: the agent must run on a clean Windows install that may not
+# have the Visual C++ redistributable (Windows Sandbox, fresh VMs).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

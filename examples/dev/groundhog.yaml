@@ -1,0 +1,36 @@
+# A developer box. Relative paths resolve against this file's location, whether it was
+# loaded from disk, a URL, or a zip bundle.
+version: 1
+extends: ../base.groundhog.yaml
+
+apps:
+  - Microsoft.VisualStudioCode
+  - id: Microsoft.DotNet.SDK.10
+  # An installer that isn't in winget; pin it so it can come from a cache and can't change.
+  # - id: internal-tool
+  #   url: https://files.example.com/internal-tool-1.2.msi
+  #   sha256: <64 hex chars>
+  #   args: ADDLOCAL=ALL
+
+files:
+  - from: config/.gitconfig
+    to: ~/.gitconfig
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
+path:
+  - C:\tools\bin
+
+registry:
+  # Dark mode for apps.
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize
+    name: AppsUseLightTheme
+    type: dword
+    value: 0
+
+run:
+  # Inline commands run in Windows PowerShell unless a shell is given.
+  - git config --global init.defaultBranch main
+  # Scripts are fetched next to this file and run from a local copy.
+  - script: scripts/post-setup.ps1
