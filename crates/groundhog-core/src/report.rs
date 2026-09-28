@@ -52,7 +52,10 @@ impl Reporter for HttpReporter {
     fn log(&self, _: &str) {}
     fn status(&self, state: &RunState) {
         if let Ok(body) = serde_json::to_vec(state) {
-            let _ = ureq::post(self.url.as_str()).header("content-type", "application/json").send(&body[..]);
+            let _ = crate::fetch::http_agent()
+                .post(self.url.as_str())
+                .header("content-type", "application/json")
+                .send(&body[..]);
         }
     }
 }

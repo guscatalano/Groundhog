@@ -1,0 +1,103 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching the workspace version) to build and publish a release.
+# Run it manually from the Actions tab to build and smoke-test without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { arch: arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Check tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object name -eq 'groundhog-agent').version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "tag $env:GITHUB_REF_NAME does not match workspace version v$version"
+          }
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p groundhog-agent -p groundhog
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release"
+          New-Item -ItemType Directory -Force dist, "stage/groundhog-${{ matrix.arch }}" | Out-Null
+          # The agent alone, so VMs can download it straight from a stable URL.
+          Copy-Item "$bin/groundhog-agent.exe" "dist/groundhog-agent-${{ matrix.arch }}.exe"
+          # The host needs the agent next to it (groundhog sandbox copies it into the sandbox).
+          Copy-Item "$bin/groundhog.exe", "$bin/groundhog-agent.exe", README.md "stage/groundhog-${{ matrix.arch }}"
+          Compress-Archive -Path "stage/groundhog-${{ matrix.arch }}/*" -DestinationPath "dist/groundhog-${{ matrix.arch }}.zip"
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          & "dist/groundhog-agent-${{ matrix.arch }}.exe" --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & "target/${{ matrix.target }}/release/groundhog.exe" plan examples/dev/groundhog.yaml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & "dist/groundhog-agent-${{ matrix.arch }}.exe" plan examples/dev/groundhog.yaml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - uses: actions/attest-build-provenance@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          subject-path: dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag $prerelease

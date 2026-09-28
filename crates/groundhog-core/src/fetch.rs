@@ -1,10 +1,12 @@
 //! Fetching bytes from `file://`, `https://` (and, when allowed, `http://`) URLs.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use url::Url;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -71,7 +73,7 @@ impl Fetcher for DefaultFetcher {
 impl DefaultFetcher {
     fn http_get(&self, url: &Url) -> Result<Vec<u8>> {
         let host = url.host_str().unwrap_or_default();
-        let mut req = ureq::get(url.as_str());
+        let mut req = http_agent().get(url.as_str());
         for rule in self.headers.iter().filter(|r| r.host.eq_ignore_ascii_case(host)) {
             req = req.header(&rule.name, &rule.value);
         }
@@ -82,6 +84,17 @@ impl DefaultFetcher {
             .read_to_vec()
             .with_context(|| format!("reading body of {url}"))
     }
+}
+
+/// The shared HTTP client. TLS goes through Windows (schannel) and trusts the machine's
+/// certificate store, so internal servers signed by an enterprise CA work like they do in a
+/// browser on the same machine.
+pub fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        let tls = TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(RootCerts::PlatformVerifier).build();
+        ureq::Agent::config_builder().tls_config(tls).build().into()
+    })
 }
 
 pub fn file_url_to_path(url: &Url) -> Result<PathBuf> {
@@ -171,6 +184,14 @@ mod tests {
         let good = sha256_hex(b"hi");
         assert!(verify_sha256(b"hi", Some(&format!("sha256:{}", good.to_uppercase())), &url).is_ok());
         assert!(verify_sha256(b"bye", Some(&good), &url).is_err());
+    }
+
+    /// Hits the network; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn fetches_over_https_with_the_windows_tls_stack() {
+        let body = DefaultFetcher::default().fetch(&Url::parse("https://github.com/").unwrap()).unwrap();
+        assert!(!body.is_empty());
     }
 
     #[test]

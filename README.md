@@ -34,6 +34,35 @@ run:
 | **`groundhog-agent.exe`** | Runs **on the machine being set up** and does all the work. It stands alone: copy it anywhere and point it at a Groundhogfile. It's a single ~2 MB file with no runtime to install. |
 | **`groundhog.exe`** | Optional **host** side. It starts a target (Windows Sandbox today; Hyper-V and Proxmox next), gives the agent a Groundhogfile and follows its progress. |
 
+## Install
+
+Download from [Releases](https://github.com/guscatalano/Groundhog/releases/latest):
+
+| Asset | Use |
+|---|---|
+| `groundhog-agent-x64.exe` / `-arm64.exe` | The agent alone. Drop it into any machine or template. |
+| `groundhog-x64.zip` / `-arm64.zip` | Host CLI plus the agent, for `groundhog sandbox` and friends. |
+| `SHA256SUMS.txt` | Checksums. Builds also carry GitHub build provenance (`gh attestation verify <file> -R guscatalano/Groundhog`). |
+
+The latest agent always lives at a stable URL, handy for bootstrapping VMs:
+
+```powershell
+Invoke-WebRequest https://github.com/guscatalano/Groundhog/releases/latest/download/groundhog-agent-x64.exe -OutFile groundhog-agent.exe
+```
+
+The binaries aren't code-signed yet, so SmartScreen may warn on first run.
+
+## Releasing
+
+Bump `version` in the root `Cargo.toml`, commit, then tag and push:
+
+```powershell
+git tag v0.2.0; git push origin v0.2.0
+```
+
+The `Release` workflow builds x64 and ARM64, smoke-tests them, and publishes the release. Tags
+with a `-` (such as `v0.2.0-rc.1`) are published as prereleases.
+
 ## Quick start
 
 ```powershell
@@ -64,7 +93,8 @@ in, like links on a web page. That makes a Groundhogfile and its config folder p
 disk, a web server and a zip.
 
 `--sha256` pins the root document (or zip), and every `sha256:` in the file pins what it
-references. For private sources, `--header "Authorization: Bearer ..."` is sent only to the
+references. HTTPS uses Windows' own TLS stack and certificate store, so internal servers signed
+by an enterprise CA work. For private sources, `--header "Authorization: Bearer ..."` is sent only to the
 source's own host.
 
 ## Caching
