@@ -39,17 +39,8 @@ pub struct Step {
     pub action: Action,
 }
 
-impl Step {
-    fn new(action: Action) -> Self {
-        let json = serde_json::to_vec(&action).expect("actions serialize");
-        let id = sha256_hex(&json)[..16].to_owned();
-        let title = title(&action);
-        Self { id, title, action }
-    }
-}
-
 fn title(action: &Action) -> String {
-    match action {
+    let base = match action {
         Action::EnsureWinget => "ensure winget is available".into(),
         Action::App(App::Winget { id, version: Some(v), .. }) => format!("install {id} {v} (winget)"),
         Action::App(App::Winget { id, .. }) => format!("install {id} (winget)"),
@@ -58,19 +49,46 @@ fn title(action: &Action) -> String {
         Action::Env { name, .. } => format!("set env {name}"),
         Action::Path { dir } => format!("add {dir} to PATH"),
         Action::Registry(r) => format!("set {}\\{}", r.key, r.name.as_deref().unwrap_or("(default)")),
-        Action::Run(RunAction::Command { command, .. }) => {
-            let first = command.lines().next().unwrap_or_default();
-            let short: String = first.chars().take(60).collect();
-            let more = short.len() < command.len();
-            format!("run: {short}{}", if more { "…" } else { "" })
-        }
+        Action::Run(RunAction::Command { command, .. }) => format!("run: {}", command_title(command)),
         Action::Run(RunAction::Script { script, .. }) => format!("run script {}", file_name(script)),
         Action::Run(RunAction::Plugin { plugin, .. }) => format!("run plugin {}", file_name(plugin)),
+    };
+    // Show what an unpinned reference resolved to, so logs say which build a machine got.
+    match resolved(action) {
+        Some(hash) => format!("{base} @{}", &hash[..8]),
+        None => base,
     }
+}
+
+fn resolved(action: &Action) -> Option<&str> {
+    match action {
+        Action::App(App::Url { resolved, .. })
+        | Action::File(FileCopy { resolved, .. })
+        | Action::Run(RunAction::Script { resolved, .. } | RunAction::Plugin { resolved, .. }) => resolved.as_deref(),
+        _ => None,
+    }
+}
+
+/// A leading `# comment` names a multi-line command; otherwise its first line does.
+fn command_title(command: &str) -> String {
+    let first = command.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+    let (text, is_comment) = match first.strip_prefix('#') {
+        Some(comment) => (comment.trim(), true),
+        None => (first, false),
+    };
+    let short: String = text.chars().take(60).collect();
+    let more = short.len() < text.len() || (!is_comment && command.trim().lines().count() > 1);
+    format!("{short}{}", if more { "…" } else { "" })
 }
 
 /// Orders the work: winget first if needed, then apps, files, env, PATH, registry, and
 /// finally custom `run` actions, which may depend on everything before them.
+///
+/// Ids work like Docker's layer cache. Declarative steps (apps, files, env, PATH, registry)
+/// are identified by their own content and are independent of each other. A `run` step is
+/// imperative and may depend on anything before it, so its id also covers every earlier
+/// step: when any of them changes (say a "latest" download resolves to a new build), that
+/// run step and every later one run again.
 pub fn plan(file: &Groundhogfile) -> Vec<Step> {
     let mut actions = Vec::new();
     if file.apps.iter().any(|a| matches!(a, App::Winget { .. })) {
@@ -82,7 +100,21 @@ pub fn plan(file: &Groundhogfile) -> Vec<Step> {
     actions.extend(file.path.iter().map(|dir| Action::Path { dir: dir.clone() }));
     actions.extend(file.registry.iter().cloned().map(Action::Registry));
     actions.extend(file.run.iter().cloned().map(Action::Run));
-    actions.into_iter().map(Step::new).collect()
+
+    let mut chain = String::new();
+    actions
+        .into_iter()
+        .map(|action| {
+            let own = sha256_hex(&serde_json::to_vec(&action).expect("actions serialize"));
+            let id = match action {
+                Action::Run(_) => sha256_hex(format!("{chain}{own}").as_bytes()),
+                _ => own,
+            }[..16]
+                .to_owned();
+            chain = sha256_hex(format!("{chain}{id}").as_bytes());
+            Step { title: title(&action), id, action }
+        })
+        .collect()
 }
 
 pub enum Outcome {
@@ -331,11 +363,41 @@ mod tests {
     }
 
     #[test]
-    fn step_ids_are_stable_and_content_based() {
+    fn run_steps_chain_like_docker_layers() {
         let a = plan(&file(&["one", "two"]));
-        let b = plan(&file(&["zero", "one", "two"]));
-        assert_eq!(a[0].id, b[1].id);
-        assert_ne!(a[0].id, a[1].id);
+        let appended = plan(&file(&["one", "two", "three"]));
+        let prepended = plan(&file(&["zero", "one", "two"]));
+        assert_eq!(a, plan(&file(&["one", "two"])), "stable");
+        assert_eq!(a[..2], appended[..2], "appending keeps earlier ids");
+        assert_ne!(a[0].id, prepended[1].id, "a change before a run step reruns it");
+    }
+
+    #[test]
+    fn declarative_steps_are_independent_and_run_steps_follow_them() {
+        let with_file = |content: &str| {
+            let mut g = file(&["unzip"]);
+            g.env.insert("A".into(), "1".into());
+            g.files.push(FileCopy {
+                from: Url::parse("https://dl.test/latest/app.zip").unwrap(),
+                to: r"C:\app.zip".into(),
+                sha256: None,
+                resolved: Some(sha256_hex(content.as_bytes())),
+            });
+            plan(&g)
+        };
+        let (v1, v2) = (with_file("build 1"), with_file("build 2"));
+        let env = |p: &[Step]| p.iter().find(|s| matches!(s.action, Action::Env { .. })).unwrap().id.clone();
+        assert_ne!(v1[0].id, v2[0].id, "new build, new file step");
+        assert_eq!(env(&v1), env(&v2), "unrelated declarative steps keep their ids");
+        assert_ne!(v1.last().unwrap().id, v2.last().unwrap().id, "the run step after it reruns");
+        assert!(v1[0].title.ends_with(&format!("@{}", &sha256_hex(b"build 1")[..8])));
+    }
+
+    #[test]
+    fn command_titles_prefer_a_leading_comment() {
+        assert_eq!(command_title("# fetch the bundle\nInvoke-WebRequest x"), "fetch the bundle");
+        assert_eq!(command_title("\n  Start-Sleep 12\n  Get-Process"), "Start-Sleep 12…");
+        assert_eq!(command_title("echo hi"), "echo hi");
     }
 
     #[test]

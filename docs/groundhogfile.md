@@ -6,6 +6,37 @@ errors, so typos fail at load time instead of being ignored.
 Steps run in this order: winget bootstrap (if any winget apps), `apps`, `files`, `env`, `path`,
 `registry`, then `run`.
 
+## When steps run again
+
+The agent records every step it finishes. On the next `apply` it runs only steps that are new
+or different, so the rules for "different" matter:
+
+- **Declarative steps** (`apps`, `files`, `env`, `path`, `registry`) are identified by their own
+  definition, **including the content they fetch**. They're independent of each other.
+- **`run` steps work like Docker layers.** A `run` step's identity also covers every step before
+  it. When anything earlier changes, that `run` step and every later one run again.
+- **Pinned vs. latest.** A reference with `sha256` is pinned: it always means those exact bytes,
+  and it can come from a cache. A reference without `sha256` **follows whatever the URL serves
+  now**. The agent fetches it while loading the file, and a new build makes the step run again.
+  `plan` and the logs show what it resolved to, such as `copy app.zip -> C:\app.zip @3f2a9c1e`.
+  The same applies to local files and folders, so editing a local script reruns it.
+
+So this downloads, unpacks and reinstalls on every apply after a new release, and does
+nothing otherwise:
+
+```yaml
+files:
+  - from: https://github.com/owner/repo/releases/latest/download/app.zip
+    to: C:\app\app.zip
+run:
+  - Expand-Archive C:\app\app.zip C:\app\current -Force
+  - C:\app\current\install.ps1
+```
+
+Because unpinned references are fetched at load time, `plan` needs network access for them,
+and a broken link fails before anything changes. If a "latest" URL moves on between loading and
+the step running, the step fails rather than installing a build you didn't plan.
+
 ## `version`
 
 ```yaml
@@ -45,7 +76,7 @@ apps:
     args: --scope machine           # extra winget arguments, verbatim
   - id: internal-tool               # a direct installer
     url: https://files.example.com/tool.msi
-    sha256: <64 hex>                # recommended; enables caching
+    sha256: <64 hex>                # pin a build (and allow caching); omit to follow latest
     args: ADDLOCAL=ALL              # installer arguments, verbatim
 ```
 
@@ -124,6 +155,15 @@ run:
 For commands and scripts, exit code 0 means success, 3010 means a restart is needed, and anything
 else fails the step. A script's shell comes from its extension (`.ps1`, `.cmd`/`.bat`, `.exe`)
 unless `shell` is set (`direct` runs the file itself).
+
+For inline PowerShell commands, if the last statement is a program that fails, its own exit code
+is kept. So a final `msiexec …` or `cmd /c …` that returns 3010 asks for a restart, instead of
+PowerShell reducing it to 1. `.ps1` scripts run with `-File` and report whatever they `exit`
+with; end them with `exit $LASTEXITCODE` to pass a program's code through.
+
+Each `run` entry is a separate process, so `$ErrorActionPreference` and variables don't carry
+over between entries. If a multi-line command starts with a `# comment`, the comment becomes the
+step's name in `plan` and the logs.
 
 ### Plugins
 

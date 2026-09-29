@@ -107,10 +107,16 @@ a cache.
 
 ## Resuming, reboots and re-runs
 
-Each step's id is a hash of what it does. The agent records finished steps, so running again:
+Each step's id is a hash of what it does, including the content it fetches. The agent records
+finished steps, so running again:
 - after a **failure** resumes at the failed step,
 - after a **restart** continues where it stopped,
-- after an **edit** runs only new or changed steps.
+- after an **edit** runs only new or changed steps,
+- after a **new release** behind an unpinned "latest" URL runs that step again, plus every `run`
+  step after it (Docker-style layers).
+
+Pin a download with `sha256` to lock it to one build; leave the pin off to follow latest. See
+[When steps run again](docs/groundhogfile.md#when-steps-run-again).
 
 When a step needs a restart, `apply` exits with **3010**. With `--reboot`, it restarts and
 continues by itself at the next logon.

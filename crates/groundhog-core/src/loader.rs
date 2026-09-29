@@ -1,5 +1,6 @@
 //! Loading a Groundhogfile from a path, URL or zip bundle, following `extends`.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -43,8 +44,52 @@ pub struct Loader<'a> {
 impl Loader<'_> {
     pub fn load(&self, root: &SourceRef) -> Result<Loaded> {
         let mut sources = Vec::new();
-        let file = self.load_ref(root, &mut Vec::new(), &mut sources)?;
+        let mut file = self.load_ref(root, &mut Vec::new(), &mut sources)?;
+        self.resolve_unpinned(&mut file, &mut sources)?;
         Ok(Loaded { file, sources })
+    }
+
+    /// Fills in `resolved` for every reference without a `sha256` pin by fetching it now.
+    /// Steps are identified by what they do, so this is what makes a "latest" URL (or an
+    /// edited local script) run again when its content changes, and only then.
+    fn resolve_unpinned(&self, file: &mut Groundhogfile, sources: &mut Vec<LoadedSource>) -> Result<()> {
+        let mut seen: HashMap<Url, String> = HashMap::new();
+        let mut resolve = |url: &Url, pinned: &Option<String>, slot: &mut Option<String>| -> Result<()> {
+            if pinned.is_some() {
+                return Ok(());
+            }
+            let hash = match seen.get(url) {
+                Some(h) => h.clone(),
+                None => {
+                    let hash = if url.scheme() == "file" && file_url_to_path(url)?.is_dir() {
+                        tree_hash(&file_url_to_path(url)?)?
+                    } else {
+                        self.content.get(url, None).with_context(|| format!("resolving {url}"))?.sha256
+                    };
+                    sources.push(LoadedSource { url: url.clone(), sha256: hash.clone() });
+                    seen.insert(url.clone(), hash.clone());
+                    hash
+                }
+            };
+            *slot = Some(hash);
+            Ok(())
+        };
+        for app in &mut file.apps {
+            if let App::Url { url, sha256, resolved, .. } = app {
+                resolve(url, sha256, resolved)?;
+            }
+        }
+        for f in &mut file.files {
+            resolve(&f.from, &f.sha256, &mut f.resolved)?;
+        }
+        for r in &mut file.run {
+            match r {
+                RunAction::Script { script: url, sha256, resolved, .. }
+                | RunAction::Plugin { plugin: url, sha256, resolved, .. } => resolve(url, sha256, resolved)?,
+                RunAction::Command { .. } => {}
+            }
+        }
+        Ok(())
     }
 
     fn load_ref(&self, r: &SourceRef, stack: &mut Vec<Url>, sources: &mut Vec<LoadedSource>) -> Result<Groundhogfile> {
@@ -96,6 +141,31 @@ impl Loader<'_> {
             .with_context(|| format!("in {url}"))?;
         Ok(merge(merged, own))
     }
+}
+
+/// A hash over a directory's relative paths and file contents, in a stable order.
+fn tree_hash(dir: &Path) -> Result<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+        for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let path = entry?.path();
+            if path.is_dir() {
+                walk(root, &path, out)?;
+            } else {
+                let rel = path.strip_prefix(root).expect("under root").to_string_lossy().replace('\\', "/");
+                out.push((rel, path));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files)?;
+    files.sort();
+    let mut manifest = Vec::new();
+    for (rel, path) in files {
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        manifest.extend_from_slice(format!("{rel}\0{}\0", fetch::sha256_hex(&bytes)).as_bytes());
+    }
+    Ok(fetch::sha256_hex(&manifest))
 }
 
 fn parse(bytes: &[u8], url: &Url) -> Result<raw::File> {
@@ -201,7 +271,13 @@ fn resolve(
                         if f.version.is_some() {
                             bail!("app '{}': 'version' only applies to winget apps", f.id);
                         }
-                        App::Url { id: f.id, url: resolve_ref(base, &u)?, sha256: pin(f.sha256)?, args: f.args }
+                        App::Url {
+                            id: f.id,
+                            url: resolve_ref(base, &u)?,
+                            sha256: pin(f.sha256)?,
+                            resolved: None,
+                            args: f.args,
+                        }
                     }
                     None => {
                         if f.sha256.is_some() {
@@ -216,7 +292,7 @@ fn resolve(
 
     let files = files
         .into_iter()
-        .map(|f| Ok(FileCopy { from: resolve_ref(base, &f.from)?, to: f.to, sha256: pin(f.sha256)? }))
+        .map(|f| Ok(FileCopy { from: resolve_ref(base, &f.from)?, to: f.to, sha256: pin(f.sha256)?, resolved: None }))
         .collect::<Result<_>>()?;
 
     if let Some(bad) = env.keys().find(|k| k.is_empty() || k.contains('=')) {
@@ -234,12 +310,19 @@ fn resolve(
                     bail!("'shell: direct' only applies to scripts; use cmd, powershell or pwsh for commands")
                 }
                 raw::RunAction::Command { command, shell } => RunAction::Command { command, shell },
-                raw::RunAction::Script { script, sha256, args, shell } => {
-                    RunAction::Script { script: resolve_ref(base, &script)?, sha256: pin(sha256)?, args, shell }
-                }
-                raw::RunAction::Plugin { plugin, sha256, with } => {
-                    RunAction::Plugin { plugin: resolve_ref(base, &plugin)?, sha256: pin(sha256)?, with }
-                }
+                raw::RunAction::Script { script, sha256, args, shell } => RunAction::Script {
+                    script: resolve_ref(base, &script)?,
+                    sha256: pin(sha256)?,
+                    resolved: None,
+                    args,
+                    shell,
+                },
+                raw::RunAction::Plugin { plugin, sha256, with } => RunAction::Plugin {
+                    plugin: resolve_ref(base, &plugin)?,
+                    sha256: pin(sha256)?,
+                    resolved: None,
+                    with,
+                },
             })
         })
         .collect::<Result<_>>()?;
@@ -353,9 +436,10 @@ mod tests {
 
     #[test]
     fn short_and_full_forms_resolve_against_the_document_url() {
-        let f = MapFetcher::default().with(
-            "https://cfg.test/dev/groundhog.yaml",
-            r#"
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/dev/groundhog.yaml",
+                r#"
 apps:
   - git.git
   - id: tool
@@ -376,7 +460,10 @@ run:
   - plugin: https://plugins.test/p.exe
     with: { a: 1 }
 "#,
-        );
+            )
+            .with("https://cfg.test/dev/config/.gitconfig", "[core]")
+            .with("https://cfg.test/dev/scripts/post.ps1", "echo")
+            .with("https://plugins.test/p.exe", "MZ");
         let dir = tempfile::tempdir().unwrap();
         let loaded = load_with(&f, "https://cfg.test/dev/groundhog.yaml", dir.path()).unwrap();
         let g = loaded.file;
@@ -390,7 +477,8 @@ run:
         assert_eq!(g.run[0], RunAction::Command { command: "echo hi".into(), shell: Shell::Powershell });
         let RunAction::Script { script, .. } = &g.run[1] else { panic!() };
         assert_eq!(script.as_str(), "https://cfg.test/dev/scripts/post.ps1");
-        assert_eq!(loaded.sources.len(), 1);
+        // The document plus the three unpinned references it resolved; the pinned app is untouched.
+        assert_eq!(loaded.sources.len(), 4);
     }
 
     #[test]
@@ -404,7 +492,8 @@ run:
                 "https://cfg.test/team/dev.json",
                 r#"{ "extends": "../base.yaml", "apps": [{ "id": "Microsoft.PowerShell" }], "env": { "B": "top" },
                     "path": ["c:\\tools"], "run": ["top-cmd"] }"#,
-            );
+            )
+            .with("https://cfg.test/gitconfig", "[core]");
         let dir = tempfile::tempdir().unwrap();
         let loaded = load_with(&f, "https://cfg.test/team/dev.json", dir.path()).unwrap();
         let g = loaded.file;
@@ -416,7 +505,44 @@ run:
         assert_eq!(g.path, ["C:\\tools\\"]);
         assert_eq!(g.run.len(), 2);
         assert_eq!(g.files[0].from.as_str(), "https://cfg.test/gitconfig");
-        assert_eq!(loaded.sources.len(), 2);
+        assert_eq!(loaded.sources.len(), 3);
+    }
+
+    #[test]
+    fn unpinned_references_resolve_to_their_content() {
+        let yaml = "files: [{ from: https://dl.test/latest/app.zip, to: C:/a.zip }, { from: https://dl.test/latest/app.zip, to: C:/b.zip }]\napps: [{ id: t, url: https://dl.test/t.msi, sha256: '0000000000000000000000000000000000000000000000000000000000000000' }]";
+        let v1 = MapFetcher::default()
+            .with("https://cfg.test/g.yaml", yaml)
+            .with("https://dl.test/latest/app.zip", "build 1");
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = load_with(&v1, "https://cfg.test/g.yaml", dir.path()).unwrap();
+
+        assert_eq!(loaded.file.files[0].resolved.as_deref(), Some(sha256_hex(b"build 1").as_str()));
+        let App::Url { resolved, .. } = &loaded.file.apps[0] else { panic!() };
+        assert_eq!(*resolved, None, "pinned entries are never fetched at load time");
+        let fetched = v1.requests.lock().unwrap().iter().filter(|u| u.contains("app.zip")).count();
+        assert_eq!(fetched, 1, "the same URL is fetched once");
+
+        let v2 = MapFetcher::default()
+            .with("https://cfg.test/g.yaml", yaml)
+            .with("https://dl.test/latest/app.zip", "build 2");
+        let again = load_with(&v2, "https://cfg.test/g.yaml", dir.path()).unwrap();
+        assert_ne!(again.file.files[0].resolved, loaded.file.files[0].resolved);
+    }
+
+    #[test]
+    fn local_folders_resolve_to_a_tree_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("cfg/sub")).unwrap();
+        std::fs::write(dir.path().join("cfg/sub/a.txt"), "one").unwrap();
+        std::fs::write(dir.path().join("groundhog.yaml"), "files: [{ from: cfg, to: C:/cfg }]").unwrap();
+        let root = dir.path().join("groundhog.yaml");
+        let first = load_with(&MapFetcher::default(), root.to_str().unwrap(), dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("cfg/sub/a.txt"), "two").unwrap();
+        let second = load_with(&MapFetcher::default(), root.to_str().unwrap(), dir.path()).unwrap();
+        assert!(first.file.files[0].resolved.is_some());
+        assert_ne!(first.file.files[0].resolved, second.file.files[0].resolved);
     }
 
     #[test]
@@ -445,6 +571,7 @@ run:
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(src.join("config")).unwrap();
+        std::fs::write(src.join("config").join("a.txt"), "a").unwrap();
         std::fs::write(src.join("groundhog.yaml"), "files: [{ from: config/a.txt, to: C:\\a.txt }]").unwrap();
 
         let loaded = load_with(&MapFetcher::default(), src.to_str().unwrap(), dir.path()).unwrap();

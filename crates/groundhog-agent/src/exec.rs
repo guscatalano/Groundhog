@@ -52,8 +52,8 @@ impl Executor for WinExecutor<'_> {
             Action::App(App::Winget { id, version, args }) => {
                 self.winget_install(id, version.as_deref(), args.as_deref(), log)
             }
-            Action::App(App::Url { url, sha256, args, .. }) => {
-                self.url_install(url, sha256.as_deref(), args.as_deref(), log)
+            Action::App(App::Url { url, sha256, resolved, args, .. }) => {
+                self.url_install(url, sha256.as_deref().or(resolved.as_deref()), args.as_deref(), log)
             }
             Action::File(f) => self.copy(f, log),
             Action::Env { name, value } => {
@@ -77,11 +77,10 @@ impl Executor for WinExecutor<'_> {
 }
 
 impl WinExecutor<'_> {
-    /// Fetches content (cache first when pinned) into `work/<kind>/<hash>/<name>`.
+    /// Fetches content into `work/<kind>/<hash>/<name>`. `sha256` is the user's pin or, for
+    /// unpinned references, the hash resolved at load time. Either way the bytes must match,
+    /// so a "latest" URL that moves on mid-run fails instead of installing a different build.
     fn download(&self, kind: &str, url: &Url, sha256: Option<&str>, log: &mut dyn FnMut(&str)) -> Result<PathBuf> {
-        if sha256.is_none() && url.scheme() != "file" {
-            log(&format!("warning: {url} is not pinned with sha256"));
-        }
         let fetched = self.content.get(url, sha256)?;
         if fetched.from_cache {
             log("using cached copy");
@@ -178,7 +177,7 @@ impl WinExecutor<'_> {
                 return Ok(Outcome::Done { changed: copy_dir(&src, &dest)? });
             }
         }
-        let bytes = self.content.get(&f.from, f.sha256.as_deref())?.bytes;
+        let bytes = self.content.get(&f.from, f.sha256.as_deref().or(f.resolved.as_deref()))?.bytes;
         let changed = write_if_different(&dest, &bytes)?;
         if changed {
             log(&format!("wrote {}", dest.display()));
@@ -196,8 +195,8 @@ impl WinExecutor<'_> {
                 };
                 exit_to_outcome(proc.run(log)?.code, "command")
             }
-            RunAction::Script { script, sha256, args, shell } => {
-                let path = self.download("scripts", script, sha256.as_deref(), log)?;
+            RunAction::Script { script, sha256, resolved, args, shell } => {
+                let path = self.download("scripts", script, sha256.as_deref().or(resolved.as_deref()), log)?;
                 let shell = match shell {
                     Some(s) => *s,
                     None => shell_for(&path)?,
@@ -215,8 +214,8 @@ impl WinExecutor<'_> {
                 proc.cwd = path.parent().map(Path::to_path_buf);
                 exit_to_outcome(proc.run(log)?.code, "script")
             }
-            RunAction::Plugin { plugin, sha256, with } => {
-                let exe = self.download("plugins", plugin, sha256.as_deref(), log)?;
+            RunAction::Plugin { plugin, sha256, resolved, with } => {
+                let exe = self.download("plugins", plugin, sha256.as_deref().or(resolved.as_deref()), log)?;
                 let scratch = self.work_dir.join("plugin-scratch");
                 std::fs::create_dir_all(&scratch)?;
                 let request = PluginRequest {
@@ -271,13 +270,20 @@ fn ps_exe(shell: Shell) -> &'static str {
 
 /// Runs an inline PowerShell command via `-EncodedCommand`, which sidesteps every quoting
 /// problem a command line can have.
+///
+/// PowerShell reduces any failure to exit code 1, which would hide a native program's 3010
+/// ("restart required"). So when the last statement failed and it was a native program, its
+/// own exit code is passed through. A success that merely left a non-zero `$LASTEXITCODE`
+/// behind (robocopy, say) still exits 0, as it did before.
 fn powershell(shell: Shell, command: &str) -> Proc {
-    // Progress records would otherwise reach stderr as CLIXML noise.
-    let command = format!(
-        "$ProgressPreference = 'SilentlyContinue'
-{command}"
+    let script = format!(
+        "$ProgressPreference = 'SilentlyContinue'\n\
+         $global:LASTEXITCODE = 0\n\
+         {command}\n\
+         if (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }} else {{ exit 1 }} }}\n\
+         exit 0\n"
     );
-    let utf16: Vec<u8> = command.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
     Proc::new(ps_exe(shell)).args([
         "-NoProfile",
@@ -370,6 +376,18 @@ mod tests {
             .code;
         assert_eq!(code, 0);
         assert_eq!(lines, [r#"it's "quoted" & fine"#]);
+    }
+
+    #[test]
+    fn inline_powershell_passes_native_exit_codes_through() {
+        let code = |cmd: &str| powershell(Shell::Powershell, cmd).run(&mut |_| {}).unwrap().code;
+        assert_eq!(code("cmd /c exit 3010"), 3010, "a failing native program keeps its code");
+        assert_eq!(code("powershell -NoProfile -Command 'exit 7'"), 7);
+        assert_eq!(code("cmd /c exit 1; Write-Output done"), 0, "a later success still succeeds");
+        assert_eq!(code("Get-Item C:/does-not-exist-groundhog"), 1, "a failing cmdlet is 1");
+        assert_eq!(code("throw 'boom'"), 1);
+        assert_eq!(code("exit 5"), 5, "an explicit exit wins");
+        assert_eq!(code("Write-Output ok"), 0);
     }
 
     #[test]

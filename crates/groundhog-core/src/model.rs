@@ -50,6 +50,10 @@ pub enum App {
         url: Url,
         #[serde(skip_serializing_if = "Option::is_none")]
         sha256: Option<String>,
+        /// Content hash found at load time when `sha256` is not pinned. Part of the step's
+        /// identity, so a new "latest" build makes the step run again.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolved: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         args: Option<String>,
     },
@@ -70,6 +74,10 @@ pub struct FileCopy {
     pub to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Content hash found at load time when `sha256` is not pinned. Part of the step's
+    /// identity, so a new "latest" build makes the step run again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +144,10 @@ pub enum RunAction {
         script: Url,
         #[serde(skip_serializing_if = "Option::is_none")]
         sha256: Option<String>,
+        /// Content hash found at load time when `sha256` is not pinned. Part of the step's
+        /// identity, so a new "latest" build makes the step run again.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolved: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         args: Option<String>,
         shell: Option<Shell>,
@@ -145,6 +157,10 @@ pub enum RunAction {
         plugin: Url,
         #[serde(skip_serializing_if = "Option::is_none")]
         sha256: Option<String>,
+        /// Content hash found at load time when `sha256` is not pinned. Part of the step's
+        /// identity, so a new "latest" build makes the step run again.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolved: Option<String>,
         with: serde_json::Value,
     },
 }

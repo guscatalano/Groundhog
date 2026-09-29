@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use groundhog_core::cache::{Cache, parse_cache_source};
+use groundhog_core::cache::{Cache, CacheSource, FolderCache, parse_cache_source};
 use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{self, RunOptions, RunState, RunStatus, StepState, now, plan, state_file};
 use groundhog_core::fetch::{DefaultFetcher, HeaderRule};
@@ -171,7 +171,13 @@ struct Session {
 
 impl Session {
     fn new(home: &Path, p: &Pending) -> Result<Self> {
-        let cache = Cache::new(p.cache.iter().map(|c| parse_cache_source(c)).collect::<Result<_>>()?);
+        // A local object store comes first: content fetched while loading (to resolve "latest"
+        // URLs) is reused when the step runs instead of being downloaded twice.
+        let mut sources: Vec<Box<dyn CacheSource>> = vec![Box::new(FolderCache { root: home.join("objects") })];
+        for c in &p.cache {
+            sources.push(parse_cache_source(c)?);
+        }
+        let cache = Cache::new(sources);
         let mut reporters: Vec<Box<dyn Reporter>> =
             vec![Box::new(ConsoleReporter), Box::new(FolderReporter { dir: home.join("last-run") })];
         for sink in &p.report {
@@ -197,8 +203,8 @@ fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<RunState> {
     let session = Session::new(home, p)?;
     let reporter = &session.reporter;
     reporter.log(&format!("groundhog-agent {} applying {}", env!("CARGO_PKG_VERSION"), p.source));
-    if !session.cache.is_empty() {
-        reporter.log(&format!("cache: {}", session.cache.describe().join(", ")));
+    if !p.cache.is_empty() {
+        reporter.log(&format!("cache: {}", p.cache.join(", ")));
     }
     if !token::is_elevated() {
         reporter.log("warning: not running elevated; machine-wide installs and HKLM changes will fail");

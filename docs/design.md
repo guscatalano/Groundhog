@@ -13,6 +13,12 @@ Sandbox, and VMs cloned from a template on Hyper-V, Proxmox or anything else.
 2. **Declarative, ordered, resumable.** A Groundhogfile describes the end state. The agent turns
    it into ordered steps whose ids are hashes of what they do. Recorded progress makes re-runs
    (after failure, restart or edit) do only what's left.
+   - A step's identity includes the **content** it references, not just the text. Unpinned
+     references ("latest" URLs, local scripts) are fetched and hashed at load time, so a new
+     build is a new step.
+   - `run` steps chain like Docker layers: each one's id covers every step before it, because
+     imperative steps usually depend on what came earlier (unpack after download, configure
+     after install). Declarative steps stay independent.
 3. **Content-addressed everything.** Anything pinned by `sha256` can come from any cache and is
    verified on arrival. Caches are plain folders or static web servers and need no trust.
 4. **Location-independent files.** References resolve relative to the document they appear in,
