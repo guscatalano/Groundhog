@@ -3,6 +3,7 @@
 //! It works on its own, with no host: copy it onto any Windows machine and point it at a
 //! path, URL or zip bundle. Hosts (Sandbox, Hyper-V, Proxmox, ...) only start it and watch.
 
+mod checks;
 mod exec;
 
 use std::path::{Path, PathBuf};

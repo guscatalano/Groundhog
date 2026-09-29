@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
-use crate::model::{App, FileCopy, Groundhogfile, RegistryValue, RunAction};
+use crate::model::{App, Check, FileCopy, Groundhogfile, RegistryValue, RunAction, ServiceState};
 use crate::report::Reporter;
 
 /// Stop asking for reboots after this many in one run; something is looping.
@@ -30,6 +30,14 @@ pub enum Action {
     Path { dir: String },
     Registry(RegistryValue),
     Run(RunAction),
+    Verify(Check),
+}
+
+impl Action {
+    /// Checks describe health, not changes: they run on every apply.
+    pub fn always_runs(&self) -> bool {
+        matches!(self, Action::Verify(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +60,7 @@ fn title(action: &Action) -> String {
         Action::Run(RunAction::Command { command, .. }) => format!("run: {}", command_title(command)),
         Action::Run(RunAction::Script { script, .. }) => format!("run script {}", file_name(script)),
         Action::Run(RunAction::Plugin { plugin, .. }) => format!("run plugin {}", file_name(plugin)),
+        Action::Verify(c) => format!("verify {}", check_title(c)),
     };
     // Show what an unpinned reference resolved to, so logs say which build a machine got.
     match resolved(action) {
@@ -66,6 +75,25 @@ fn resolved(action: &Action) -> Option<&str> {
         | Action::File(FileCopy { resolved, .. })
         | Action::Run(RunAction::Script { resolved, .. } | RunAction::Plugin { resolved, .. }) => resolved.as_deref(),
         _ => None,
+    }
+}
+
+fn check_title(c: &Check) -> String {
+    match c {
+        Check::Process { name, stable_for_ms: 0, .. } => format!("process {name} is running"),
+        Check::Process { name, stable_for_ms, .. } => {
+            format!("process {name} stays up {}s", stable_for_ms.div_ceil(1000))
+        }
+        Check::Service { name, status: ServiceState::Running, .. } => format!("service {name} is running"),
+        Check::Service { name, status: ServiceState::Stopped, .. } => format!("service {name} is stopped"),
+        Check::EventLog { provider, must_contain, must_not_contain, .. } => {
+            let mut parts: Vec<String> = must_contain.iter().map(|t| format!("include '{t}'")).collect();
+            parts.extend(must_not_contain.iter().map(|t| format!("have no '{t}'")));
+            format!("{provider} events {}", parts.join(", "))
+        }
+        Check::Port { host, port, .. } => format!("{host}:{port} accepts connections"),
+        Check::File { path, .. } => format!("{path} exists"),
+        Check::Command { command, .. } => command_title(command),
     }
 }
 
@@ -100,6 +128,7 @@ pub fn plan(file: &Groundhogfile) -> Vec<Step> {
     actions.extend(file.path.iter().map(|dir| Action::Path { dir: dir.clone() }));
     actions.extend(file.registry.iter().cloned().map(Action::Registry));
     actions.extend(file.run.iter().cloned().map(Action::Run));
+    actions.extend(file.verify.iter().cloned().map(Action::Verify));
 
     let mut chain = String::new();
     actions
@@ -234,7 +263,7 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
         steps: steps
             .iter()
             .map(|s| {
-                let already = done.contains(&s.id);
+                let already = done.contains(&s.id) && !s.action.always_runs();
                 StepState {
                     id: s.id.clone(),
                     title: s.title.clone(),
@@ -382,6 +411,7 @@ mod tests {
                 to: r"C:\app.zip".into(),
                 sha256: None,
                 resolved: Some(sha256_hex(content.as_bytes())),
+                extract: false,
             });
             plan(&g)
         };
@@ -391,6 +421,33 @@ mod tests {
         assert_eq!(env(&v1), env(&v2), "unrelated declarative steps keep their ids");
         assert_ne!(v1.last().unwrap().id, v2.last().unwrap().id, "the run step after it reruns");
         assert!(v1[0].title.ends_with(&format!("@{}", &sha256_hex(b"build 1")[..8])));
+    }
+
+    #[test]
+    fn verify_steps_run_on_every_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut g = file(&["install"]);
+        g.verify.push(Check::Port { host: "127.0.0.1".into(), port: 1, within_ms: 0 });
+        let steps = plan(&g);
+        assert_eq!(steps.last().unwrap().title, "verify 127.0.0.1:1 accepts connections");
+
+        struct Count(Vec<String>);
+        impl Executor for Count {
+            fn execute(&mut self, step: &Step, _: &dyn Reporter) -> Result<Outcome> {
+                self.0.push(step.title.clone());
+                Ok(Outcome::Done { changed: false })
+            }
+        }
+        let url = Url::parse("https://cfg.test/g.yaml").unwrap();
+        let opts = || RunOptions { source: &url, sources: vec![], state_path: &path, fresh: false };
+        let mut exec = Count(vec![]);
+        run(&steps, &mut exec, &NullReporter, opts()).unwrap();
+        run(&steps, &mut exec, &NullReporter, opts()).unwrap();
+        assert_eq!(
+            exec.0,
+            ["run: install", "verify 127.0.0.1:1 accepts connections", "verify 127.0.0.1:1 accepts connections"]
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 pub mod env;
 pub mod process;
 pub mod registry;
+pub mod system;
 pub mod tasks;
 pub mod token;
 pub mod winget;

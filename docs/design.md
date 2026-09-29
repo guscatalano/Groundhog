@@ -75,5 +75,10 @@ task, restarts, and continues. It gives up after 5 restarts in one run.
   plus a catalog of where known apps keep their settings).
 - **`groundhog cache serve`**: a tiny static server for a cache folder.
 - **Lock mode**: re-apply exactly the hashes recorded by an earlier run.
+- **`stop:` on `files:` entries**: stop named services or processes before replacing files, and
+  restart services afterwards (Restart Manager can report who holds a file).
+- **`github:` sources** (`github:owner/repo@latest/asset.zip`): resolve through the releases API,
+  so logs show the release tag and `plan` can use GitHub's published asset digest instead of
+  downloading to find out what "latest" is.
 - More built-in steps: services, optional features, ACLs, symlinks, file associations.
 - Signed Groundhogfiles, checked against a key built into a template.

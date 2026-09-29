@@ -4,6 +4,7 @@
 //! Nothing here touches the machine being configured; that is the agent's job, through the
 //! [`engine::Executor`] trait.
 
+pub mod archive;
 pub mod cache;
 pub mod content;
 pub mod engine;

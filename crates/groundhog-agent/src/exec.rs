@@ -1,9 +1,11 @@
 //! Carrying out steps on this machine.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
+use groundhog_core::archive;
 use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{Action, Executor, Outcome, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
@@ -36,11 +38,13 @@ pub struct WinExecutor<'a> {
     content: &'a ContentStore<'a>,
     work_dir: PathBuf,
     winget: Option<PathBuf>,
+    /// When this apply started, for checks that only look at what happened since.
+    started: SystemTime,
 }
 
 impl<'a> WinExecutor<'a> {
     pub fn new(content: &'a ContentStore<'a>, work_dir: PathBuf) -> Self {
-        Self { content, work_dir, winget: None }
+        Self { content, work_dir, winget: None, started: SystemTime::now() }
     }
 }
 
@@ -72,6 +76,10 @@ impl Executor for WinExecutor<'_> {
             }
             Action::Registry(r) => set_registry(r),
             Action::Run(r) => self.run_action(r, log),
+            Action::Verify(c) => {
+                crate::checks::run(c, self.started, log)?;
+                Ok(Outcome::Done { changed: false })
+            }
         }
     }
 }
@@ -178,6 +186,11 @@ impl WinExecutor<'_> {
             }
         }
         let bytes = self.content.get(&f.from, f.sha256.as_deref().or(f.resolved.as_deref()))?.bytes;
+        if f.extract {
+            replace_with_zip(&bytes, &dest)?;
+            log(&format!("unpacked into {}", dest.display()));
+            return Ok(Outcome::Done { changed: true });
+        }
         let changed = write_if_different(&dest, &bytes)?;
         if changed {
             log(&format!("wrote {}", dest.display()));
@@ -275,7 +288,7 @@ fn ps_exe(shell: Shell) -> &'static str {
 /// ("restart required"). So when the last statement failed and it was a native program, its
 /// own exit code is passed through. A success that merely left a non-zero `$LASTEXITCODE`
 /// behind (robocopy, say) still exits 0, as it did before.
-fn powershell(shell: Shell, command: &str) -> Proc {
+pub(crate) fn powershell(shell: Shell, command: &str) -> Proc {
     let script = format!(
         "$ProgressPreference = 'SilentlyContinue'\n\
          $global:LASTEXITCODE = 0\n\
@@ -335,6 +348,57 @@ fn write_if_different(dest: &Path, bytes: &[u8]) -> Result<bool> {
     Ok(true)
 }
 
+/// Unpacks a zip into `dest`, replacing its previous contents as a whole: files the new
+/// archive no longer has disappear, and a failure never leaves a half-unpacked folder.
+///
+/// The archive is unpacked next to `dest` first, then swapped in with two renames. Windows
+/// allows the rename even while a program runs from the old folder; that program keeps
+/// running from the renamed copy, which is removed once nothing holds it (on this run or a
+/// later one). The rename fails only when a file inside is open without delete sharing, and
+/// then nothing has changed.
+fn replace_with_zip(bytes: &[u8], dest: &Path) -> Result<()> {
+    let name = dest.file_name().context("destination has no folder name")?.to_string_lossy().into_owned();
+    let sibling = |suffix: &str| dest.with_file_name(format!("{name}{suffix}"));
+    let staging = sibling(".groundhog-new");
+    let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let old = sibling(&format!(".groundhog-old-{stamp}"));
+
+    remove_old_copies(dest, &name);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).with_context(|| format!("removing leftover {}", staging.display()))?;
+    }
+    std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
+    if let Err(e) = archive::unzip(bytes, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    if dest.exists()
+        && let Err(e) = std::fs::rename(dest, &old)
+    {
+        let _ = std::fs::remove_dir_all(&staging);
+        bail!("cannot replace {}: {e}. A program has a file in it open; stop it first", dest.display());
+    }
+    if let Err(e) = std::fs::rename(&staging, dest) {
+        let _ = std::fs::rename(&old, dest);
+        bail!("moving the new contents into {}: {e}", dest.display());
+    }
+    remove_old_copies(dest, &name);
+    Ok(())
+}
+
+/// Best effort: previous versions set aside by [`replace_with_zip`] that nothing uses anymore.
+fn remove_old_copies(dest: &Path, name: &str) {
+    let Some(parent) = dest.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    let prefix = format!("{name}.groundhog-old");
+    for entry in entries.filter_map(Result::ok) {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 fn copy_dir(src: &Path, dest: &Path) -> Result<bool> {
     let mut changed = false;
     for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
@@ -352,6 +416,43 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_a_folder_drops_stale_files_and_survives_a_running_program() {
+        let zip = |files: &[(&str, &str)]| {
+            use std::io::Write;
+            let mut bytes = Vec::new();
+            let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            for (name, body) in files {
+                z.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+                z.write_all(body.as_bytes()).unwrap();
+            }
+            z.finish().unwrap();
+            bytes
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("app");
+        replace_with_zip(&zip(&[("a.txt", "1"), ("sub/stale.txt", "x")]), &dest).unwrap();
+        replace_with_zip(&zip(&[("a.txt", "2")]), &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "2");
+        assert!(!dest.join("sub").exists(), "files the new archive lacks are gone");
+
+        // A program running from the folder doesn't block an update, even twice in a row.
+        std::fs::copy(r"C:\Windows\System32\cmd.exe", dest.join("holder.exe")).unwrap();
+        let mut holder = std::process::Command::new(dest.join("holder.exe"))
+            .args(["/c", "ping -n 3 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        replace_with_zip(&zip(&[("a.txt", "3")]), &dest).unwrap();
+        replace_with_zip(&zip(&[("a.txt", "4")]), &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "4");
+        holder.wait().unwrap();
+
+        // Once nothing holds the old copy, the next update cleans it up.
+        replace_with_zip(&zip(&[("a.txt", "5")]), &dest).unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["app"], "no leftovers");
+    }
 
     #[test]
     fn copies_directories_idempotently() {

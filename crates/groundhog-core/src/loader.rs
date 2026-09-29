@@ -1,18 +1,18 @@
 //! Loading a Groundhogfile from a path, URL or zip bundle, following `extends`.
 
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::archive;
 use crate::content::ContentStore;
 use crate::fetch::{self, file_url_to_path};
 use crate::model::{
-    App, CURRENT_VERSION, FileCopy, Groundhogfile, HiveScope, RegistryData, RegistryType, RegistryValue, RunAction,
-    Shell, SourceRef, raw,
+    App, CURRENT_VERSION, Check, FileCopy, Groundhogfile, HiveScope, RegistryData, RegistryType, RegistryValue,
+    RunAction, ServiceState, Shell, SourceRef, raw,
 };
 
 /// File names looked for when a source is a directory or a zip bundle, in order.
@@ -120,7 +120,7 @@ impl Loader<'_> {
 
         let doc = self.content.get(&url, sha256.as_deref())?;
         sources.push(LoadedSource { url: url.clone(), sha256: doc.sha256.clone() });
-        let raw = parse(&doc.bytes, &url)?;
+        let mut raw = parse(&doc.bytes, &url)?;
 
         if let Some(v) = raw.version
             && v > CURRENT_VERSION
@@ -130,15 +130,14 @@ impl Loader<'_> {
 
         stack.push(url.clone());
         let mut merged = Groundhogfile::default();
-        for base in raw.extends.into_vec() {
+        for base in std::mem::take(&mut raw.extends).into_vec() {
             let base = resolve_source_ref(&url, base)?;
             let base = self.load_ref(&base, stack, sources).with_context(|| format!("loading base of {url}"))?;
             merged = merge(merged, base);
         }
         stack.pop();
 
-        let own = resolve(&url, raw.apps, raw.files, raw.env, raw.path, raw.registry, raw.run)
-            .with_context(|| format!("in {url}"))?;
+        let own = resolve(&url, raw).with_context(|| format!("in {url}"))?;
         Ok(merge(merged, own))
     }
 }
@@ -206,21 +205,8 @@ fn extract_zip(bytes: &[u8], dir: &Path) -> Result<()> {
     if dir.exists() {
         std::fs::remove_dir_all(dir)?;
     }
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let rel = entry.enclosed_name().ok_or_else(|| anyhow!("unsafe path in zip: {}", entry.name()))?;
-        let out = dir.join(rel);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&out)?;
-        } else {
-            if let Some(parent) = out.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut f = std::fs::File::create(&out)?;
-            std::io::copy(&mut entry, &mut f)?;
-        }
-    }
+    std::fs::create_dir_all(dir)?;
+    archive::unzip(bytes, dir)?;
     std::fs::write(marker, b"")?;
     Ok(())
 }
@@ -252,15 +238,8 @@ fn pin(sha256: Option<String>) -> Result<Option<String>> {
     sha256.map(|s| fetch::normalize_sha256(&s)).transpose()
 }
 
-fn resolve(
-    base: &Url,
-    apps: Vec<raw::App>,
-    files: Vec<raw::FileCopy>,
-    env: std::collections::BTreeMap<String, String>,
-    path: Vec<String>,
-    registry: Vec<raw::RegistryValue>,
-    run: Vec<raw::RunAction>,
-) -> Result<Groundhogfile> {
+fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
+    let raw::File { apps, files, env, path, registry, run, verify, .. } = raw;
     let apps = apps
         .into_iter()
         .map(|a| {
@@ -292,7 +271,13 @@ fn resolve(
 
     let files = files
         .into_iter()
-        .map(|f| Ok(FileCopy { from: resolve_ref(base, &f.from)?, to: f.to, sha256: pin(f.sha256)?, resolved: None }))
+        .map(|f| {
+            let from = resolve_ref(base, &f.from)?;
+            if f.extract && !from.path().to_ascii_lowercase().ends_with(".zip") {
+                bail!("'{}': 'extract' needs a .zip file", f.from);
+            }
+            Ok(FileCopy { from, to: f.to, sha256: pin(f.sha256)?, resolved: None, extract: f.extract })
+        })
         .collect::<Result<_>>()?;
 
     if let Some(bad) = env.keys().find(|k| k.is_empty() || k.contains('=')) {
@@ -327,7 +312,111 @@ fn resolve(
         })
         .collect::<Result<_>>()?;
 
-    Ok(Groundhogfile { apps, files, env, path, registry, run })
+    let verify = verify
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| resolve_check(c).with_context(|| format!("verify[{i}]")))
+        .collect::<Result<_>>()?;
+
+    Ok(Groundhogfile { apps, files, env, path, registry, run, verify })
+}
+
+/// How long a check keeps retrying before it fails, unless it says otherwise. Checks usually
+/// run right after an install, so a little grace beats a hand-written `Start-Sleep`.
+const DEFAULT_WITHIN_MS: u64 = 30_000;
+
+fn resolve_check(c: raw::Check) -> Result<Check> {
+    let kinds = [
+        ("process", c.process.is_some()),
+        ("service", c.service.is_some()),
+        ("eventlog", c.eventlog.is_some()),
+        ("port", c.port.is_some()),
+        ("file", c.file.is_some()),
+        ("command", c.command.is_some()),
+    ];
+    let set: Vec<&str> = kinds.iter().filter(|(_, on)| *on).map(|(k, _)| *k).collect();
+    let kind = match set.as_slice() {
+        [one] => *one,
+        [] => bail!("a check needs one of: process, service, eventlog, port, file, command"),
+        many => bail!("a check can only be one kind, but this one sets {}", many.join(" and ")),
+    };
+
+    // Options that only make sense for some kinds.
+    let allowed: &[&str] = match kind {
+        "process" => &["stable-for", "within"],
+        "service" => &["status", "within"],
+        "eventlog" => &[],
+        "port" => &["host", "within"],
+        "file" => &["within"],
+        _ => &["shell", "within"],
+    };
+    let given = [
+        ("host", c.host.is_some()),
+        ("status", c.status.is_some()),
+        ("shell", c.shell.is_some()),
+        ("stable-for", c.stable_for.is_some()),
+        ("within", c.within.is_some()),
+    ];
+    if let Some((opt, _)) = given.iter().find(|(opt, on)| *on && !allowed.contains(opt)) {
+        bail!("'{opt}' doesn't apply to a {kind} check");
+    }
+
+    let within_ms = match c.within {
+        Some(d) => duration_ms(d)?,
+        None => DEFAULT_WITHIN_MS,
+    };
+    Ok(match kind {
+        "process" => Check::Process {
+            name: c.process.expect("kind"),
+            stable_for_ms: c.stable_for.map(duration_ms).transpose()?.unwrap_or(0),
+            within_ms,
+        },
+        "service" => Check::Service {
+            name: c.service.expect("kind"),
+            status: c.status.unwrap_or(ServiceState::Running),
+            within_ms,
+        },
+        "eventlog" => {
+            let e = c.eventlog.expect("kind");
+            let must_contain = e.must_contain.map(raw::OneOrMany::into_vec).unwrap_or_default();
+            let must_not_contain = e.must_not_contain.map(raw::OneOrMany::into_vec).unwrap_or_default();
+            if must_contain.is_empty() && must_not_contain.is_empty() {
+                bail!("an eventlog check needs 'must-contain' or 'must-not-contain'");
+            }
+            Check::EventLog {
+                log: e.log.unwrap_or_else(|| "Application".to_owned()),
+                provider: e.provider,
+                must_contain,
+                must_not_contain,
+                since: e.since,
+            }
+        }
+        "port" => Check::Port {
+            host: c.host.unwrap_or_else(|| "127.0.0.1".to_owned()),
+            port: c.port.expect("kind"),
+            within_ms,
+        },
+        "file" => Check::File { path: c.file.expect("kind"), within_ms },
+        _ => {
+            let shell = c.shell.unwrap_or_default();
+            if shell == Shell::Direct {
+                bail!("'shell: direct' only applies to scripts");
+            }
+            Check::Command { command: c.command.expect("kind"), shell, within_ms }
+        }
+    })
+}
+
+fn duration_ms(d: raw::Duration) -> Result<u64> {
+    let ms = match d {
+        raw::Duration::Seconds(s) => s.saturating_mul(1000),
+        raw::Duration::Text(t) => {
+            let parsed = humantime::parse_duration(t.trim())
+                .map_err(|e| anyhow!("invalid duration '{t}' ({e}); use e.g. 30s, 2m or 500ms"))?;
+            u64::try_from(parsed.as_millis()).unwrap_or(u64::MAX)
+        }
+    };
+    Ok(ms)
 }
 
 fn resolve_registry(r: raw::RegistryValue) -> Result<RegistryValue> {
@@ -410,7 +499,10 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
     let mut run = base.run;
     run.extend(top.run);
 
-    Groundhogfile { apps, files, env, path, registry, run }
+    let mut verify = base.verify;
+    verify.extend(top.verify);
+
+    Groundhogfile { apps, files, env, path, registry, run, verify }
 }
 
 /// Convenience for callers: turns user input plus an optional pin into a [`SourceRef`].
@@ -420,7 +512,7 @@ pub fn source_ref(input: &str, sha256: Option<String>, cwd: &Path) -> Result<Sou
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Cursor, Write};
 
     use super::*;
     use crate::cache::Cache;
@@ -543,6 +635,74 @@ run:
         let second = load_with(&MapFetcher::default(), root.to_str().unwrap(), dir.path()).unwrap();
         assert!(first.file.files[0].resolved.is_some());
         assert_ne!(first.file.files[0].resolved, second.file.files[0].resolved);
+    }
+
+    #[test]
+    fn parses_verify_checks_with_defaults() {
+        let f = MapFetcher::default().with(
+            "https://cfg.test/g.yaml",
+            r#"
+verify:
+  - process: rdpeek-agent
+    stable-for: 8s
+    within: 1m
+  - service: RdpeekAgentSvc
+  - eventlog: { provider: RdpeekAgentSvc, must-not-contain: '0xC0000142' }
+  - port: 3389
+  - file: C:\rdpeek\bundle\rdpeek-agent.exe
+    within: 5
+  - command: Test-Path C:\x
+"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let v = load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap().file.verify;
+        assert_eq!(v[0], Check::Process { name: "rdpeek-agent".into(), stable_for_ms: 8000, within_ms: 60_000 });
+        assert_eq!(
+            v[1],
+            Check::Service {
+                name: "RdpeekAgentSvc".into(),
+                status: ServiceState::Running,
+                within_ms: DEFAULT_WITHIN_MS
+            }
+        );
+        let Check::EventLog { log, must_not_contain, since, .. } = &v[2] else { panic!() };
+        assert_eq!(
+            (log.as_str(), must_not_contain.as_slice(), *since),
+            ("Application", &["0xC0000142".to_owned()][..], crate::model::EventsSince::Apply)
+        );
+        assert_eq!(v[3], Check::Port { host: "127.0.0.1".into(), port: 3389, within_ms: DEFAULT_WITHIN_MS });
+        assert!(matches!(&v[4], Check::File { within_ms: 5000, .. }));
+        assert!(matches!(&v[5], Check::Command { shell: Shell::Powershell, .. }));
+    }
+
+    #[test]
+    fn rejects_malformed_checks_with_useful_errors() {
+        let cases = [
+            ("verify: [{ process: a, service: b }]", "only be one kind"),
+            ("verify: [{ within: 5s }]", "needs one of"),
+            ("verify: [{ service: a, stable-for: 5s }]", "'stable-for' doesn't apply to a service check"),
+            ("verify: [{ process: a, within: soon }]", "invalid duration"),
+            ("verify: [{ eventlog: { provider: p } }]", "must-contain"),
+            ("verify: [{ proces: a }]", "unknown field"),
+            ("files: [{ from: a.txt, to: C:/a, extract: true }]", "needs a .zip"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (yaml, want) in cases {
+            let f = MapFetcher::default().with("https://cfg.test/g.yaml", yaml).with("https://cfg.test/a.txt", "x");
+            let err = format!("{:#}", load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap_err());
+            assert!(err.contains(want), "{yaml}: expected '{want}' in: {err}");
+        }
+    }
+
+    #[test]
+    fn verify_accumulates_across_extends() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/base.yaml", "verify: [{ port: 22 }]")
+            .with("https://cfg.test/top.yaml", "extends: base.yaml\nverify: [{ port: 3389 }]");
+        let dir = tempfile::tempdir().unwrap();
+        let v = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file.verify;
+        let ports: Vec<_> = v.iter().map(|c| if let Check::Port { port, .. } = c { *port } else { 0 }).collect();
+        assert_eq!(ports, [22, 3389]);
     }
 
     #[test]

@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "groundhog"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "groundhog-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -345,11 +345,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "url",
+ "zip",
 ]
 
 [[package]]
 name = "groundhog-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -367,9 +368,10 @@ dependencies = [
 
 [[package]]
 name = "groundhog-win"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "humantime",
  "windows-sys",
  "winreg",
 ]

@@ -23,6 +23,70 @@ pub struct Groundhogfile {
     pub path: Vec<String>,
     pub registry: Vec<RegistryValue>,
     pub run: Vec<RunAction>,
+    pub verify: Vec<Check>,
+}
+
+/// A health check. Unlike every other step, checks run on every apply, after everything else,
+/// and a failed check fails the apply.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "check", rename_all = "kebab-case")]
+pub enum Check {
+    /// A process with this image name (`.exe` optional) is running and, with `stable_for_ms`,
+    /// keeps the same PID for that long.
+    Process {
+        name: String,
+        stable_for_ms: u64,
+        within_ms: u64,
+    },
+    Service {
+        name: String,
+        status: ServiceState,
+        within_ms: u64,
+    },
+    /// Looks at events from `provider` in `log`. Text matching is a case-insensitive substring
+    /// test against each event's rendered message.
+    EventLog {
+        log: String,
+        provider: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        must_contain: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        must_not_contain: Vec<String>,
+        since: EventsSince,
+    },
+    /// Something accepts TCP connections on `host:port`.
+    Port {
+        host: String,
+        port: u16,
+        within_ms: u64,
+    },
+    File {
+        path: String,
+        within_ms: u64,
+    },
+    /// Anything else: the check passes when the command exits 0.
+    Command {
+        command: String,
+        shell: Shell,
+        within_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceState {
+    Running,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EventsSince {
+    /// Only events logged since this apply started, so old failures don't count.
+    #[default]
+    Apply,
+    /// Any event still in the log.
+    Any,
 }
 
 /// A reference to another resource, optionally pinned to a content hash.
@@ -78,6 +142,9 @@ pub struct FileCopy {
     /// identity, so a new "latest" build makes the step run again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved: Option<String>,
+    /// `from` is a zip; unpack it into the folder `to`, replacing what was there.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub extract: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,7 +238,7 @@ pub(crate) mod raw {
 
     use serde::Deserialize;
 
-    use super::{HiveScope, RegistryType, Shell};
+    use super::{EventsSince, HiveScope, RegistryType, ServiceState, Shell};
 
     #[derive(Debug, Default, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -191,6 +258,47 @@ pub(crate) mod raw {
         pub registry: Vec<RegistryValue>,
         #[serde(default)]
         pub run: Vec<RunAction>,
+        #[serde(default)]
+        pub verify: Vec<Check>,
+    }
+
+    /// One flat shape for every check kind, so a typo gets a precise "unknown field" error;
+    /// the loader then checks that exactly one kind key is set and the options fit it.
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct Check {
+        pub process: Option<String>,
+        pub service: Option<String>,
+        pub eventlog: Option<EventLog>,
+        pub port: Option<u16>,
+        pub file: Option<String>,
+        pub command: Option<String>,
+        pub host: Option<String>,
+        pub status: Option<ServiceState>,
+        pub shell: Option<Shell>,
+        pub stable_for: Option<Duration>,
+        pub within: Option<Duration>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct EventLog {
+        pub provider: String,
+        pub log: Option<String>,
+        #[serde(default)]
+        pub must_contain: Option<OneOrMany<String>>,
+        #[serde(default)]
+        pub must_not_contain: Option<OneOrMany<String>>,
+        #[serde(default)]
+        pub since: EventsSince,
+    }
+
+    /// `30s`, `2m`, `500ms`, or a bare number of seconds.
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    pub enum Duration {
+        Seconds(u64),
+        Text(String),
     }
 
     #[derive(Debug, Deserialize)]
@@ -246,6 +354,8 @@ pub(crate) mod raw {
         pub from: String,
         pub to: String,
         pub sha256: Option<String>,
+        #[serde(default)]
+        pub extract: bool,
     }
 
     #[derive(Debug, Deserialize)]

@@ -105,6 +105,22 @@ re-verified, so a cache never has to be trusted. Writable folder caches are fill
 downloads, so the first machine warms the cache for the rest. Only pinned content can come from
 a cache.
 
+## Checking the result
+
+`verify:` checks run at the end of **every** apply and fail it if the machine isn't healthy:
+
+```yaml
+verify:
+  - process: my-agent
+    stable-for: 8s          # catches crash loops
+  - service: MyAgentSvc
+  - eventlog: { provider: MyAgentSvc, must-not-contain: '0xC0000142' }
+  - port: 3389
+```
+
+Each check retries until it passes or its deadline (`within`, default 30s) runs out. See
+[the reference](docs/groundhogfile.md#verify).
+
 ## Resuming, reboots and re-runs
 
 Each step's id is a hash of what it does, including the content it fetches. The agent records
