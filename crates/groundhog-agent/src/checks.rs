@@ -8,7 +8,6 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Result, bail};
 use groundhog_core::model::{Check, EventsSince, ServiceState, Shell};
 use groundhog_win::env;
-use groundhog_win::process::Proc;
 use groundhog_win::system::{self, ServiceStatus};
 
 use crate::exec::powershell;
@@ -53,7 +52,7 @@ pub fn run(check: &Check, started: SystemTime, log: &mut dyn FnMut(&str)) -> Res
         Check::Command { command, shell, within_ms } => wait(*within_ms, log, || {
             let mut output = Vec::new();
             let proc = match shell {
-                Shell::Cmd => Proc::new("cmd.exe").args(["/d", "/s", "/c"]).raw(Some(&format!("\"{command}\""))),
+                Shell::Cmd => crate::exec::cmd(command)?,
                 _ => powershell(*shell, command),
             };
             let code = proc.run(&mut |l| output.push(l.to_owned()))?.code;

@@ -142,6 +142,44 @@ it in. A program still running from the old folder keeps working from a renamed 
 removed once it's no longer in use. If a file in the folder is held open in a way that blocks
 the swap, the step fails before anything changes.
 
+`strip: 2` drops that many leading folders from every path in the zip, the way
+`tar --strip-components` does. GitHub source archives wrap everything in a folder named after
+the version (`findneedle-1.0.267\`); `strip: 1` removes it, so paths stay the same across
+versions.
+
+### Files from GitHub releases
+
+```yaml
+files:
+  - from: github:guscatalano/findneedle@latest/release.zip   # an asset of the newest release
+    prerelease: true                                         # count prereleases as "newest"
+    to: C:\fn\app
+    extract: true
+  - from: github:guscatalano/findneedle@latest/source        # that same release's source code
+    prerelease: true
+    to: C:\fn\src
+    extract: true
+    strip: 1
+```
+
+`github:OWNER/REPO@REF/ASSET` asks GitHub's releases API for a release: `@latest`, or a tag
+such as `@1.0.267`. `ASSET` is an asset's file name, or `source` for the release's source code
+as a zip. This works in `files:` and in `apps:` (`url: github:…`).
+
+- **Consistent:** each release is looked up once per load, so every `@latest` in a file (an
+  app and the source of its tests, say) resolves to the same release.
+- **Prereleases:** GitHub's own "latest" ignores prereleases. A repository that only publishes
+  prereleases has no latest release until you add `prerelease: true`, and the error says so.
+- **Verified without downloading:** when GitHub publishes an asset's SHA-256 (its digest), that
+  becomes the pin. The download is checked against it and can come from a cache, and `plan`
+  knows the build without downloading it. Source archives have no published digest, so they're
+  resolved by content like any other unpinned download.
+- **Readable:** `plan` and the logs show the release tag, as in
+  `copy release.zip -> C:\fn\app @1.0.267`.
+- **Rate limits:** unauthenticated API calls are limited to 60 an hour per IP address. For
+  more, pass a token for the API host:
+  `--header "api.github.com=Authorization: Bearer <token>"`.
+
 ## `env` and `path`
 
 ```yaml
@@ -184,7 +222,22 @@ run:
     sha256: <64 hex>
   - plugin: plugins/configure-thing.exe            # see below
     with: { any: [structured, data] }
+  - command: dotnet test C:\src\Tests.csproj
+    timeout: 30m                                   # stop it (and everything it started) after 30 minutes
+    always: true                                   # run on every apply, not only when something changed
 ```
+
+`timeout` works on every kind of `run` entry and on `apps` (`timeout: 20m`). When it's reached,
+the step and **every process it started** are stopped, and the step fails with its last few
+lines of output. Without a timeout, a hung installer or build would stall an unattended VM
+forever.
+
+`always: true` runs the step on every apply. Normally a finished step is skipped until
+something about it changes; this is for steps whose point is to run each time, such as a test
+suite.
+
+Unknown keys in a `run` entry are errors (`timout:` is reported, not ignored), and each entry
+must set exactly one of `command`, `script` or `plugin`.
 
 For commands and scripts, exit code 0 means success, 3010 means a restart is needed, and anything
 else fails the step. A script's shell comes from its extension (`.ps1`, `.cmd`/`.bat`, `.exe`)
@@ -197,7 +250,15 @@ with; end them with `exit $LASTEXITCODE` to pass a program's code through.
 
 Each `run` entry is a separate process, so `$ErrorActionPreference` and variables don't carry
 over between entries. If a multi-line command starts with a `# comment`, the comment becomes the
-step's name in `plan` and the logs.
+step's name in `plan` and the logs. That works for every shell: with `shell: cmd`, those
+leading `#` lines are left out of what cmd runs, and a multi-line command runs as a batch file,
+so every line runs (`cmd /c` alone would only run the first).
+
+Environment variables from `env:` and `path:` are stored for the user, and running programs are
+told about the change. But a process that was **already running** keeps the environment it
+started with, and so does everything it starts later. A remote command runner or agent service
+started before the apply won't see the new values. Set the variable in that command itself when
+it matters (`$env:NAME = '…'; …`).
 
 ### Plugins
 

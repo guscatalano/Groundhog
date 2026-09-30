@@ -1,12 +1,21 @@
 //! Running child processes with their output streamed line by line.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::VecDeque;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    TerminateJobObject,
+};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -21,8 +30,11 @@ pub struct Proc {
     pub stdin: Option<Vec<u8>>,
     /// Return stdout instead of streaming it (plugins answer on stdout).
     pub capture_stdout: bool,
+    /// Kill the process, and every process it started, if it runs longer than this.
+    pub timeout: Option<Duration>,
 }
 
+#[derive(Debug)]
 pub struct Output {
     pub code: i32,
     pub stdout: String,
@@ -43,6 +55,11 @@ impl Proc {
         self
     }
 
+    pub fn timeout_ms(mut self, ms: Option<u64>) -> Self {
+        self.timeout = ms.map(Duration::from_millis);
+        self
+    }
+
     /// Runs to completion, calling `on_line` for each line of stderr (and of stdout unless
     /// captured). Returns the exit code.
     pub fn run(&self, on_line: &mut dyn FnMut(&str)) -> Result<Output> {
@@ -59,6 +76,13 @@ impl Proc {
             cmd.current_dir(cwd);
         }
         let mut child = cmd.spawn().with_context(|| format!("starting {}", self.program.display()))?;
+        // With a timeout, the process runs in a job, so a timeout ends everything it started.
+        // Killing only the process isn't enough: an installer's children keep its output
+        // pipes open, and we would wait on them forever.
+        let job = match self.timeout {
+            Some(_) => Some(Job::containing(&child)?),
+            None => None,
+        };
 
         if let (Some(input), Some(mut stdin)) = (self.stdin.clone(), child.stdin.take()) {
             std::thread::spawn(move || {
@@ -81,18 +105,104 @@ impl Proc {
         let t2 = pump(Box::new(child.stderr.take().expect("piped")), false, tx);
 
         let mut stdout = String::new();
-        for (is_stdout, line) in rx {
+        let mut recent: VecDeque<String> = VecDeque::new();
+        let mut deadline = self.timeout.map(|t| Instant::now() + t);
+        let mut timed_out = false;
+        loop {
+            let (is_stdout, line) = match deadline {
+                None => match rx.recv() {
+                    Ok(m) => m,
+                    Err(_) => break,
+                },
+                Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
+                    Ok(m) => m,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        timed_out = true;
+                        deadline = None; // keep reading what's left until the pipes close
+                        if let Some(job) = &job {
+                            job.terminate();
+                        }
+                        continue;
+                    }
+                },
+            };
             if is_stdout && self.capture_stdout {
                 stdout.push_str(&line);
                 continue;
             }
             if let Some(clean) = clean_line(&line) {
                 on_line(clean);
+                if recent.len() == 5 {
+                    recent.pop_front();
+                }
+                recent.push_back(clean.to_owned());
             }
         }
         let _ = (t1.join(), t2.join());
         let status = child.wait().context("waiting for process")?;
+        if timed_out {
+            let limit = self.timeout.unwrap_or_default();
+            let tail = Vec::from(recent).join(" / ");
+            if tail.is_empty() {
+                bail!("{} timed out after {}s and was stopped", self.program.display(), limit.as_secs());
+            }
+            bail!(
+                "{} timed out after {}s and was stopped; last output: {tail}",
+                self.program.display(),
+                limit.as_secs()
+            );
+        }
         Ok(Output { code: status.code().unwrap_or(-1), stdout })
+    }
+}
+
+/// A Windows job object holding a process and everything it starts, so they can be ended
+/// together. It's also set to end them if the agent itself goes away.
+struct Job(HANDLE);
+
+impl Job {
+    fn containing(child: &Child) -> Result<Self> {
+        // SAFETY: no security attributes and no name: a fresh anonymous job.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            bail!("creating a job object: {}", io::Error::last_os_error());
+        }
+        let job = Job(handle);
+        // SAFETY: plain data, zeroed, then one flag set.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the buffer is a JOBOBJECT_EXTENDED_LIMIT_INFORMATION of the size we pass.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            bail!("configuring a job object: {}", io::Error::last_os_error());
+        }
+        // Anything the child starts from here on joins the job too. (A grandchild started in
+        // the instant between spawn and this call would escape; nothing we run is that quick.)
+        // SAFETY: both handles are valid for the duration of the call.
+        if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) } == 0 {
+            bail!("putting the process in a job: {}", io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+
+    fn terminate(&self) {
+        // SAFETY: we own the job handle.
+        unsafe { TerminateJobObject(self.0, 1) };
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        // SAFETY: we own the handle and close it once.
+        unsafe { CloseHandle(self.0) };
     }
 }
 
@@ -131,6 +241,24 @@ mod tests {
             Proc { stdin: Some(b"hello".to_vec()), capture_stdout: true, ..Proc::new("findstr.exe").args(["."]) };
         let out = proc.run(&mut |_| {}).unwrap();
         assert_eq!(out.stdout.trim(), "hello");
+    }
+
+    #[test]
+    fn a_timeout_stops_the_whole_process_tree() {
+        // cmd starts ping as a child; both must go, or the pipes stay open and this hangs.
+        let started = Instant::now();
+        let err = Proc::new("cmd.exe")
+            .args(["/d", "/c"])
+            .raw(Some("echo working & ping -n 30 127.0.0.1 >nul"))
+            .timeout_ms(Some(1500))
+            .run(&mut |_| {})
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(err.to_string().contains("timed out after 1s"), "{err}");
+        assert!(err.to_string().contains("last output: working"), "{err}");
+
+        let fast = Proc::new("cmd.exe").args(["/d", "/c"]).raw(Some("exit 4")).timeout_ms(Some(10_000));
+        assert_eq!(fast.run(&mut |_| {}).unwrap().code, 4, "finishing in time behaves as before");
     }
 
     #[test]

@@ -112,6 +112,9 @@ pub enum App {
         version: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         args: Option<String>,
+        /// Kill the step (and everything it started) if it runs longer than this.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
     /// An installer fetched from a URL (or found in a cache by hash) and run directly.
     Url {
@@ -123,8 +126,14 @@ pub enum App {
         /// identity, so a new "latest" build makes the step run again.
         #[serde(skip_serializing_if = "Option::is_none")]
         resolved: Option<String>,
+        /// The GitHub release a `github:` reference resolved to, for logs and step identity.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        release: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         args: Option<String>,
+        /// Kill the step (and everything it started) if it runs longer than this.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
 }
 
@@ -150,6 +159,16 @@ pub struct FileCopy {
     /// `from` is a zip; unpack it into the folder `to`, replacing what was there.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub extract: bool,
+    /// With `extract`: leading folders to drop from every path in the zip.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub strip: u32,
+    /// The GitHub release a `github:` reference resolved to, for logs and step identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,7 +229,16 @@ pub enum Shell {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum RunAction {
     /// An inline command.
-    Command { command: String, shell: Shell },
+    Command {
+        command: String,
+        shell: Shell,
+        /// Kill the step (and everything it started) if it runs longer than this.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Run on every apply, not only when something changed (a test run, say).
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        always: bool,
+    },
     /// A script fetched relative to the Groundhogfile and run from a local copy.
     Script {
         script: Url,
@@ -223,6 +251,12 @@ pub enum RunAction {
         #[serde(skip_serializing_if = "Option::is_none")]
         args: Option<String>,
         shell: Option<Shell>,
+        /// Kill the step (and everything it started) if it runs longer than this.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Run on every apply, not only when something changed (a test run, say).
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        always: bool,
     },
     /// An external executable speaking the plugin protocol (see [`crate::plugin`]).
     Plugin {
@@ -234,7 +268,31 @@ pub enum RunAction {
         #[serde(skip_serializing_if = "Option::is_none")]
         resolved: Option<String>,
         with: serde_json::Value,
+        /// Kill the step (and everything it started) if it runs longer than this.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Run on every apply, not only when something changed (a test run, say).
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        always: bool,
     },
+}
+
+impl RunAction {
+    pub fn timeout_ms(&self) -> Option<u64> {
+        match self {
+            RunAction::Command { timeout_ms, .. }
+            | RunAction::Script { timeout_ms, .. }
+            | RunAction::Plugin { timeout_ms, .. } => *timeout_ms,
+        }
+    }
+
+    pub fn always(&self) -> bool {
+        match self {
+            RunAction::Command { always, .. } | RunAction::Script { always, .. } | RunAction::Plugin { always, .. } => {
+                *always
+            }
+        }
+    }
 }
 
 /// What the user writes. Only the loader uses these.
@@ -337,22 +395,49 @@ pub(crate) mod raw {
         Full { source: String, sha256: Option<String> },
     }
 
-    #[derive(Debug, Deserialize)]
-    #[serde(untagged)]
-    pub enum App {
-        /// `- git.git` is shorthand for a winget id.
+    /// `- git.git` is shorthand for a winget id.
+    pub type App = StringOr<AppFull>;
+
+    /// An entry written either as a bare string (the short form) or as a map. Unlike
+    /// `#[serde(untagged)]`, a map that fails to parse keeps its own error ("unknown field
+    /// `timout`") instead of a generic "did not match any variant".
+    #[derive(Debug)]
+    pub enum StringOr<T> {
         Short(String),
-        Full(AppFull),
+        Full(T),
+    }
+
+    impl<'de, T: Deserialize<'de>> Deserialize<'de> for StringOr<T> {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V<T>(std::marker::PhantomData<T>);
+            impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for V<T> {
+                type Value = StringOr<T>;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a string or a map")
+                }
+                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                    Ok(StringOr::Short(v.to_owned()))
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                    T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(StringOr::Full)
+                }
+            }
+            d.deserialize_any(V(std::marker::PhantomData))
+        }
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
+    #[serde(rename_all = "kebab-case")]
     pub struct AppFull {
         pub id: String,
         pub version: Option<String>,
         pub url: Option<String>,
         pub sha256: Option<String>,
         pub args: Option<String>,
+        pub timeout: Option<Duration>,
+        #[serde(default)]
+        pub prerelease: bool,
     }
 
     #[derive(Debug, Deserialize)]
@@ -363,6 +448,9 @@ pub(crate) mod raw {
         pub sha256: Option<String>,
         #[serde(default)]
         pub extract: bool,
+        pub strip: Option<u32>,
+        #[serde(default)]
+        pub prerelease: bool,
     }
 
     #[derive(Debug, Deserialize)]
@@ -389,27 +477,24 @@ pub(crate) mod raw {
         List(Vec<String>),
     }
 
-    #[derive(Debug, Deserialize)]
-    #[serde(untagged)]
-    pub enum RunAction {
-        /// `- winget upgrade --all` is shorthand for a PowerShell command.
-        Short(String),
-        Command {
-            command: String,
-            #[serde(default)]
-            shell: Shell,
-        },
-        Script {
-            script: String,
-            sha256: Option<String>,
-            args: Option<String>,
-            shell: Option<Shell>,
-        },
-        Plugin {
-            plugin: String,
-            sha256: Option<String>,
-            #[serde(default)]
-            with: serde_json::Value,
-        },
+    /// `- winget upgrade --all` is shorthand for a PowerShell command.
+    pub type RunAction = StringOr<RunFull>;
+
+    /// One flat shape for every kind of `run` entry, so a typo (`timout:`) is an "unknown
+    /// field" error instead of being silently ignored; the loader then checks that exactly one
+    /// of `command`, `script` and `plugin` is set and that the options fit it.
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct RunFull {
+        pub command: Option<String>,
+        pub script: Option<String>,
+        pub plugin: Option<String>,
+        pub shell: Option<Shell>,
+        pub args: Option<String>,
+        pub sha256: Option<String>,
+        pub with: Option<serde_json::Value>,
+        pub timeout: Option<Duration>,
+        #[serde(default)]
+        pub always: bool,
     }
 }

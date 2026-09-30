@@ -4,6 +4,30 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.6.0] - 2026-09-30
+
+### Added
+- **`github:` sources** for `files:` and `apps:`: `github:OWNER/REPO@latest/ASSET`, a tag
+  instead of `latest`, or `source` for a release's source code. With `prerelease: true`,
+  repositories that only publish prereleases work too (GitHub's own "latest" ignores them).
+  Every `@latest` in a file resolves to the same release, so an app and the source of its tests
+  can't drift apart. Assets with a published digest are pinned by it, so `plan` doesn't
+  download them, and the logs show the release tag (`@1.0.267`).
+- **`strip: N` with `extract`** drops leading folders from the zip's paths, such as the
+  `repo-1.0.267\` folder GitHub source archives wrap everything in.
+- **`timeout:` on `run` entries and `apps`.** A step that runs too long is stopped along with
+  every process it started, and fails with its last lines of output.
+- **`always: true` on `run` entries**, for steps that should run on every apply, such as a test
+  suite.
+
+### Fixed
+- **Multi-line `shell: cmd` commands ran only their first line.** They now run as a batch file,
+  and a leading `# title` line is no longer passed to cmd. This affects `run` entries and
+  `command` checks.
+- A typo in a `run` or `apps` entry (`timout: 5m`) is now reported as an unknown field instead
+  of being silently ignored or reported as "did not match any variant".
+- `plan` now reports a Groundhogfile's `agent:` requirement, as `apply` does.
+
 ## [0.5.0] - 2026-09-30
 
 ### Added
@@ -90,6 +114,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.6.0]: https://github.com/guscatalano/Groundhog/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/guscatalano/Groundhog/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/guscatalano/Groundhog/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/guscatalano/Groundhog/compare/v0.2.0...v0.3.0

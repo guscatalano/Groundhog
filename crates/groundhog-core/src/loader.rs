@@ -10,6 +10,7 @@ use url::Url;
 use crate::archive;
 use crate::content::ContentStore;
 use crate::fetch::{self, file_url_to_path};
+use crate::github;
 use crate::model::{
     App, CURRENT_VERSION, Check, FileCopy, Groundhogfile, HiveScope, RegistryData, RegistryType, RegistryValue,
     RunAction, ServiceState, Shell, SourceRef, raw,
@@ -54,6 +55,29 @@ impl Loader<'_> {
     /// Steps are identified by what they do, so this is what makes a "latest" URL (or an
     /// edited local script) run again when its content changes, and only then.
     fn resolve_unpinned(&self, file: &mut Groundhogfile, sources: &mut Vec<LoadedSource>) -> Result<()> {
+        // github: references first: they become ordinary URLs, pinned by GitHub's own digest
+        // when it publishes one, and then flow through the content resolution below.
+        let gh = github::Resolver::new(self.content.fetcher);
+        let from_github = |url: &mut Url, sha256: &mut Option<String>, release: &mut Option<String>| -> Result<()> {
+            if github::is_github(url) {
+                let r = gh.resolve(url).with_context(|| format!("resolving {url}"))?;
+                *url = r.url;
+                if sha256.is_none() {
+                    *sha256 = r.sha256;
+                }
+                *release = Some(r.tag);
+            }
+            Ok(())
+        };
+        for app in &mut file.apps {
+            if let App::Url { url, sha256, release, .. } = app {
+                from_github(url, sha256, release)?;
+            }
+        }
+        for f in &mut file.files {
+            from_github(&mut f.from, &mut f.sha256, &mut f.release)?;
+        }
+
         let mut seen: HashMap<Url, String> = HashMap::new();
         let mut resolve = |url: &Url, pinned: &Option<String>, slot: &mut Option<String>| -> Result<()> {
             if pinned.is_some() {
@@ -283,27 +307,39 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         .into_iter()
         .map(|a| {
             Ok(match a {
-                raw::App::Short(id) => App::Winget { id, version: None, args: None },
-                raw::App::Full(f) => match f.url {
-                    Some(u) => {
-                        if f.version.is_some() {
-                            bail!("app '{}': 'version' only applies to winget apps", f.id);
+                raw::App::Short(id) => App::Winget { id, version: None, args: None, timeout_ms: None },
+                raw::App::Full(f) => {
+                    let timeout_ms = f.timeout.map(duration_ms).transpose()?;
+                    match f.url {
+                        Some(u) => {
+                            if f.version.is_some() {
+                                bail!("app '{}': 'version' only applies to winget apps", f.id);
+                            }
+                            let mut url = resolve_ref(base, &u)?;
+                            if f.prerelease {
+                                if !github::is_github(&url) {
+                                    bail!("app '{}': 'prerelease' only applies to github: sources", f.id);
+                                }
+                                github::allow_prerelease(&mut url);
+                            }
+                            App::Url {
+                                id: f.id,
+                                url,
+                                sha256: pin(f.sha256)?,
+                                resolved: None,
+                                release: None,
+                                args: f.args,
+                                timeout_ms,
+                            }
                         }
-                        App::Url {
-                            id: f.id,
-                            url: resolve_ref(base, &u)?,
-                            sha256: pin(f.sha256)?,
-                            resolved: None,
-                            args: f.args,
+                        None => {
+                            if f.sha256.is_some() || f.prerelease {
+                                bail!("app '{}': 'sha256' and 'prerelease' only apply to apps with a 'url'", f.id);
+                            }
+                            App::Winget { id: f.id, version: f.version, args: f.args, timeout_ms }
                         }
                     }
-                    None => {
-                        if f.sha256.is_some() {
-                            bail!("app '{}': 'sha256' only applies to apps with a 'url'", f.id);
-                        }
-                        App::Winget { id: f.id, version: f.version, args: f.args }
-                    }
-                },
+                }
             })
         })
         .collect::<Result<_>>()?;
@@ -311,11 +347,30 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     let files = files
         .into_iter()
         .map(|f| {
-            let from = resolve_ref(base, &f.from)?;
-            if f.extract && !from.path().to_ascii_lowercase().ends_with(".zip") {
+            let mut from = resolve_ref(base, &f.from)?;
+            if f.prerelease {
+                if !github::is_github(&from) {
+                    bail!("'{}': 'prerelease' only applies to github: sources", f.from);
+                }
+                github::allow_prerelease(&mut from);
+            }
+            let path = from.path().to_ascii_lowercase();
+            let is_zip = path.ends_with(".zip") || (github::is_github(&from) && path.ends_with("/source"));
+            if f.extract && !is_zip {
                 bail!("'{}': 'extract' needs a .zip file", f.from);
             }
-            Ok(FileCopy { from, to: f.to, sha256: pin(f.sha256)?, resolved: None, extract: f.extract })
+            if f.strip.is_some() && !f.extract {
+                bail!("'{}': 'strip' only applies with 'extract: true'", f.from);
+            }
+            Ok(FileCopy {
+                from,
+                to: f.to,
+                sha256: pin(f.sha256)?,
+                resolved: None,
+                extract: f.extract,
+                strip: f.strip.unwrap_or(0),
+                release: None,
+            })
         })
         .collect::<Result<_>>()?;
 
@@ -327,27 +382,12 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
 
     let run = run
         .into_iter()
-        .map(|r| {
-            Ok(match r {
-                raw::RunAction::Short(command) => RunAction::Command { command, shell: Shell::Powershell },
-                raw::RunAction::Command { shell: Shell::Direct, .. } => {
-                    bail!("'shell: direct' only applies to scripts; use cmd, powershell or pwsh for commands")
-                }
-                raw::RunAction::Command { command, shell } => RunAction::Command { command, shell },
-                raw::RunAction::Script { script, sha256, args, shell } => RunAction::Script {
-                    script: resolve_ref(base, &script)?,
-                    sha256: pin(sha256)?,
-                    resolved: None,
-                    args,
-                    shell,
-                },
-                raw::RunAction::Plugin { plugin, sha256, with } => RunAction::Plugin {
-                    plugin: resolve_ref(base, &plugin)?,
-                    sha256: pin(sha256)?,
-                    resolved: None,
-                    with,
-                },
-            })
+        .enumerate()
+        .map(|(i, r)| match r {
+            raw::RunAction::Short(command) => {
+                Ok(RunAction::Command { command, shell: Shell::Powershell, timeout_ms: None, always: false })
+            }
+            raw::RunAction::Full(r) => resolve_run(base, r).with_context(|| format!("run[{i}]")),
         })
         .collect::<Result<_>>()?;
 
@@ -358,6 +398,67 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         .collect::<Result<_>>()?;
 
     Ok(Groundhogfile { apps, files, env, path, registry, run, verify, requires_agent })
+}
+
+fn resolve_run(base: &Url, r: raw::RunFull) -> Result<RunAction> {
+    let kinds = [("command", r.command.is_some()), ("script", r.script.is_some()), ("plugin", r.plugin.is_some())];
+    let set: Vec<&str> = kinds.iter().filter(|(_, on)| *on).map(|(k, _)| *k).collect();
+    let kind = match set.as_slice() {
+        [one] => *one,
+        [] => bail!("a run entry needs one of: command, script, plugin"),
+        many => bail!("a run entry can only be one kind, but this one sets {}", many.join(" and ")),
+    };
+    let allowed: &[&str] = match kind {
+        "command" => &["shell"],
+        "script" => &["shell", "args", "sha256"],
+        _ => &["sha256", "with"],
+    };
+    let given = [
+        ("shell", r.shell.is_some()),
+        ("args", r.args.is_some()),
+        ("sha256", r.sha256.is_some()),
+        ("with", r.with.is_some()),
+    ];
+    if let Some((opt, _)) = given.iter().find(|(opt, on)| *on && !allowed.contains(opt)) {
+        bail!("'{opt}' doesn't apply to {kind} entries");
+    }
+
+    let timeout_ms = r.timeout.map(duration_ms).transpose()?;
+    let always = r.always;
+    Ok(match kind {
+        "command" => {
+            let shell = r.shell.unwrap_or_default();
+            if shell == Shell::Direct {
+                bail!("'shell: direct' only applies to scripts; use cmd, powershell or pwsh for commands");
+            }
+            RunAction::Command { command: r.command.expect("kind"), shell, timeout_ms, always }
+        }
+        "script" => {
+            let script = resolve_ref(base, &r.script.expect("kind"))?;
+            github::reject(&script, "'run' scripts")?;
+            RunAction::Script {
+                script,
+                sha256: pin(r.sha256)?,
+                resolved: None,
+                args: r.args,
+                shell: r.shell,
+                timeout_ms,
+                always,
+            }
+        }
+        _ => {
+            let plugin = resolve_ref(base, &r.plugin.expect("kind"))?;
+            github::reject(&plugin, "'run' plugins")?;
+            RunAction::Plugin {
+                plugin,
+                sha256: pin(r.sha256)?,
+                resolved: None,
+                with: r.with.unwrap_or(serde_json::Value::Null),
+                timeout_ms,
+                always,
+            }
+        }
+    })
 }
 
 /// How long a check keeps retrying before it fails, unless it says otherwise. Checks usually
@@ -603,13 +704,16 @@ run:
         let loaded = load_with(&f, "https://cfg.test/dev/groundhog.yaml", dir.path()).unwrap();
         let g = loaded.file;
 
-        assert_eq!(g.apps[0], App::Winget { id: "git.git".into(), version: None, args: None });
+        assert_eq!(g.apps[0], App::Winget { id: "git.git".into(), version: None, args: None, timeout_ms: None });
         let App::Url { url, .. } = &g.apps[1] else { panic!() };
         assert_eq!(url.as_str(), "https://cfg.test/dl/tool.msi");
         assert_eq!(g.files[0].from.as_str(), "https://cfg.test/dev/config/.gitconfig");
         assert_eq!(g.registry[0].data, RegistryData::Dword(16));
         assert_eq!(g.registry[0].scope, vec![HiveScope::CurrentUser, HiveScope::DefaultUser]);
-        assert_eq!(g.run[0], RunAction::Command { command: "echo hi".into(), shell: Shell::Powershell });
+        assert_eq!(
+            g.run[0],
+            RunAction::Command { command: "echo hi".into(), shell: Shell::Powershell, timeout_ms: None, always: false }
+        );
         let RunAction::Script { script, .. } = &g.run[1] else { panic!() };
         assert_eq!(script.as_str(), "https://cfg.test/dev/scripts/post.ps1");
         // The document plus the three unpinned references it resolved; the pinned app is untouched.
@@ -773,6 +877,87 @@ verify:
         // An old enough requirement doesn't excuse a typo.
         let err = load_with(&f, "https://cfg.test/typo.yaml", dir.path()).unwrap_err();
         assert!(err.downcast_ref::<NeedsAgent>().is_none());
+    }
+
+    #[test]
+    fn run_entries_take_timeout_and_always_and_reject_typos() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/g.yaml", "run:\n  - command: dotnet test\n    timeout: 30m\n    always: true")
+            .with("https://cfg.test/typo.yaml", "run:\n  - command: dotnet test\n    timout: 30m")
+            .with("https://cfg.test/two.yaml", "run:\n  - command: a\n    script: b.ps1")
+            .with("https://cfg.test/opt.yaml", "run:\n  - command: a\n    args: -x");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap().file;
+        assert_eq!(g.run[0].timeout_ms(), Some(30 * 60 * 1000));
+        assert!(g.run[0].always());
+
+        let err = |url: &str| format!("{:#}", load_with(&f, url, dir.path()).unwrap_err());
+        assert!(
+            err("https://cfg.test/typo.yaml").contains("unknown field `timout`"),
+            "{}",
+            err("https://cfg.test/typo.yaml")
+        );
+        assert!(err("https://cfg.test/two.yaml").contains("only be one kind"));
+        assert!(err("https://cfg.test/opt.yaml").contains("'args' doesn't apply to command entries"));
+    }
+
+    #[test]
+    fn github_sources_resolve_to_one_release_with_digests() {
+        let release = format!(
+            r#"[{{ "tag_name": "1.0.268", "prerelease": true, "draft": false, "assets": [
+                {{ "name": "release.zip", "browser_download_url": "https://github.com/o/r/releases/download/1.0.268/release.zip",
+                   "digest": "sha256:{}" }} ] }}]"#,
+            "cd".repeat(32)
+        );
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/g.yaml",
+                r#"
+files:
+  - from: github:o/r@latest/release.zip
+    prerelease: true
+    to: C:\app
+    extract: true
+  - from: github:o/r@latest/source
+    prerelease: true
+    to: C:\src
+    extract: true
+    strip: 1
+"#,
+            )
+            .with("https://api.github.com/repos/o/r/releases?per_page=30", release)
+            .with("https://github.com/o/r/archive/refs/tags/1.0.268.zip", "zip bytes");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap().file;
+
+        assert_eq!(g.files[0].from.as_str(), "https://github.com/o/r/releases/download/1.0.268/release.zip");
+        assert_eq!(g.files[0].sha256.as_deref(), Some("cd".repeat(32).as_str()), "GitHub's digest pins it");
+        assert_eq!(g.files[0].resolved, None, "so plan doesn't download it");
+        assert_eq!(g.files[1].from.as_str(), "https://github.com/o/r/archive/refs/tags/1.0.268.zip");
+        assert!(g.files[1].resolved.is_some(), "source zips have no digest and are resolved by content");
+        assert_eq!((g.files[0].release.as_deref(), g.files[1].release.as_deref()), (Some("1.0.268"), Some("1.0.268")));
+        assert_eq!(g.files[1].strip, 1);
+        let requests = f.requests.lock().unwrap();
+        assert_eq!(requests.iter().filter(|u| u.contains("api.github.com")).count(), 1);
+        assert!(!requests.iter().any(|u| u.ends_with("/release.zip")), "the pinned asset wasn't downloaded");
+    }
+
+    #[test]
+    fn rejects_misplaced_github_options() {
+        let cases = [
+            ("files: [{ from: https://x.test/a.zip, to: C:/a, prerelease: true }]", "only applies to github:"),
+            (
+                "files: [{ from: https://x.test/a.zip, to: C:/a, strip: 1 }]",
+                "'strip' only applies with 'extract: true'",
+            ),
+            ("run: [{ script: 'github:o/r@latest/x.ps1' }]", "not 'run' scripts"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (yaml, want) in cases {
+            let f = MapFetcher::default().with("https://cfg.test/g.yaml", yaml).with("https://x.test/a.zip", "z");
+            let err = format!("{:#}", load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap_err());
+            assert!(err.contains(want), "{yaml}: expected '{want}' in: {err}");
+        }
     }
 
     #[test]

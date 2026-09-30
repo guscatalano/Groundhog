@@ -53,11 +53,11 @@ impl Executor for WinExecutor<'_> {
         let log = &mut |line: &str| reporter.log(&format!("    {line}"));
         match &step.action {
             Action::EnsureWinget => self.ensure_winget(log),
-            Action::App(App::Winget { id, version, args }) => {
-                self.winget_install(id, version.as_deref(), args.as_deref(), log)
+            Action::App(App::Winget { id, version, args, timeout_ms }) => {
+                self.winget_install(id, version.as_deref(), args.as_deref(), *timeout_ms, log)
             }
-            Action::App(App::Url { url, sha256, resolved, args, .. }) => {
-                self.url_install(url, sha256.as_deref().or(resolved.as_deref()), args.as_deref(), log)
+            Action::App(App::Url { url, sha256, resolved, args, timeout_ms, .. }) => {
+                self.url_install(url, sha256.as_deref().or(resolved.as_deref()), args.as_deref(), *timeout_ms, log)
             }
             Action::File(f) => self.copy(f, log),
             Action::Env { name, value } => {
@@ -122,6 +122,7 @@ impl WinExecutor<'_> {
         id: &str,
         version: Option<&str>,
         args: Option<&str>,
+        timeout_ms: Option<u64>,
         log: &mut dyn FnMut(&str),
     ) -> Result<Outcome> {
         let winget = self.winget()?.to_path_buf();
@@ -138,7 +139,7 @@ impl WinExecutor<'_> {
         if let Some(v) = version {
             install = install.args(["--version", v]);
         }
-        let code = install.raw(args).run(log)?.code;
+        let code = install.raw(args).timeout_ms(timeout_ms).run(log)?.code;
         match code {
             0 => Ok(Outcome::Done { changed: true }),
             codes::PACKAGE_ALREADY_INSTALLED | codes::INSTALL_ALREADY_INSTALLED | codes::UPDATE_NOT_APPLICABLE => {
@@ -156,6 +157,7 @@ impl WinExecutor<'_> {
         url: &Url,
         sha256: Option<&str>,
         args: Option<&str>,
+        timeout_ms: Option<u64>,
         log: &mut dyn FnMut(&str),
     ) -> Result<Outcome> {
         let installer = self.download("downloads", url, sha256, log)?;
@@ -169,7 +171,7 @@ impl WinExecutor<'_> {
             "exe" => Proc::new(&installer).raw(args),
             other => bail!("don't know how to install '.{other}' files (supported: msi, msix, appx, exe)"),
         };
-        match proc.run(log)?.code {
+        match proc.timeout_ms(timeout_ms).run(log)?.code {
             0 => Ok(Outcome::Done { changed: true }),
             EXIT_REBOOT_REQUIRED | EXIT_REBOOT_INITIATED => Ok(Outcome::RebootRequired),
             EXIT_INSTALL_IN_PROGRESS => bail!("another installation is in progress (1618); run again when it finishes"),
@@ -187,7 +189,7 @@ impl WinExecutor<'_> {
         }
         let bytes = self.content.get(&f.from, f.sha256.as_deref().or(f.resolved.as_deref()))?.bytes;
         if f.extract {
-            replace_with_zip(&bytes, &dest)?;
+            replace_with_zip(&bytes, &dest, f.strip as usize)?;
             log(&format!("unpacked into {}", dest.display()));
             return Ok(Outcome::Done { changed: true });
         }
@@ -199,16 +201,17 @@ impl WinExecutor<'_> {
     }
 
     fn run_action(&mut self, action: &RunAction, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
+        let timeout_ms = action.timeout_ms();
         match action {
-            RunAction::Command { command, shell } => {
+            RunAction::Command { command, shell, .. } => {
                 let proc = match shell {
                     Shell::Powershell | Shell::Pwsh => powershell(*shell, command),
-                    Shell::Cmd => Proc::new("cmd.exe").args(["/d", "/s", "/c"]).raw(Some(&format!("\"{command}\""))),
+                    Shell::Cmd => cmd(command)?,
                     Shell::Direct => bail!("'shell: direct' only applies to scripts"),
                 };
-                exit_to_outcome(proc.run(log)?.code, "command")
+                exit_to_outcome(proc.timeout_ms(timeout_ms).run(log)?.code, "command")
             }
-            RunAction::Script { script, sha256, resolved, args, shell } => {
+            RunAction::Script { script, sha256, resolved, args, shell, .. } => {
                 let path = self.download("scripts", script, sha256.as_deref().or(resolved.as_deref()), log)?;
                 let shell = match shell {
                     Some(s) => *s,
@@ -225,9 +228,9 @@ impl WinExecutor<'_> {
                     Shell::Direct => Proc::new(&path).raw(args.as_deref()),
                 };
                 proc.cwd = path.parent().map(Path::to_path_buf);
-                exit_to_outcome(proc.run(log)?.code, "script")
+                exit_to_outcome(proc.timeout_ms(timeout_ms).run(log)?.code, "script")
             }
-            RunAction::Plugin { plugin, sha256, resolved, with } => {
+            RunAction::Plugin { plugin, sha256, resolved, with, .. } => {
                 let exe = self.download("plugins", plugin, sha256.as_deref().or(resolved.as_deref()), log)?;
                 let scratch = self.work_dir.join("plugin-scratch");
                 std::fs::create_dir_all(&scratch)?;
@@ -237,7 +240,11 @@ impl WinExecutor<'_> {
                     with: with.clone(),
                     work_dir: scratch.to_string_lossy().into_owned(),
                 };
-                let proc = Proc { stdin: Some(serde_json::to_vec(&request)?), capture_stdout: true, ..Proc::new(&exe) };
+                let proc = Proc {
+                    stdin: Some(serde_json::to_vec(&request)?),
+                    capture_stdout: true,
+                    ..Proc::new(&exe).timeout_ms(timeout_ms)
+                };
                 let out = proc.run(log)?;
                 let response: PluginResponse = serde_json::from_str(out.stdout.trim()).with_context(|| {
                     format!("plugin exited with {} and did not answer with valid JSON on stdout", out.code)
@@ -279,6 +286,24 @@ fn set_registry(r: &RegistryValue) -> Result<Outcome> {
 
 fn ps_exe(shell: Shell) -> &'static str {
     if shell == Shell::Pwsh { "pwsh.exe" } else { "powershell.exe" }
+}
+
+/// Runs an inline cmd command. `cmd /c` only runs the first line of what it's given, so a
+/// multi-line command is written to a batch file and run from there. Leading `# title` lines
+/// are Groundhog's naming convention, not cmd syntax, so they're left out of what cmd sees.
+pub(crate) fn cmd(command: &str) -> Result<Proc> {
+    let lines: Vec<&str> =
+        command.lines().skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with('#')).collect();
+    if lines.len() <= 1 {
+        let line = lines.first().copied().unwrap_or_default();
+        return Ok(Proc::new("cmd.exe").args(["/d", "/s", "/c"]).raw(Some(&format!("\"{line}\""))));
+    }
+    let body = format!("@echo off\r\n{}\r\n", lines.join("\r\n"));
+    let dir = std::env::temp_dir().join("groundhog").join("cmd");
+    std::fs::create_dir_all(&dir)?;
+    let batch = dir.join(format!("{}.cmd", &groundhog_core::fetch::sha256_hex(body.as_bytes())[..16]));
+    std::fs::write(&batch, body).with_context(|| format!("writing {}", batch.display()))?;
+    Ok(Proc::new("cmd.exe").args(["/d", "/s", "/c"]).raw(Some(&format!("\"\"{}\"\"", batch.display()))))
 }
 
 /// Runs an inline PowerShell command via `-EncodedCommand`, which sidesteps every quoting
@@ -356,7 +381,7 @@ fn write_if_different(dest: &Path, bytes: &[u8]) -> Result<bool> {
 /// running from the renamed copy, which is removed once nothing holds it (on this run or a
 /// later one). The rename fails only when a file inside is open without delete sharing, and
 /// then nothing has changed.
-fn replace_with_zip(bytes: &[u8], dest: &Path) -> Result<()> {
+fn replace_with_zip(bytes: &[u8], dest: &Path, strip: usize) -> Result<()> {
     let name = dest.file_name().context("destination has no folder name")?.to_string_lossy().into_owned();
     let sibling = |suffix: &str| dest.with_file_name(format!("{name}{suffix}"));
     let staging = sibling(".groundhog-new");
@@ -368,7 +393,7 @@ fn replace_with_zip(bytes: &[u8], dest: &Path) -> Result<()> {
         std::fs::remove_dir_all(&staging).with_context(|| format!("removing leftover {}", staging.display()))?;
     }
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
-    if let Err(e) = archive::unzip(bytes, &staging) {
+    if let Err(e) = archive::unzip_stripped(bytes, &staging, strip) {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
@@ -432,8 +457,8 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("app");
-        replace_with_zip(&zip(&[("a.txt", "1"), ("sub/stale.txt", "x")]), &dest).unwrap();
-        replace_with_zip(&zip(&[("a.txt", "2")]), &dest).unwrap();
+        replace_with_zip(&zip(&[("a.txt", "1"), ("sub/stale.txt", "x")]), &dest, 0).unwrap();
+        replace_with_zip(&zip(&[("a.txt", "2")]), &dest, 0).unwrap();
         assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "2");
         assert!(!dest.join("sub").exists(), "files the new archive lacks are gone");
 
@@ -443,13 +468,13 @@ mod tests {
             .args(["/c", "ping -n 3 127.0.0.1 >nul"])
             .spawn()
             .unwrap();
-        replace_with_zip(&zip(&[("a.txt", "3")]), &dest).unwrap();
-        replace_with_zip(&zip(&[("a.txt", "4")]), &dest).unwrap();
+        replace_with_zip(&zip(&[("a.txt", "3")]), &dest, 0).unwrap();
+        replace_with_zip(&zip(&[("a.txt", "4")]), &dest, 0).unwrap();
         assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "4");
         holder.wait().unwrap();
 
         // Once nothing holds the old copy, the next update cleans it up.
-        replace_with_zip(&zip(&[("a.txt", "5")]), &dest).unwrap();
+        replace_with_zip(&zip(&[("a.txt", "5")]), &dest, 0).unwrap();
         let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names, ["app"], "no leftovers");
     }
@@ -489,6 +514,21 @@ mod tests {
         assert_eq!(code("throw 'boom'"), 1);
         assert_eq!(code("exit 5"), 5, "an explicit exit wins");
         assert_eq!(code("Write-Output ok"), 0);
+    }
+
+    #[test]
+    fn multi_line_cmd_commands_run_every_line() {
+        let mut lines = Vec::new();
+        let out = cmd("# a title, not a command\necho one\necho two\nexit 7")
+            .unwrap()
+            .run(&mut |l| lines.push(l.to_owned()))
+            .unwrap();
+        assert_eq!(lines, ["one", "two"]);
+        assert_eq!(out.code, 7, "the batch's own exit code comes through");
+
+        let mut single = Vec::new();
+        cmd("echo \"quoted & fine\"").unwrap().run(&mut |l| single.push(l.to_owned())).unwrap();
+        assert_eq!(single, ["\"quoted & fine\""]);
     }
 
     #[test]

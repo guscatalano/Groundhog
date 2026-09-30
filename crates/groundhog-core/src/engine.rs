@@ -34,9 +34,14 @@ pub enum Action {
 }
 
 impl Action {
-    /// Checks describe health, not changes: they run on every apply.
+    /// Checks describe health, not changes, and `always: true` run steps ask for it: these
+    /// run on every apply.
     pub fn always_runs(&self) -> bool {
-        matches!(self, Action::Verify(_))
+        match self {
+            Action::Verify(_) => true,
+            Action::Run(r) => r.always(),
+            _ => false,
+        }
     }
 }
 
@@ -53,7 +58,15 @@ fn title(action: &Action) -> String {
         Action::App(App::Winget { id, version: Some(v), .. }) => format!("install {id} {v} (winget)"),
         Action::App(App::Winget { id, .. }) => format!("install {id} (winget)"),
         Action::App(App::Url { id, url, .. }) => format!("install {id} from {}", file_name(url)),
-        Action::File(f) => format!("copy {} -> {}", file_name(&f.from), f.to),
+        Action::File(f) => {
+            // A release's source archive is named after its tag; "source" reads better next to "@tag".
+            let name = if f.release.is_some() && f.from.path().contains("/archive/refs/tags/") {
+                "source".to_owned()
+            } else {
+                file_name(&f.from)
+            };
+            format!("copy {name} -> {}", f.to)
+        }
         Action::Env { name, .. } => format!("set env {name}"),
         Action::Path { dir } => format!("add {dir} to PATH"),
         Action::Registry(r) => format!("set {}\\{}", r.key, r.name.as_deref().unwrap_or("(default)")),
@@ -62,20 +75,25 @@ fn title(action: &Action) -> String {
         Action::Run(RunAction::Plugin { plugin, .. }) => format!("run plugin {}", file_name(plugin)),
         Action::Verify(c) => format!("verify {}", check_title(c)),
     };
-    // Show what an unpinned reference resolved to, so logs say which build a machine got.
-    match resolved(action) {
-        Some(hash) => format!("{base} @{}", &hash[..8]),
+    // Say which build a machine got: the GitHub release when there is one, otherwise the
+    // content hash an unpinned reference resolved to.
+    match build_label(action) {
+        Some(label) => format!("{base} @{label}"),
         None => base,
     }
 }
 
-fn resolved(action: &Action) -> Option<&str> {
-    match action {
-        Action::App(App::Url { resolved, .. })
-        | Action::File(FileCopy { resolved, .. })
-        | Action::Run(RunAction::Script { resolved, .. } | RunAction::Plugin { resolved, .. }) => resolved.as_deref(),
-        _ => None,
-    }
+fn build_label(action: &Action) -> Option<String> {
+    let (release, resolved) = match action {
+        Action::App(App::Url { release, resolved, .. }) | Action::File(FileCopy { release, resolved, .. }) => {
+            (release.as_deref(), resolved.as_deref())
+        }
+        Action::Run(RunAction::Script { resolved, .. } | RunAction::Plugin { resolved, .. }) => {
+            (None, resolved.as_deref())
+        }
+        _ => (None, None),
+    };
+    release.map(str::to_owned).or_else(|| resolved.map(|h| h[..8].to_owned()))
 }
 
 fn check_title(c: &Check) -> String {
@@ -384,7 +402,15 @@ mod tests {
 
     fn file(cmds: &[&str]) -> Groundhogfile {
         Groundhogfile {
-            run: cmds.iter().map(|c| RunAction::Command { command: (*c).into(), shell: Shell::Powershell }).collect(),
+            run: cmds
+                .iter()
+                .map(|c| RunAction::Command {
+                    command: (*c).into(),
+                    shell: Shell::Powershell,
+                    timeout_ms: None,
+                    always: false,
+                })
+                .collect(),
             ..Default::default()
         }
     }
@@ -416,6 +442,8 @@ mod tests {
                 sha256: None,
                 resolved: Some(sha256_hex(content.as_bytes())),
                 extract: false,
+                strip: 0,
+                release: None,
             });
             plan(&g)
         };
@@ -455,6 +483,31 @@ mod tests {
     }
 
     #[test]
+    fn always_run_steps_run_on_every_apply_and_titles_show_releases() {
+        let mut g = file(&["build"]);
+        g.run.push(RunAction::Command {
+            command: "dotnet test".into(),
+            shell: Shell::Powershell,
+            timeout_ms: Some(1000),
+            always: true,
+        });
+        let steps = plan(&g);
+        assert!(!steps[0].action.always_runs());
+        assert!(steps[1].action.always_runs());
+
+        let file_from_release = Action::File(FileCopy {
+            from: Url::parse("https://github.com/o/r/releases/download/1.0.268/release.zip").unwrap(),
+            to: r"C:\app".into(),
+            sha256: Some("ab".repeat(32)),
+            resolved: None,
+            extract: true,
+            strip: 0,
+            release: Some("1.0.268".into()),
+        });
+        assert_eq!(title(&file_from_release), r"copy release.zip -> C:\app @1.0.268");
+    }
+
+    #[test]
     fn command_titles_prefer_a_leading_comment() {
         assert_eq!(command_title("# fetch the bundle\nInvoke-WebRequest x"), "fetch the bundle");
         assert_eq!(command_title("\n  Start-Sleep 12\n  Get-Process"), "Start-Sleep 12…");
@@ -465,7 +518,7 @@ mod tests {
     fn winget_is_ensured_only_when_needed() {
         let mut g = file(&[]);
         assert!(plan(&g).is_empty());
-        g.apps.push(App::Winget { id: "git.git".into(), version: None, args: None });
+        g.apps.push(App::Winget { id: "git.git".into(), version: None, args: None, timeout_ms: None });
         assert_eq!(plan(&g)[0].action, Action::EnsureWinget);
     }
 

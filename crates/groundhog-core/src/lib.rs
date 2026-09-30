@@ -9,6 +9,7 @@ pub mod cache;
 pub mod content;
 pub mod engine;
 pub mod fetch;
+pub mod github;
 pub mod loader;
 pub mod model;
 pub mod pending;

@@ -388,6 +388,12 @@ fn print_plan(home: &Path, p: &Pending) -> Result<()> {
     for s in &loaded.sources {
         println!("source  {}  sha256:{}", s.url, s.sha256);
     }
+    // The same check `apply` makes, so `plan` never passes a file this agent can't apply.
+    if let Some(required) = &loaded.file.requires_agent
+        && *required > Version::current()
+    {
+        bail!("this Groundhogfile needs groundhog-agent {required} or newer, and this is {}", Version::current());
+    }
     let steps = plan(&loaded.file);
     for (i, step) in steps.iter().enumerate() {
         println!("{:>3}. [{}] {}", i + 1, step.id, step.title);
