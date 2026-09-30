@@ -154,11 +154,16 @@ hands over to the new version. Clones pick up new Groundhogfile features without
 manual `apply` only updates with `--update`, and `groundhog-agent update` updates on demand.
 Details, pinning and trust: [Keeping the template's agent current](docs/templates.md#keeping-the-templates-agent-current).
 
+**Starting from nothing:** `groundhog unattend` writes an answer file that installs Windows from ISO
+(or finishes each clone of a sysprepped template), creates the provisioning account, turns on
+autologon, and starts the agent on first logon. See [docs/unattend.md](docs/unattend.md).
+
 ## More
 
 - [docs/groundhogfile.md](docs/groundhogfile.md): full file reference
 - [docs/design.md](docs/design.md): architecture and roadmap
 - [docs/templates.md](docs/templates.md): preparing VM templates
+- [docs/unattend.md](docs/unattend.md): answer files for unattended installs and sysprepped templates
 
 ## Layout
 

@@ -4,6 +4,7 @@
 
 mod mirror;
 mod sandbox;
+mod unattend;
 mod watch;
 
 use std::path::PathBuf;
@@ -39,6 +40,9 @@ enum Command {
     Sandbox(sandbox::SandboxArgs),
     /// Write a pending.json bootstrap file for a templated VM (see docs/templates.md).
     Pending(PendingArgs),
+    /// Write an unattend file that installs Windows (or finishes a sysprepped template) and
+    /// then hands the machine to the agent (see docs/unattend.md).
+    Unattend(Box<unattend::UnattendArgs>),
     /// Copy a release's agents and agent.json into a folder or share, to use as an update
     /// source (`--update-from` / `agentUpdateFrom`) that doesn't need GitHub.
     MirrorAgent(mirror::MirrorArgs),
@@ -48,6 +52,16 @@ enum Command {
 struct PendingArgs {
     /// Path, URL or zip bundle, as the agent inside the VM will see it.
     source: String,
+    #[command(flatten)]
+    options: PendingOptions,
+    /// Where to write the file.
+    #[arg(short, long, default_value = PENDING_FILE)]
+    output: PathBuf,
+}
+
+/// What goes into a pending.json besides the source; shared by `pending` and `unattend`.
+#[derive(Args)]
+pub(crate) struct PendingOptions {
     #[arg(long)]
     sha256: Option<String>,
     /// Cache sources as seen from inside the VM (UNC share or http URL). Repeatable.
@@ -75,9 +89,36 @@ struct PendingArgs {
     /// them in plain text, so treat it like a password.
     #[arg(long = "secret", value_name = "NAME[=VALUE]")]
     secrets: Vec<String>,
-    /// Where to write the file.
-    #[arg(short, long, default_value = PENDING_FILE)]
-    output: PathBuf,
+}
+
+impl PendingOptions {
+    pub(crate) fn build(&self, source: &str) -> Result<Pending> {
+        if let Some(policy) = &self.agent_update {
+            groundhog_core::update::Policy::parse(policy)?;
+        }
+        Ok(Pending {
+            source: source.to_owned(),
+            sha256: self.sha256.clone(),
+            cache: self.cache.clone(),
+            report: self.report.clone(),
+            headers: Vec::new(),
+            allow_reboot: !self.no_reboot,
+            allow_http: self.allow_http,
+            agent_update: self.agent_update.clone(),
+            agent_update_from: self.agent_update_from.clone(),
+            secrets: self.secrets.iter().map(|s| secret_value(s)).collect::<Result<_>>()?,
+        })
+    }
+}
+
+/// `NAME=value`, or `NAME` with the value taken from the NAME environment variable.
+pub(crate) fn secret_value(spec: &str) -> Result<(String, String)> {
+    match spec.split_once('=') {
+        Some((name, value)) => Ok((name.to_owned(), value.to_owned())),
+        None => std::env::var(spec)
+            .map(|v| (spec.to_owned(), v))
+            .with_context(|| format!("secret {spec}: no environment variable named {spec}")),
+    }
 }
 
 fn main() {
@@ -110,34 +151,12 @@ fn run(command: Command) -> Result<i32> {
         }
         Command::Sandbox(args) => sandbox::run(args),
         Command::Pending(a) => {
-            if let Some(policy) = &a.agent_update {
-                groundhog_core::update::Policy::parse(policy)?;
-            }
-            let pending = Pending {
-                source: a.source,
-                sha256: a.sha256,
-                cache: a.cache,
-                report: a.report,
-                headers: Vec::new(),
-                allow_reboot: !a.no_reboot,
-                allow_http: a.allow_http,
-                agent_update: a.agent_update,
-                agent_update_from: a.agent_update_from,
-                secrets: a
-                    .secrets
-                    .iter()
-                    .map(|s| match s.split_once('=') {
-                        Some((name, value)) => Ok((name.to_owned(), value.to_owned())),
-                        None => std::env::var(s)
-                            .map(|v| (s.clone(), v))
-                            .with_context(|| format!("--secret {s}: no environment variable named {s}")),
-                    })
-                    .collect::<Result<_>>()?,
-            };
+            let pending = a.options.build(&a.source)?;
             write_json_atomic(&a.output, &pending).with_context(|| format!("writing {}", a.output.display()))?;
             println!("wrote {}", a.output.display());
             Ok(0)
         }
+        Command::Unattend(args) => unattend::run(*args),
         Command::MirrorAgent(args) => mirror::run(args),
     }
 }

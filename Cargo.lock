@@ -325,8 +325,11 @@ name = "groundhog"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
+ "getrandom",
  "groundhog-core",
+ "roxmltree",
  "serde_json",
  "tempfile",
 ]
@@ -716,6 +719,15 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "rustix"

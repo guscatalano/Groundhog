@@ -4,6 +4,23 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.8.0] - 2026-09-30
+
+### Added
+- **`groundhog unattend`** writes a Windows answer file that goes from Windows Setup (or a
+  sysprepped template) to "the agent is applying a Groundhogfile" with nobody at the keyboard:
+  it skips the setup screens, sets the computer name, language and time zone, creates the
+  provisioning account with autologon, and on first logon installs the agent, writes
+  `pending.json` and starts it.
+  - `--mode install` for ISO/USB installs: edition, product key, VirtIO and other storage
+    drivers (`--driver-path`), Windows 11 hardware-check bypass, and disk partitioning only
+    with an explicit `--wipe-disk N`.
+  - `--mode sysprep` for sealing templates; each clone gets its own name and bootstrap.
+  - Secrets can be embedded with `--secret`; Setup's own copy of the file is then deleted on
+    first logon. See [docs/unattend.md](docs/unattend.md) for the security trade-offs.
+
+  Not yet verified through a complete Windows Setup run; try it on a throwaway VM first.
+
 ## [0.7.0] - 2026-09-30
 
 ### Added

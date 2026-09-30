@@ -5,6 +5,10 @@ task. Each clone does nothing until a host drops a `pending.json` into it.
 
 ## One-time template setup
 
+**Shortcut:** `groundhog unattend` writes an answer file that does steps 1–3 for you, either
+while installing from ISO (`--mode install`) or on every clone of a sysprepped template
+(`--mode sysprep`). See [Unattend files](unattend.md). The manual steps:
+
 1. Install Windows and create a local **provisioning account** (an administrator).
 2. Turn on **autologon** for that account, for example with Sysinternals Autologon (which stores
    the password as an LSA secret) or `Winlogon` registry values. The password is stored
