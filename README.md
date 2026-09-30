@@ -148,6 +148,12 @@ continues by itself at the next logon.
 Install the agent in the template once (`groundhog-agent install-task` plus autologon). Each clone
 then applies whatever `pending.json` a host drops in. See [docs/templates.md](docs/templates.md).
 
+**The template doesn't go stale.** Before each run from `pending.json`, the agent updates itself
+from GitHub releases, or from your own folder or share (`groundhog mirror-agent` fills one), and
+hands over to the new version. Clones pick up new Groundhogfile features without rebaking. A
+manual `apply` only updates with `--update`, and `groundhog-agent update` updates on demand.
+Details, pinning and trust: [Keeping the template's agent current](docs/templates.md#keeping-the-templates-agent-current).
+
 ## More
 
 - [docs/groundhogfile.md](docs/groundhogfile.md): full file reference

@@ -2,6 +2,7 @@
 //! and Proxmox next), hands the agent a Groundhogfile, and watches progress. Everything that
 //! changes the target is done by `groundhog-agent` inside it.
 
+mod mirror;
 mod sandbox;
 mod watch;
 
@@ -38,6 +39,9 @@ enum Command {
     Sandbox(sandbox::SandboxArgs),
     /// Write a pending.json bootstrap file for a templated VM (see docs/templates.md).
     Pending(PendingArgs),
+    /// Copy a release's agents and agent.json into a folder or share, to use as an update
+    /// source (`--update-from` / `agentUpdateFrom`) that doesn't need GitHub.
+    MirrorAgent(mirror::MirrorArgs),
 }
 
 #[derive(Args)]
@@ -57,6 +61,14 @@ struct PendingArgs {
     no_reboot: bool,
     #[arg(long)]
     allow_http: bool,
+    /// How the agent keeps itself current before applying: latest (the default), off, or a
+    /// version to pin to.
+    #[arg(long, value_name = "POLICY")]
+    agent_update: Option<String>,
+    /// Where agent updates come from, as seen from inside the VM: an agent.json manifest, or a
+    /// folder, share or URL holding one (see `groundhog mirror-agent`). Default: GitHub releases.
+    #[arg(long, value_name = "SOURCE")]
+    agent_update_from: Option<String>,
     /// Where to write the file.
     #[arg(short, long, default_value = PENDING_FILE)]
     output: PathBuf,
@@ -92,6 +104,9 @@ fn run(command: Command) -> Result<i32> {
         }
         Command::Sandbox(args) => sandbox::run(args),
         Command::Pending(a) => {
+            if let Some(policy) = &a.agent_update {
+                groundhog_core::update::Policy::parse(policy)?;
+            }
             let pending = Pending {
                 source: a.source,
                 sha256: a.sha256,
@@ -100,10 +115,13 @@ fn run(command: Command) -> Result<i32> {
                 headers: Vec::new(),
                 allow_reboot: !a.no_reboot,
                 allow_http: a.allow_http,
+                agent_update: a.agent_update,
+                agent_update_from: a.agent_update_from,
             };
             write_json_atomic(&a.output, &pending).with_context(|| format!("writing {}", a.output.display()))?;
             println!("wrote {}", a.output.display());
             Ok(0)
         }
+        Command::MirrorAgent(args) => mirror::run(args),
     }
 }

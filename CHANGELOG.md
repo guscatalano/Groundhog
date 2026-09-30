@@ -4,6 +4,29 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.5.0] - 2026-09-30
+
+### Added
+- **The agent keeps itself current.** Before each run from `pending.json` (the logon task in a
+  VM template), it checks for a newer agent, verifies it against the release's SHA-256, swaps
+  it in and hands the run over, so a template no longer goes stale when Groundhog gains
+  features. If anything goes wrong (no network, a bad hash), the run carries on with the
+  current agent. Set `agentUpdate` in `pending.json` to `latest` (the default there), `off`,
+  or a version to pin to.
+- **Serve updates yourself.** `agentUpdateFrom` (or `--update-from`) points at any folder, share
+  or web server holding `agent.json` and the agent exes, so clones never need GitHub.
+  `groundhog mirror-agent <folder>` fills one from a release.
+- `groundhog-agent apply --update[=VERSION]` updates before a manual run (off by default), and
+  `groundhog-agent update` updates on demand, for maintaining templates.
+- **`agent: ">=0.5.0"` in a Groundhogfile** declares the oldest agent that understands it. An
+  older agent says so, instead of failing on an unknown key.
+- Releases include `agent.json`, the manifest agents update from.
+- `status` shows which agent version produced each result.
+
+### Upgrading
+- Rebake templates once with 0.5.0. Older agents can't update themselves, and they reject
+  `pending.json` files and Groundhogfiles that use the new keys.
+
 ## [0.4.0] - 2026-09-30
 
 ### Changed
@@ -67,6 +90,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.5.0]: https://github.com/guscatalano/Groundhog/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/guscatalano/Groundhog/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/guscatalano/Groundhog/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/guscatalano/Groundhog/compare/v0.1.0...v0.2.0

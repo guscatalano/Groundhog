@@ -44,6 +44,7 @@ cat <<EOF
 | --- | --- |
 | \`groundhog-agent-x64.exe\`, \`groundhog-agent-arm64.exe\` | The agent on its own: one file, no runtime. Copy it into any machine or VM template. |
 | \`groundhog-x64.zip\`, \`groundhog-arm64.zip\` | The host CLI plus the agent, for \`groundhog sandbox\` and \`groundhog pending\`. |
+| \`agent.json\` | The update manifest agents read to update themselves. Copy it with the agent exes to host your own update source. |
 | \`SHA256SUMS.txt\` | Checksums for everything above. |
 
 The newest agent is always at

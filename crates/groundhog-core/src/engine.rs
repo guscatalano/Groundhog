@@ -211,6 +211,9 @@ pub struct RunState {
     pub steps: Vec<StepState>,
     #[serde(default)]
     pub sources: Vec<LoadedSource>,
+    /// The agent version that produced this state.
+    #[serde(default)]
+    pub agent: String,
 }
 
 pub fn now() -> String {
@@ -274,6 +277,7 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
             })
             .collect(),
         sources: opts.sources,
+        agent: env!("CARGO_PKG_VERSION").to_owned(),
     };
 
     let save = |state: &mut RunState| -> Result<()> {

@@ -5,6 +5,7 @@
 
 mod checks;
 mod exec;
+mod update;
 
 use std::path::{Path, PathBuf};
 
@@ -14,9 +15,10 @@ use groundhog_core::cache::{Cache, CacheSource, FolderCache, parse_cache_source}
 use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{self, RunOptions, RunState, RunStatus, StepState, now, plan, state_file};
 use groundhog_core::fetch::{DefaultFetcher, HeaderRule};
-use groundhog_core::loader::{Loaded, Loader, source_ref};
+use groundhog_core::loader::{Loaded, Loader, NeedsAgent, source_ref};
 use groundhog_core::pending::{PENDING_FILE, Pending, default_home};
 use groundhog_core::report::{ConsoleReporter, FolderReporter, MultiReporter, Reporter, parse_report_sink};
+use groundhog_core::update::{Policy, Version};
 use groundhog_win::process::Proc;
 use groundhog_win::{tasks, token};
 
@@ -47,6 +49,16 @@ enum Command {
     InstallTask,
     /// Show the last result for each Groundhogfile applied on this machine.
     Status,
+    /// Update this agent now, without applying anything (for maintaining templates).
+    Update {
+        /// `latest`, or a version to move to.
+        #[arg(long, default_value = "latest", value_name = "POLICY")]
+        to: String,
+        /// Where agent updates come from: an agent.json manifest, or a folder, share or URL
+        /// holding one (default: GitHub releases).
+        #[arg(long, value_name = "SOURCE")]
+        from: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -82,6 +94,14 @@ struct ApplyArgs {
     /// Ignore earlier progress and run every step again.
     #[arg(long)]
     fresh: bool,
+    /// Update this agent before applying: `--update` for the latest, `--update=0.5.0` to pin.
+    /// Off unless given (the logon task's pending.json defaults to latest instead).
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "latest", value_name = "POLICY")]
+    update: Option<String>,
+    /// Where agent updates come from: an agent.json manifest, or a folder, share or URL
+    /// holding one (default: GitHub releases).
+    #[arg(long, value_name = "SOURCE")]
+    update_from: Option<String>,
 }
 
 fn main() {
@@ -100,8 +120,13 @@ fn main() {
 fn run(home: &Path, command: Command) -> Result<i32> {
     match command {
         Command::Apply(args) => {
-            let pending = to_pending(&args.source, args.report, args.reboot)?;
-            let state = apply(home, &pending, args.fresh)?;
+            let mut pending = to_pending(&args.source, args.report, args.reboot)?;
+            pending.agent_update = Some(args.update.unwrap_or_else(|| "off".to_owned()));
+            pending.agent_update_from = args.update_from;
+            let state = match apply(home, &pending, args.fresh)? {
+                Applied::Ran(state) => *state,
+                Applied::HandedOver(code) => return Ok(code),
+            };
             if state.status == RunStatus::RebootPending {
                 if args.reboot {
                     schedule_continuation(home, &pending)?;
@@ -133,6 +158,16 @@ fn run(home: &Path, command: Command) -> Result<i32> {
             print_status(home)?;
             Ok(0)
         }
+        Command::Update { to, from } => {
+            let settings = update::Settings { policy: Policy::parse(&to)?, from };
+            let session = Session::new(home, &Pending { source: String::new(), ..Pending::default() })?;
+            let content = ContentStore { fetcher: &session.fetcher, cache: &session.cache };
+            match update::update_now(&settings, home, &content, &session.reporter)? {
+                Some(path) => println!("installed {}", path.display()),
+                None => println!("groundhog-agent {} is up to date", Version::current()),
+            }
+            Ok(0)
+        }
     }
 }
 
@@ -149,6 +184,8 @@ fn to_pending(args: &SourceArgs, report: Vec<String>, allow_reboot: bool) -> Res
         headers,
         allow_reboot,
         allow_http: args.allow_http,
+        agent_update: None,
+        agent_update_from: None,
     })
 }
 
@@ -200,7 +237,13 @@ impl Session {
     }
 }
 
-fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<RunState> {
+enum Applied {
+    Ran(Box<RunState>),
+    /// A newer agent took over this run; its exit code is the result.
+    HandedOver(i32),
+}
+
+fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<Applied> {
     let session = Session::new(home, p)?;
     let reporter = &session.reporter;
     reporter.log(&format!("groundhog-agent {} applying {}", env!("CARGO_PKG_VERSION"), p.source));
@@ -211,19 +254,38 @@ fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<RunState> {
         reporter.log("warning: not running elevated; machine-wide installs and HKLM changes will fail");
     }
 
-    let (url, loaded) = match session.load(home, p) {
+    // Keep a template's frozen agent current before it reads a file written for a newer one.
+    let settings = update::Settings {
+        policy: Policy::parse(p.agent_update.as_deref().unwrap_or("latest"))?,
+        from: p.agent_update_from.clone(),
+    };
+    let content = ContentStore { fetcher: &session.fetcher, cache: &session.cache };
+    if let update::Outcome::HandedOver(code) = update::run(&settings, home, &content, reporter) {
+        return Ok(Applied::HandedOver(code));
+    }
+
+    let loaded = session.load(home, p).and_then(|(url, loaded)| match &loaded.file.requires_agent {
+        Some(required) if *required > Version::current() => {
+            Err(anyhow::anyhow!(update::explain_requirement(required, &settings)))
+        }
+        _ => Ok((url, loaded)),
+    });
+    let (url, loaded) = match loaded {
         Ok(v) => v,
         Err(e) => {
+            let e = match e.downcast_ref::<NeedsAgent>() {
+                Some(n) => anyhow::anyhow!(update::explain_requirement(&n.required, &settings)),
+                None => e,
+            };
             // Tell anyone watching, or a host would wait forever for a run that never starts.
             let state = failed_before_start(p, &e);
             reporter.log(&format!("failed: {e:#}"));
             reporter.status(&state);
-            return Ok(state);
+            return Ok(Applied::Ran(Box::new(state)));
         }
     };
 
     let steps = plan(&loaded.file);
-    let content = ContentStore { fetcher: &session.fetcher, cache: &session.cache };
     let mut exec = WinExecutor::new(&content, home.join("work"));
     let state = engine::run(
         &steps,
@@ -232,7 +294,7 @@ fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<RunState> {
         RunOptions { source: &url, sources: loaded.sources, state_path: &state_file(home, &url), fresh },
     )?;
     reporter.log(&format!("{:?}: {}", state.status, state.message.as_deref().unwrap_or_default()));
-    Ok(state)
+    Ok(Applied::Ran(Box::new(state)))
 }
 
 fn failed_before_start(p: &Pending, e: &anyhow::Error) -> RunState {
@@ -245,6 +307,7 @@ fn failed_before_start(p: &Pending, e: &anyhow::Error) -> RunState {
         reboots: 0,
         steps: Vec::new(),
         sources: Vec::new(),
+        agent: env!("CARGO_PKG_VERSION").to_owned(),
     }
 }
 
@@ -255,7 +318,11 @@ fn run_pending(home: &Path) -> Result<i32> {
         return Ok(0);
     };
     let pending: Pending = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
-    let state = apply(home, &pending, false)?;
+    let state = match apply(home, &pending, false)? {
+        Applied::Ran(state) => *state,
+        // The newer agent handled the pending file, reboots included.
+        Applied::HandedOver(code) => return Ok(code),
+    };
     match state.status {
         RunStatus::RebootPending if pending.allow_reboot => reboot()?,
         RunStatus::RebootPending => println!("A restart is required; it will continue at the next logon."),
@@ -316,6 +383,7 @@ fn exit_code(status: RunStatus) -> i32 {
 
 fn print_plan(home: &Path, p: &Pending) -> Result<()> {
     let session = Session::new(home, &Pending { report: Vec::new(), ..p.clone() })?;
+    println!("groundhog-agent {}", Version::current());
     let (_, loaded) = session.load(home, p)?;
     for s in &loaded.sources {
         println!("source  {}  sha256:{}", s.url, s.sha256);
@@ -335,7 +403,7 @@ fn print_status(home: &Path) -> Result<()> {
     };
     for entry in entries.filter_map(Result::ok) {
         let Some(state) = engine::read_state(&entry.path()) else { continue };
-        println!("{:?}  {}  (updated {})", state.status, state.source, state.updated);
+        println!("{:?}  {}  (updated {}, agent {})", state.status, state.source, state.updated, state.agent);
         if let Some(m) = &state.message {
             println!("    {m}");
         }

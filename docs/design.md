@@ -82,3 +82,7 @@ task, restarts, and continues. It gives up after 5 restarts in one run.
   downloading to find out what "latest" is.
 - More built-in steps: services, optional features, ACLs, symlinks, file associations.
 - Signed Groundhogfiles, checked against a key built into a template.
+- **Stronger agent-update trust**: today an update is accepted when its SHA-256 matches the
+  source's `agent.json`, which trusts whoever controls the source. Verifying GitHub's build
+  provenance attestations, or code-signing the binaries and checking the signature, would
+  also protect against a compromised source.

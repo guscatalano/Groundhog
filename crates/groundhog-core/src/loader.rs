@@ -14,6 +14,7 @@ use crate::model::{
     App, CURRENT_VERSION, Check, FileCopy, Groundhogfile, HiveScope, RegistryData, RegistryType, RegistryValue,
     RunAction, ServiceState, Shell, SourceRef, raw,
 };
+use crate::update::{self, Version};
 
 /// File names looked for when a source is a directory or a zip bundle, in order.
 pub const ROOT_FILE_NAMES: &[&str] = &["groundhog.yaml", "groundhog.yml", "groundhog.json", "Groundhogfile"];
@@ -167,16 +168,53 @@ fn tree_hash(dir: &Path) -> Result<String> {
     Ok(fetch::sha256_hex(&manifest))
 }
 
+/// A Groundhogfile asked for a newer agent than the one reading it. Returned (inside the
+/// error chain) whenever the file declares `agent:`, even if the rest of it doesn't parse:
+/// a newer file often uses keys an older agent has never heard of, and "update the agent"
+/// is the useful answer there, not "unknown field".
+#[derive(Debug)]
+pub struct NeedsAgent {
+    pub required: Version,
+}
+
+impl std::fmt::Display for NeedsAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "this Groundhogfile needs groundhog-agent {} or newer", self.required)
+    }
+}
+
+impl std::error::Error for NeedsAgent {}
+
 fn parse(bytes: &[u8], url: &Url) -> Result<raw::File> {
     let text = std::str::from_utf8(bytes).with_context(|| format!("{url} is not UTF-8"))?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    if url.path().to_ascii_lowercase().ends_with(".json") {
-        serde_json::from_str(text).with_context(|| format!("parsing {url}"))
+    let is_json = url.path().to_ascii_lowercase().ends_with(".json");
+    let strict = if is_json {
+        serde_json::from_str(text).map_err(anyhow::Error::from)
     } else if text.trim().is_empty() {
         Ok(raw::File::default())
     } else {
-        serde_norway::from_str(text).with_context(|| format!("parsing {url}"))
+        serde_norway::from_str(text).map_err(anyhow::Error::from)
+    };
+    strict.map_err(|e| {
+        let e = e.context(format!("parsing {url}"));
+        match peek_agent_requirement(text, is_json) {
+            Some(required) if required > Version::current() => {
+                anyhow::Error::new(NeedsAgent { required }).context(format!("{e:#}"))
+            }
+            _ => e,
+        }
+    })
+}
+
+/// Reads just the top-level `agent:` value, ignoring everything this version doesn't know.
+fn peek_agent_requirement(text: &str, is_json: bool) -> Option<Version> {
+    #[derive(Deserialize)]
+    struct Peek {
+        agent: Option<String>,
     }
+    let peek: Peek = if is_json { serde_json::from_str(text).ok()? } else { serde_norway::from_str(text).ok()? };
+    update::parse_requirement(&peek.agent?).ok()
 }
 
 fn find_root_file(dir: &Path) -> Result<Url> {
@@ -239,7 +277,8 @@ fn pin(sha256: Option<String>) -> Result<Option<String>> {
 }
 
 fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
-    let raw::File { apps, files, env, path, registry, run, verify, .. } = raw;
+    let raw::File { apps, files, env, path, registry, run, verify, agent, .. } = raw;
+    let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
     let apps = apps
         .into_iter()
         .map(|a| {
@@ -318,7 +357,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         .map(|(i, c)| resolve_check(c).with_context(|| format!("verify[{i}]")))
         .collect::<Result<_>>()?;
 
-    Ok(Groundhogfile { apps, files, env, path, registry, run, verify })
+    Ok(Groundhogfile { apps, files, env, path, registry, run, verify, requires_agent })
 }
 
 /// How long a check keeps retrying before it fails, unless it says otherwise. Checks usually
@@ -503,7 +542,10 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
     let mut verify = base.verify;
     verify.extend(top.verify);
 
-    Groundhogfile { apps, files, env, path, registry, run, verify }
+    // The strictest requirement wins: a base that needs a newer agent still needs it.
+    let requires_agent = base.requires_agent.max(top.requires_agent);
+
+    Groundhogfile { apps, files, env, path, registry, run, verify, requires_agent }
 }
 
 /// Convenience for callers: turns user input plus an optional pin into a [`SourceRef`].
@@ -704,6 +746,33 @@ verify:
         let v = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file.verify;
         let ports: Vec<_> = v.iter().map(|c| if let Check::Port { port, .. } = c { *port } else { 0 }).collect();
         assert_eq!(ports, [22, 3389]);
+    }
+
+    #[test]
+    fn agent_requirements_are_read_and_merged() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/base.yaml", "agent: '>=0.2.0'")
+            .with("https://cfg.test/top.yaml", "extends: base.yaml\nagent: 0.1.0");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        assert_eq!(g.requires_agent, Some(Version::parse("0.2.0").unwrap()), "the higher requirement wins");
+    }
+
+    #[test]
+    fn a_file_for_a_newer_agent_says_so_instead_of_unknown_field() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/future.yaml", "agent: '>=99.0.0'\nsome-future-key: [1, 2]")
+            .with("https://cfg.test/typo.yaml", "agent: '>=0.0.1'\naps: [git.git]");
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = load_with(&f, "https://cfg.test/future.yaml", dir.path()).unwrap_err();
+        let needs = err.downcast_ref::<NeedsAgent>().expect("a NeedsAgent error");
+        assert_eq!(needs.required, Version::parse("99.0.0").unwrap());
+        assert!(format!("{err:#}").contains("unknown field"), "the parse error is kept for context: {err:#}");
+
+        // An old enough requirement doesn't excuse a typo.
+        let err = load_with(&f, "https://cfg.test/typo.yaml", dir.path()).unwrap_err();
+        assert!(err.downcast_ref::<NeedsAgent>().is_none());
     }
 
     #[test]

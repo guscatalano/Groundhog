@@ -50,6 +50,19 @@ version: 1
 
 Optional. An agent refuses files that need a newer version than it supports.
 
+## `agent`
+
+```yaml
+agent: ">=0.5.0"
+```
+
+Optional: the oldest `groundhog-agent` that understands this file. Set it when you use a
+feature added in a later release. An older agent that reads the file then says exactly that,
+"this Groundhogfile needs groundhog-agent 0.5.0 or newer", instead of failing on a key it
+doesn't know. With [agent updates](templates.md#keeping-the-templates-agent-current) on, it
+will usually have updated itself before reading the file. The highest `agent:` across `extends`
+applies. Agents older than 0.5.0 don't know this key and reject it.
+
 ## `extends`
 
 ```yaml

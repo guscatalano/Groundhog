@@ -102,6 +102,9 @@ jobs:
           pattern: dist-*
           merge-multiple: true
           path: dist
+      # What agents read to update themselves (and what `groundhog mirror-agent` copies).
+      - name: Agent update manifest
+        run: python3 scripts/agent-manifest.py dist "$GITHUB_REF_NAME"
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt

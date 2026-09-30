@@ -24,6 +24,9 @@ pub struct Groundhogfile {
     pub registry: Vec<RegistryValue>,
     pub run: Vec<RunAction>,
     pub verify: Vec<Check>,
+    /// The oldest agent that understands this file (the highest `agent:` across `extends`).
+    #[serde(skip)]
+    pub requires_agent: Option<crate::update::Version>,
 }
 
 /// A health check. Unlike every other step, checks run on every apply, after everything else,
@@ -246,6 +249,8 @@ pub(crate) mod raw {
     #[serde(deny_unknown_fields)]
     pub struct File {
         pub version: Option<u32>,
+        /// The oldest agent version that understands this file, as `">=0.5.0"`.
+        pub agent: Option<String>,
         #[serde(default)]
         pub extends: OneOrMany<SourceRef>,
         #[serde(default)]

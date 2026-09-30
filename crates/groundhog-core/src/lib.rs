@@ -14,3 +14,4 @@ pub mod model;
 pub mod pending;
 pub mod plugin;
 pub mod report;
+pub mod update;

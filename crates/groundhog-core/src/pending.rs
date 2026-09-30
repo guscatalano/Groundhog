@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fetch::HeaderRule;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Pending {
     /// Path, URL or zip bundle, exactly as `groundhog-agent apply` takes it.
@@ -27,6 +27,14 @@ pub struct Pending {
     pub allow_reboot: bool,
     #[serde(default)]
     pub allow_http: bool,
+    /// How the agent keeps itself current before applying: `latest` (the default here, since a
+    /// template's agent is otherwise frozen at bake time), `off`, or a version to pin to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_update: Option<String>,
+    /// Where new agents come from: an `agent.json` manifest, or a folder, share or URL holding
+    /// one. Default: GitHub releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_update_from: Option<String>,
 }
 
 fn yes() -> bool {
