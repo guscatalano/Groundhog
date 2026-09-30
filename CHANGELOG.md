@@ -4,6 +4,31 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.10.0] - 2026-09-30
+
+### Added
+- **A built-in library of Groundhogfiles.** `groundhog:NAME` names one, to apply as it is or
+  to build on with `extends`:
+  ```powershell
+  groundhog-agent apply groundhog:windows-internals
+  ```
+  The first set is for Windows internals work: `sysinternals`, `windbg`, `wpt` (Windows
+  Performance Toolkit), `symbols`, `crash-dumps` and `explorer-dev`, and `windows-internals`
+  with all of them. A name means the library as of the agent's own release;
+  `groundhog:NAME@main` follows the latest one. See
+  [the library](docs/groundhogfile.md#the-built-in-library).
+
+### Fixed
+- **Features that finish after a restart restarted the machine one by one again.** The first
+  one left Windows "waiting for a restart", which the next feature took as a reason to restart
+  first. The agent now knows that restart is its own, finishes the section, and restarts once.
+
+### Documentation
+- `features:` and `capabilities:` don't need install media: without `source:`, payloads come
+  from Windows Update (or WSUS). Tested on a fresh Windows 11 VM, including the restart and
+  the logon task picking the run back up. It's slow (about half an hour each for `NetFx3` and
+  `OpenSSH.Server`), so the docs now say when a local source or a baked template pays off.
+
 ## [0.9.0] - 2026-09-30
 
 ### Added
@@ -165,6 +190,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.10.0]: https://github.com/guscatalano/Groundhog/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/guscatalano/Groundhog/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/guscatalano/Groundhog/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/guscatalano/Groundhog/compare/v0.6.0...v0.7.0

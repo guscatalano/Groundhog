@@ -1,0 +1,5 @@
+# Microsoft's public symbol server, cached in C:\Symbols, for WinDbg, WPA, Process Explorer
+# and anything else that reads _NT_SYMBOL_PATH.
+
+env:
+  _NT_SYMBOL_PATH: srv*C:\Symbols*https://msdl.microsoft.com/download/symbols

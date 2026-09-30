@@ -1,0 +1,14 @@
+# A machine for Windows internals work: Sysinternals, WinDbg, the Windows Performance Toolkit,
+# the public symbol server, crash dumps kept, and Explorer showing everything.
+#
+#   groundhog-agent apply groundhog:windows-internals
+#
+# Or start from it and add your own:  extends: groundhog:windows-internals
+
+extends:
+  - sysinternals.groundhog.yaml
+  - windbg.groundhog.yaml
+  - wpt.groundhog.yaml
+  - symbols.groundhog.yaml
+  - crash-dumps.groundhog.yaml
+  - explorer-dev.groundhog.yaml

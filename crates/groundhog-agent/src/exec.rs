@@ -47,11 +47,14 @@ pub struct WinExecutor<'a> {
     secrets: crate::secrets::Secrets,
     /// Opened on first use: only needed for features and capabilities.
     dism: Option<dism::Session>,
+    /// A servicing step in this run finished "after a restart", so Windows now reports a
+    /// pending restart of our own making. The rest of the section carries on regardless.
+    deferred_restart: bool,
 }
 
 impl<'a> WinExecutor<'a> {
     pub fn new(content: &'a ContentStore<'a>, work_dir: PathBuf, secrets: crate::secrets::Secrets) -> Self {
-        Self { content, work_dir, winget: None, started: SystemTime::now(), secrets, dism: None }
+        Self { content, work_dir, winget: None, started: SystemTime::now(), secrets, dism: None, deferred_restart: false }
     }
 }
 
@@ -203,12 +206,14 @@ impl WinExecutor<'_> {
     /// it's idempotent even on a template where someone already enabled it.
     fn ensure_feature(&mut self, f: &Feature, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
         let log_path = self.work_dir.join("dism.log");
+        let deferred = self.deferred_restart;
         let session = self.dism()?;
         let state = session.feature_state(&f.name).map_err(|e| explain(e, "feature", &f.name, &log_path))?;
         if state.is_on() == f.enabled {
+            self.deferred_restart |= state.is_pending();
             return Ok(settled(state, log));
         }
-        if dism::servicing_reboot_pending() {
+        if !deferred && dism::servicing_reboot_pending() {
             log("Windows servicing is waiting for a restart; retrying after one");
             return Ok(Outcome::RetryAfterReboot);
         }
@@ -224,21 +229,19 @@ impl WinExecutor<'_> {
             return pending_or(e, "feature", &f.name, &log_path, log);
         }
         let after = session.feature_state(&f.name).map_err(|e| explain(e, "feature", &f.name, &log_path))?;
-        Ok(if after.is_pending() {
-            Outcome::DoneRestartLater { changed: true }
-        } else {
-            Outcome::Done { changed: true }
-        })
+        Ok(self.restart_later_if(after.is_pending()))
     }
 
     fn ensure_capability(&mut self, c: &Capability, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
         let log_path = self.work_dir.join("dism.log");
+        let deferred = self.deferred_restart;
         let session = self.dism()?;
         let state = session.capability_state(&c.name).map_err(|e| explain(e, "capability", &c.name, &log_path))?;
         if state.is_on() == c.present {
+            self.deferred_restart |= state.is_pending();
             return Ok(settled(state, log));
         }
-        if dism::servicing_reboot_pending() {
+        if !deferred && dism::servicing_reboot_pending() {
             log("Windows servicing is waiting for a restart; retrying after one");
             return Ok(Outcome::RetryAfterReboot);
         }
@@ -254,11 +257,16 @@ impl WinExecutor<'_> {
             return pending_or(e, "capability", &c.name, &log_path, log);
         }
         let after = session.capability_state(&c.name).map_err(|e| explain(e, "capability", &c.name, &log_path))?;
-        Ok(if after.is_pending() {
+        Ok(self.restart_later_if(after.is_pending()))
+    }
+
+    fn restart_later_if(&mut self, pending: bool) -> Outcome {
+        if pending {
+            self.deferred_restart = true;
             Outcome::DoneRestartLater { changed: true }
         } else {
             Outcome::Done { changed: true }
-        })
+        }
     }
 
     /// Creates the account if it's missing; otherwise brings its settings in line, leaving the

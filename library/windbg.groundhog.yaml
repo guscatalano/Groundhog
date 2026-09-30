@@ -1,0 +1,10 @@
+# WinDbg, the current debugger from the Microsoft Store (winget id Microsoft.WinDbg).
+# Pair it with symbols.groundhog.yaml for the symbol server.
+
+apps:
+  - Microsoft.WinDbg
+
+verify:
+  - command: |
+      # installed for this user
+      if (-not (Get-AppxPackage Microsoft.WinDbg)) { exit 1 }

@@ -1,0 +1,20 @@
+# Keep a full memory dump of any crashing program in C:\CrashDumps (Windows Error Reporting
+# LocalDumps), and keep kernel dumps even when disk space is low.
+
+registry:
+  - key: HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps
+    name: DumpFolder
+    type: expand-string
+    value: C:\CrashDumps
+  - key: HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps
+    name: DumpType
+    type: dword
+    value: 2                  # 1 mini, 2 full
+  - key: HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps
+    name: DumpCount
+    type: dword
+    value: 20
+  - key: HKLM\SYSTEM\CurrentControlSet\Control\CrashControl
+    name: AlwaysKeepMemoryDump
+    type: dword
+    value: 1

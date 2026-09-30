@@ -84,6 +84,14 @@ target\release\groundhog-agent.exe apply examples\dev\groundhog.yaml
 target\release\groundhog.exe sandbox examples\dev\groundhog.yaml --cache C:\groundhog-cache
 ```
 
+Or start from the [built-in library](docs/groundhogfile.md#the-built-in-library): a machine
+for Windows internals work (Sysinternals, WinDbg, the Performance Toolkit, symbols, crash
+dumps) is one line:
+
+```powershell
+groundhog-agent apply groundhog:windows-internals
+```
+
 ## Sources: path, URL or zip
 
 The agent takes a local path, a directory, an `https://` URL, or a `.zip` bundle (local or remote).

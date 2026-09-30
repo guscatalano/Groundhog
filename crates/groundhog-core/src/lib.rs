@@ -10,6 +10,7 @@ pub mod content;
 pub mod engine;
 pub mod fetch;
 pub mod github;
+pub mod library;
 pub mod loader;
 pub mod model;
 pub mod pending;

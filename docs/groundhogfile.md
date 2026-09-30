@@ -84,6 +84,37 @@ Bases load first and this file is layered on top:
 
 Cycles are detected.
 
+### The built-in library
+
+`groundhog:NAME` names a ready-made Groundhogfile from Groundhog's own
+[`library/`](../library) folder. Extend one and add your own on top, or apply one as it is:
+
+```yaml
+extends: groundhog:windows-internals
+apps:
+  - Microsoft.VisualStudioCode
+```
+
+```powershell
+groundhog-agent apply groundhog:windows-internals
+```
+
+It's the library as of the agent's release, so it never needs a newer agent than the one
+reading it, and it changes only when the agent does (the template's agent keeps itself
+current). `groundhog:NAME@main` follows the latest library instead, and
+`groundhog:NAME@v0.10.0` pins one release. The files are plain Groundhogfiles on GitHub, so a
+machine that can't reach GitHub can use a copy from your own share by path instead.
+
+| Name | What it sets up |
+| --- | --- |
+| `windows-internals` | All of the below. |
+| `sysinternals` | Sysinternals Suite in `C:\Tools\Sysinternals`, on PATH, EULA accepted. |
+| `windbg` | WinDbg. |
+| `wpt` | Windows Performance Toolkit (WPR, WPA, xperf) from the Windows ADK. |
+| `symbols` | `_NT_SYMBOL_PATH` for Microsoft's symbol server, cached in `C:\Symbols`. |
+| `crash-dumps` | Full dumps of crashing programs in `C:\CrashDumps`; kernel dumps kept. |
+| `explorer-dev` | Explorer shows extensions, hidden and system files, and full paths. |
+
 ## `users`
 
 ```yaml
@@ -164,11 +195,19 @@ best taken before long installs.
 - **Names are exact** and differ between client and Server Windows (`Microsoft-Hyper-V-All` vs
   `Microsoft-Hyper-V`). `dism /online /get-features` and `dism /online /get-capabilities` list
   them. A capability name without `~` gets the usual version, `~~~~0.0.1.0`.
-- **Sources** are folders or shares the machine can reach: the `sources\sxs` folder of install
-  media for this exact Windows build (for `NetFx3`), or an unpacked Features on Demand
-  repository ("Languages and Optional Features" ISO). A relative path works when the
-  Groundhogfile is a local file. Zip and web sources aren't supported yet; these repositories
-  are gigabytes.
+- **Where payloads come from:** without `source:`, Windows gets anything it doesn't have on
+  disk (`NetFx3`, most capabilities) from **Windows Update**, or from WSUS / Windows Update for
+  Business when the machine is managed. That needs nothing from you but internet access, but
+  it's slow: on a fresh Windows 11 VM, `NetFx3` and `OpenSSH.Server` each took about half an
+  hour, mostly spent working out which parts of the Features on Demand catalog apply. That's a
+  good reason to [bake them into the template](templates.md#baking-a-base-layer), or to give
+  a local `source:`.
+  `source:` is for machines that can't do that (offline, or WSUS without the payloads, error
+  `0x800F0954`): a folder or share with the `sources\sxs` folder of install media for this
+  exact Windows build (for `NetFx3`), or an unpacked Features on Demand repository
+  ("Languages and Optional Features" ISO). A mounted ISO works as a drive path
+  (`D:\sources\sxs`). A relative path works when the Groundhogfile is a local file. Zip and
+  web sources aren't supported yet; these repositories are gigabytes.
 - **Needs the agent elevated.** Not supported inside Windows Sandbox (the step fails
   immediately with that explanation).
 

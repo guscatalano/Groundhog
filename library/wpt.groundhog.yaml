@@ -1,0 +1,10 @@
+# Windows Performance Toolkit: WPR, WPA and xperf, from the Windows ADK (only that feature
+# of it). WPA opens traces recorded with wpr.exe, which Windows already includes.
+
+apps:
+  - id: Microsoft.WindowsADK
+    args: --override "/features OptionId.WindowsPerformanceToolkit /quiet /norestart /ceip off"
+    timeout: 30m
+
+verify:
+  - file: C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\wpa.exe

@@ -84,7 +84,7 @@ fn xml_escape(s: &str) -> String {
 
 /// Decides what to map for the source and how the agent inside should refer to it.
 pub(crate) fn map_source(source: &str, map_root: Option<&Path>) -> Result<(Option<Mapping>, String)> {
-    let is_url = source.contains("://") && !source.starts_with("file://");
+    let is_url = (source.contains("://") && !source.starts_with("file://")) || source.starts_with("groundhog:");
     if is_url {
         return Ok((None, source.to_owned()));
     }
@@ -207,6 +207,8 @@ mod tests {
         assert_eq!(m.unwrap().host, dir.path());
         assert_eq!(inside, r"C:\groundhog\bundle\team\dev.yaml");
 
+        let (m, _) = map_source("groundhog:windbg", None).unwrap();
+        assert!(m.is_none());
         let (m, inside) = map_source("https://cfg.test/dev.yaml", None).unwrap();
         assert!(m.is_none());
         assert_eq!(inside, "https://cfg.test/dev.yaml");

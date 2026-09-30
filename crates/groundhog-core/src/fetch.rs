@@ -103,7 +103,8 @@ pub fn file_url_to_path(url: &Url) -> Result<PathBuf> {
 
 /// Turns what a user typed (a path, relative or absolute, or a URL) into a URL.
 pub fn parse_location(input: &str, cwd: &Path) -> Result<Url> {
-    let looks_like_url = input.contains("://") && !is_windows_path(input);
+    let looks_like_url = (input.contains("://") && !is_windows_path(input))
+        || input.starts_with(&format!("{}:", crate::library::SCHEME));
     if looks_like_url {
         return Url::parse(input).with_context(|| format!("invalid URL '{input}'"));
     }
@@ -167,6 +168,7 @@ mod tests {
     fn parses_paths_and_urls() {
         let cwd = Path::new(r"C:\work");
         assert_eq!(parse_location("https://x.test/a.yaml", cwd).unwrap().as_str(), "https://x.test/a.yaml");
+        assert_eq!(parse_location("groundhog:windbg", cwd).unwrap().as_str(), "groundhog:windbg");
         assert_eq!(parse_location("dev.yaml", cwd).unwrap().as_str(), "file:///C:/work/dev.yaml");
         assert_eq!(parse_location(r"D:\b\c.yaml", cwd).unwrap().as_str(), "file:///D:/b/c.yaml");
         assert_eq!(parse_location(r"\\nas\share\x.yaml", cwd).unwrap().as_str(), "file://nas/share/x.yaml");

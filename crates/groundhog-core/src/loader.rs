@@ -11,6 +11,7 @@ use crate::archive;
 use crate::content::ContentStore;
 use crate::fetch::{self, file_url_to_path};
 use crate::github;
+use crate::library;
 use crate::model::{
     App, CURRENT_VERSION, Capability, Check, Feature, FileCopy, Groundhogfile, HiveScope, Password, RegistryData,
     RegistryType, RegistryValue, RunAction, ServiceState, Shell, SourceRef, User, raw,
@@ -120,6 +121,10 @@ impl Loader<'_> {
     fn load_ref(&self, r: &SourceRef, stack: &mut Vec<Url>, sources: &mut Vec<LoadedSource>) -> Result<Groundhogfile> {
         let mut url = r.url.clone();
         let mut sha256 = r.sha256.clone();
+
+        if library::is_library(&url) {
+            url = library::expand(&url)?;
+        }
 
         if url.path().to_ascii_lowercase().ends_with(".zip") {
             let zip = self.content.get(&url, sha256.as_deref())?;
@@ -1188,6 +1193,56 @@ capabilities:
             let err = format!("{:#}", load_with(&f, "https://cfg.test/b.yaml", dir.path()).unwrap_err());
             assert!(err.contains(want), "{yaml}: expected '{want}' in: {err}");
         }
+    }
+
+    #[test]
+    fn library_files_parse_and_extend_only_each_other() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        let mut count = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with(".groundhog.yaml") {
+                continue;
+            }
+            let url = library::expand(&Url::parse(&format!("groundhog:{}", name.trim_end_matches(".groundhog.yaml"))).unwrap())
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            let mut raw = parse(&std::fs::read(&path).unwrap(), &url).unwrap_or_else(|e| panic!("{e:#}"));
+            for base in std::mem::take(&mut raw.extends).into_vec() {
+                let base = resolve_source_ref(&url, base).unwrap();
+                let file = base.url.path_segments().unwrap().next_back().unwrap().to_owned();
+                assert!(dir.join(&file).is_file(), "{name} extends {file}, which isn't in library/");
+            }
+            resolve(&url, raw).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            count += 1;
+        }
+        assert!(count >= 5, "found only {count} library files");
+    }
+
+    #[test]
+    fn library_names_load_from_the_library() {
+        let v = env!("CARGO_PKG_VERSION");
+        let lib = format!("https://raw.githubusercontent.com/guscatalano/Groundhog/v{v}/library");
+        let f = MapFetcher::default()
+            .with(&format!("{lib}/bundle.groundhog.yaml"), "extends: [part.groundhog.yaml]
+apps: [b]")
+            .with(&format!("{lib}/part.groundhog.yaml"), "apps: [a]")
+            .with("https://cfg.test/top.yaml", "extends: groundhog:bundle
+apps: [c]");
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap();
+        let ids: Vec<_> = loaded
+            .file
+            .apps
+            .iter()
+            .map(|a| match a {
+                App::Winget { id, .. } => id.as_str(),
+                App::Url { .. } => "url",
+            })
+            .collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        let direct = load_with(&f, "groundhog:bundle", dir.path()).unwrap();
+        assert_eq!(direct.file.apps.len(), 2);
     }
 
     #[test]
