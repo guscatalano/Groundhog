@@ -4,6 +4,25 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.9.0] - 2026-09-30
+
+### Added
+- **`features:` and `capabilities:`** enable or disable Windows optional features (WSL,
+  `VirtualMachinePlatform`, `NetFx3`, IIS, …) and add or remove capabilities / Features on
+  Demand (`OpenSSH.Server`, RSAT, languages, …). They run after `users` and before `apps`.
+  Each step checks the live state first, so they're safe on machines where someone already
+  did it. Payloads can come from a folder or share (`source:`, with `limit-access: true` to
+  keep Windows Update out of it). Common DISM failures come with what to do about them.
+- **One restart for a batch of features.** Features that finish after a restart no longer
+  restart the machine one by one: the agent completes the rest of the section, restarts once
+  and continues.
+- A "bake a base layer" recipe for templates in [docs/templates.md](docs/templates.md).
+
+### Notes
+- This uses the DISM API directly (typed state, exact error codes, clean cancellation for
+  `timeout:`), so the agent must run elevated, as it does from the template's logon task. Not
+  supported inside Windows Sandbox.
+
 ## [0.8.0] - 2026-09-30
 
 ### Added
@@ -146,6 +165,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.9.0]: https://github.com/guscatalano/Groundhog/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/guscatalano/Groundhog/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/guscatalano/Groundhog/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/guscatalano/Groundhog/compare/v0.5.0...v0.6.0

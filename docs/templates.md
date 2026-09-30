@@ -108,6 +108,22 @@ It downloads the agents, verifies them against the release's manifest, and write
 also copy a release's `agent.json` and `groundhog-agent-*.exe` assets by hand; they're all
 together on each release page.
 
+### Baking a base layer
+
+Anything every clone needs and that rarely changes (Windows features and capabilities, big
+apps) is faster done once in the template than in every clone. Apply a base Groundhogfile to
+the template VM **before** sealing it:
+
+```powershell
+groundhog-agent apply base.groundhog.yaml --reboot   # features, capabilities, common apps
+sysprep /generalize /oobe /shutdown /unattend:C:\unattend.xml
+```
+
+Clones then extend the base (`extends: base.groundhog.yaml`). The base's steps find the
+machine already in the right state and take seconds, not minutes, and a feature that needed
+restarts in the template doesn't need them again. This is the Docker-layer idea applied to VM
+templates, with no image-editing tools involved.
+
 ### What still has to be baked once
 
 Self-update arrived in **0.5.0**. A template baked with an older agent can't update itself, and

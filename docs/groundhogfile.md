@@ -3,8 +3,8 @@
 A Groundhogfile is YAML (`.yaml`/`.yml`, or no extension) or JSON (`.json`). Unknown keys are
 errors, so typos fail at load time instead of being ignored.
 
-Steps run in this order: `users`, winget bootstrap (if any winget apps), `apps`, `files`, `env`,
-`path`, `registry`, `run`, then the `verify` checks.
+Steps run in this order: `users`, `features`, `capabilities`, winget bootstrap (if any winget
+apps), `apps`, `files`, `env`, `path`, `registry`, `run`, then the `verify` checks.
 
 ## When steps run again
 
@@ -121,6 +121,67 @@ The agent takes secrets out of `pending.json` as soon as it reads it. They're ne
 recorded in state. If a run pauses for a restart, they're kept until it finishes, encrypted
 with DPAPI so only the same account on the same machine can read them, and then deleted.
 `plan` lists the secrets a file needs and whether each one is provided.
+
+## `features` and `capabilities`
+
+Windows optional features (`Microsoft-Windows-Subsystem-Linux`, `VirtualMachinePlatform`,
+`NetFx3`, `IIS-WebServerRole`, …) and capabilities, also called Features on Demand
+(`OpenSSH.Server`, `Rsat.*`, …).
+
+```yaml
+features:
+  - Microsoft-Windows-Subsystem-Linux          # short form: enable it
+  - name: NetFx3
+    source: \\nas\media\26100\sources\sxs       # a folder or share with the payload; one or a list
+    limit-access: true                          # never ask Windows Update
+    timeout: 30m
+  - name: IIS-WebServerRole
+    all: true                                   # the default: enable the features it depends on
+  - name: SMB1Protocol
+    state: disabled                             # enabled (default) | disabled
+    remove-payload: true                        # disabled only: also delete its files
+
+capabilities:
+  - OpenSSH.Server                              # short for OpenSSH.Server~~~~0.0.1.0
+  - name: Language.Basic~~~de-DE~0.0.1.0        # other versions: write the full name
+    source: \\nas\fod\26100-amd64
+    limit-access: true
+  - name: App.StepsRecorder
+    state: removed                              # present (default) | removed
+```
+
+They run right after `users` and before `apps`, because apps often need them (WSL or
+`VirtualMachinePlatform` for Docker, `NetFx3` for older installers), and their restarts are
+best taken before long installs.
+
+- **Live state first:** every step checks the feature's current state and does nothing if it's
+  already right, so it's safe on templates where someone already enabled it.
+- **One restart for the lot:** a feature that finishes only after a restart doesn't restart
+  the machine right away. The agent finishes the rest of the features and capabilities first,
+  then restarts once and continues.
+- **Pending servicing:** if Windows is already waiting for a restart from earlier servicing,
+  the step restarts first and then runs.
+- **Names are exact** and differ between client and Server Windows (`Microsoft-Hyper-V-All` vs
+  `Microsoft-Hyper-V`). `dism /online /get-features` and `dism /online /get-capabilities` list
+  them. A capability name without `~` gets the usual version, `~~~~0.0.1.0`.
+- **Sources** are folders or shares the machine can reach: the `sources\sxs` folder of install
+  media for this exact Windows build (for `NetFx3`), or an unpacked Features on Demand
+  repository ("Languages and Optional Features" ISO). A relative path works when the
+  Groundhogfile is a local file. Zip and web sources aren't supported yet; these repositories
+  are gigabytes.
+- **Needs the agent elevated.** Not supported inside Windows Sandbox (the step fails
+  immediately with that explanation).
+
+Common failures, and what the error suggests:
+
+| Code | Meaning |
+| --- | --- |
+| `0x800F080C` | No feature or capability by that name on this edition. |
+| `0x800F081F` | The payload wasn't found: give `source:`, or allow Windows Update. |
+| `0x800F0954` | A WSUS policy blocks the download: give `source:` with `limit-access: true`. |
+| `0x800F0906`, `0x800F0907` | Download from Windows Update failed or is blocked. |
+
+Details are in `%ProgramData%\groundhog\work\dism.log` and `C:\Windows\Logs\CBS\CBS.log`.
 
 ## `apps`
 
