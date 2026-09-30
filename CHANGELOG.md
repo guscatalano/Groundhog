@@ -146,6 +146,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.8.0]: https://github.com/guscatalano/Groundhog/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/guscatalano/Groundhog/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/guscatalano/Groundhog/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/guscatalano/Groundhog/compare/v0.4.0...v0.5.0
