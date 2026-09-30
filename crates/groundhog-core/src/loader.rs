@@ -12,8 +12,8 @@ use crate::content::ContentStore;
 use crate::fetch::{self, file_url_to_path};
 use crate::github;
 use crate::model::{
-    App, CURRENT_VERSION, Check, FileCopy, Groundhogfile, HiveScope, RegistryData, RegistryType, RegistryValue,
-    RunAction, ServiceState, Shell, SourceRef, raw,
+    App, CURRENT_VERSION, Check, FileCopy, Groundhogfile, HiveScope, Password, RegistryData, RegistryType,
+    RegistryValue, RunAction, ServiceState, Shell, SourceRef, User, raw,
 };
 use crate::update::{self, Version};
 
@@ -301,7 +301,7 @@ fn pin(sha256: Option<String>) -> Result<Option<String>> {
 }
 
 fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
-    let raw::File { apps, files, env, path, registry, run, verify, agent, .. } = raw;
+    let raw::File { apps, files, env, path, registry, run, verify, agent, users, .. } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
     let apps = apps
         .into_iter()
@@ -397,7 +397,59 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         .map(|(i, c)| resolve_check(c).with_context(|| format!("verify[{i}]")))
         .collect::<Result<_>>()?;
 
-    Ok(Groundhogfile { apps, files, env, path, registry, run, verify, requires_agent })
+    let users = users
+        .into_iter()
+        .enumerate()
+        .map(|(i, u)| resolve_user(u).with_context(|| format!("users[{i}]")))
+        .collect::<Result<_>>()?;
+
+    Ok(Groundhogfile { users, apps, files, env, path, registry, run, verify, requires_agent })
+}
+
+fn resolve_user(u: raw::User) -> Result<User> {
+    // Windows' own rules for local account names.
+    if u.name.trim().is_empty()
+        || u.name.len() > 20
+        || u.name.contains(['"', '/', '\\', '[', ']', ':', ';', '|', '=', ',', '+', '*', '?', '<', '>', '@'])
+    {
+        bail!(
+            "'{}' is not a valid local account name (up to 20 characters, none of \" / \\ [ ] : ; | = , + * ? < > @)",
+            u.name
+        );
+    }
+    let password = match u.password {
+        None => Password::Generate,
+        Some(raw::StringOr::Short(s)) if s == "generate" => Password::Generate,
+        Some(raw::StringOr::Short(_)) => bail!(
+            "user '{}': a password can't be written in a Groundhogfile; use 'generate' or {{ secret: NAME }} and supply NAME at run time",
+            u.name
+        ),
+        Some(raw::StringOr::Full(r)) => {
+            if r.secret.is_empty() || !r.secret.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                bail!("user '{}': secret names use letters, digits and _ ('{}')", u.name, r.secret);
+            }
+            Password::Secret(r.secret)
+        }
+    };
+    Ok(User {
+        name: u.name,
+        full_name: u.full_name,
+        password,
+        groups: u.groups.map(raw::OneOrMany::into_vec).unwrap_or_default(),
+        password_never_expires: u.password_never_expires.unwrap_or(true),
+        reset_password: u.reset_password,
+    })
+}
+
+/// Every secret a Groundhogfile needs at run time.
+pub fn required_secrets(file: &Groundhogfile) -> std::collections::BTreeSet<String> {
+    file.users
+        .iter()
+        .filter_map(|u| match &u.password {
+            Password::Secret(name) => Some(name.clone()),
+            Password::Generate => None,
+        })
+        .collect()
 }
 
 fn resolve_run(base: &Url, r: raw::RunFull) -> Result<RunAction> {
@@ -643,10 +695,14 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
     let mut verify = base.verify;
     verify.extend(top.verify);
 
+    let mut users: Vec<User> =
+        base.users.into_iter().filter(|b| !top.users.iter().any(|t| eq(&t.name, &b.name))).collect();
+    users.extend(top.users);
+
     // The strictest requirement wins: a base that needs a newer agent still needs it.
     let requires_agent = base.requires_agent.max(top.requires_agent);
 
-    Groundhogfile { apps, files, env, path, registry, run, verify, requires_agent }
+    Groundhogfile { users, apps, files, env, path, registry, run, verify, requires_agent }
 }
 
 /// Convenience for callers: turns user input plus an optional pin into a [`SourceRef`].
@@ -958,6 +1014,30 @@ files:
             let err = format!("{:#}", load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap_err());
             assert!(err.contains(want), "{yaml}: expected '{want}' in: {err}");
         }
+    }
+
+    #[test]
+    fn users_take_secrets_or_generate_and_refuse_literal_passwords() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/g.yaml",
+                "users:\n  - name: tester\n    password: { secret: TESTER_PASSWORD }\n    groups: [Remote Desktop Users]\n  - name: svc\n    password: generate\n  - name: bare",
+            )
+            .with("https://cfg.test/literal.yaml", "users: [{ name: a, password: hunter2 }]")
+            .with("https://cfg.test/badname.yaml", "users: [{ name: 'a/b' }]")
+            .with("https://cfg.test/typo.yaml", "users: [{ name: a, groop: [Users] }]");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap().file;
+        assert_eq!(g.users[0].password, Password::Secret("TESTER_PASSWORD".into()));
+        assert_eq!(g.users[0].groups, ["Remote Desktop Users"]);
+        assert!(g.users[0].password_never_expires, "defaults to never expiring");
+        assert_eq!((&g.users[1].password, &g.users[2].password), (&Password::Generate, &Password::Generate));
+        assert_eq!(required_secrets(&g).into_iter().collect::<Vec<_>>(), ["TESTER_PASSWORD"]);
+
+        let err = |u: &str| format!("{:#}", load_with(&f, u, dir.path()).unwrap_err());
+        assert!(err("https://cfg.test/literal.yaml").contains("can't be written in a Groundhogfile"));
+        assert!(err("https://cfg.test/badname.yaml").contains("not a valid local account name"));
+        assert!(err("https://cfg.test/typo.yaml").contains("unknown field `groop`"));
     }
 
     #[test]

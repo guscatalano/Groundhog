@@ -5,6 +5,7 @@
 
 mod checks;
 mod exec;
+mod secrets;
 mod update;
 
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use groundhog_core::cache::{Cache, CacheSource, FolderCache, parse_cache_source}
 use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{self, RunOptions, RunState, RunStatus, StepState, now, plan, state_file};
 use groundhog_core::fetch::{DefaultFetcher, HeaderRule};
-use groundhog_core::loader::{Loaded, Loader, NeedsAgent, source_ref};
+use groundhog_core::loader::{Loaded, Loader, NeedsAgent, required_secrets, source_ref};
 use groundhog_core::pending::{PENDING_FILE, Pending, default_home};
 use groundhog_core::report::{ConsoleReporter, FolderReporter, MultiReporter, Reporter, parse_report_sink};
 use groundhog_core::update::{Policy, Version};
@@ -102,6 +103,10 @@ struct ApplyArgs {
     /// holding one (default: GitHub releases).
     #[arg(long, value_name = "SOURCE")]
     update_from: Option<String>,
+    /// A JSON file of secrets the Groundhogfile names, `{ "NAME": "value" }`. They can also
+    /// come from GROUNDHOG_SECRET_<NAME> environment variables.
+    #[arg(long, value_name = "FILE")]
+    secrets_file: Option<PathBuf>,
 }
 
 fn main() {
@@ -123,6 +128,9 @@ fn run(home: &Path, command: Command) -> Result<i32> {
             let mut pending = to_pending(&args.source, args.report, args.reboot)?;
             pending.agent_update = Some(args.update.unwrap_or_else(|| "off".to_owned()));
             pending.agent_update_from = args.update_from;
+            if let Some(file) = &args.secrets_file {
+                pending.secrets = secrets::read_file(file)?;
+            }
             let state = match apply(home, &pending, args.fresh)? {
                 Applied::Ran(state) => *state,
                 Applied::HandedOver(code) => return Ok(code),
@@ -186,6 +194,7 @@ fn to_pending(args: &SourceArgs, report: Vec<String>, allow_reboot: bool) -> Res
         allow_http: args.allow_http,
         agent_update: None,
         agent_update_from: None,
+        secrets: Default::default(),
     })
 }
 
@@ -286,7 +295,8 @@ fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<Applied> {
     };
 
     let steps = plan(&loaded.file);
-    let mut exec = WinExecutor::new(&content, home.join("work"));
+    let secrets = secrets::gather(home, &p.secrets)?;
+    let mut exec = WinExecutor::new(&content, home.join("work"), secrets.clone());
     let state = engine::run(
         &steps,
         &mut exec,
@@ -294,6 +304,11 @@ fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<Applied> {
         RunOptions { source: &url, sources: loaded.sources, state_path: &state_file(home, &url), fresh },
     )?;
     reporter.log(&format!("{:?}: {}", state.status, state.message.as_deref().unwrap_or_default()));
+    // Secrets outlive a run only while it's paused for a restart, encrypted for this user.
+    match state.status {
+        RunStatus::RebootPending => secrets::save_store(home, &secrets)?,
+        _ => secrets::delete_store(home)?,
+    }
     Ok(Applied::Ran(Box::new(state)))
 }
 
@@ -317,7 +332,14 @@ fn run_pending(home: &Path) -> Result<i32> {
         println!("nothing pending ({} not found)", path.display());
         return Ok(0);
     };
-    let pending: Pending = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    let mut pending: Pending = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    // Take secrets out of the plain-text file right away; they live on only encrypted.
+    if !pending.secrets.is_empty() {
+        let mut stored = secrets::load_store(home)?;
+        stored.extend(std::mem::take(&mut pending.secrets));
+        secrets::save_store(home, &stored)?;
+        engine::write_json_atomic(&path, &pending)?;
+    }
     let state = match apply(home, &pending, false)? {
         Applied::Ran(state) => *state,
         // The newer agent handled the pending file, reboots included.
@@ -336,7 +358,8 @@ fn run_pending(home: &Path) -> Result<i32> {
 
 /// Makes `apply --reboot` continue by itself after the restart.
 fn schedule_continuation(home: &Path, p: &Pending) -> Result<()> {
-    engine::write_json_atomic(&home.join(PENDING_FILE), p)?;
+    // Secrets were saved encrypted when the run paused; the plain-text file never holds them.
+    engine::write_json_atomic(&home.join(PENDING_FILE), &Pending { secrets: Default::default(), ..p.clone() })?;
     let exe = install_self(home)?;
     let mut args = "run-pending".to_owned();
     if home != default_home() {
@@ -387,6 +410,15 @@ fn print_plan(home: &Path, p: &Pending) -> Result<()> {
     let (_, loaded) = session.load(home, p)?;
     for s in &loaded.sources {
         println!("source  {}  sha256:{}", s.url, s.sha256);
+    }
+    let needed = required_secrets(&loaded.file);
+    if !needed.is_empty() {
+        let have = secrets::gather(home, &p.secrets)?;
+        let listed: Vec<String> = needed
+            .iter()
+            .map(|n| format!("{n} ({})", if have.contains_key(n) { "provided" } else { "missing" }))
+            .collect();
+        println!("secrets {}", listed.join(", "));
     }
     // The same check `apply` makes, so `plan` never passes a file this agent can't apply.
     if let Some(required) = &loaded.file.requires_agent

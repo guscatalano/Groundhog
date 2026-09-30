@@ -17,6 +17,7 @@ pub const CURRENT_VERSION: u32 = 1;
 /// A fully loaded and merged Groundhogfile.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Groundhogfile {
+    pub users: Vec<User>,
     pub apps: Vec<App>,
     pub files: Vec<FileCopy>,
     pub env: BTreeMap<String, String>,
@@ -27,6 +28,33 @@ pub struct Groundhogfile {
     /// The oldest agent that understands this file (the highest `agent:` across `extends`).
     #[serde(skip)]
     pub requires_agent: Option<crate::update::Version>,
+}
+
+/// A local user account. Existing accounts are brought in line (groups, password expiry) but
+/// their password is left alone unless `reset_password` is set.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct User {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_name: Option<String>,
+    pub password: Password,
+    /// Local groups the user is added to. Membership in other groups is left alone.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    pub password_never_expires: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reset_password: bool,
+}
+
+/// Where a password comes from. Never the password itself: a Groundhogfile is shared, logged
+/// and cached, so passwords are supplied at run time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Password {
+    /// Random, known to nobody: for accounts no one types into.
+    Generate,
+    /// Supplied at run time under this name (pending.json `secrets`, or `GROUNDHOG_SECRET_<NAME>`).
+    Secret(String),
 }
 
 /// A health check. Unlike every other step, checks run on every apply, after everything else,
@@ -325,6 +353,26 @@ pub(crate) mod raw {
         pub run: Vec<RunAction>,
         #[serde(default)]
         pub verify: Vec<Check>,
+        #[serde(default)]
+        pub users: Vec<User>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct User {
+        pub name: String,
+        pub full_name: Option<String>,
+        pub password: Option<StringOr<SecretRef>>,
+        pub groups: Option<OneOrMany<String>>,
+        pub password_never_expires: Option<bool>,
+        #[serde(default)]
+        pub reset_password: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SecretRef {
+        pub secret: String,
     }
 
     /// One flat shape for every check kind, so a typo gets a precise "unknown field" error;

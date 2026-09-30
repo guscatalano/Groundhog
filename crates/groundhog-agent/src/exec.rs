@@ -9,13 +9,15 @@ use groundhog_core::archive;
 use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{Action, Executor, Outcome, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
-use groundhog_core::model::{App, FileCopy, HiveScope, RegistryData, RegistryType, RegistryValue, RunAction, Shell};
+use groundhog_core::model::{
+    App, FileCopy, HiveScope, Password, RegistryData, RegistryType, RegistryValue, RunAction, Shell, User,
+};
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
-use groundhog_win::env;
 use groundhog_win::process::Proc;
 use groundhog_win::registry::{self, Data, DefaultUserHive};
 use groundhog_win::winget::{self, codes};
+use groundhog_win::{accounts, env};
 use url::Url;
 
 /// Windows Installer and common convention: success, restart required.
@@ -40,11 +42,12 @@ pub struct WinExecutor<'a> {
     winget: Option<PathBuf>,
     /// When this apply started, for checks that only look at what happened since.
     started: SystemTime,
+    secrets: crate::secrets::Secrets,
 }
 
 impl<'a> WinExecutor<'a> {
-    pub fn new(content: &'a ContentStore<'a>, work_dir: PathBuf) -> Self {
-        Self { content, work_dir, winget: None, started: SystemTime::now() }
+    pub fn new(content: &'a ContentStore<'a>, work_dir: PathBuf, secrets: crate::secrets::Secrets) -> Self {
+        Self { content, work_dir, winget: None, started: SystemTime::now(), secrets }
     }
 }
 
@@ -76,6 +79,7 @@ impl Executor for WinExecutor<'_> {
             }
             Action::Registry(r) => set_registry(r),
             Action::Run(r) => self.run_action(r, log),
+            Action::User(u) => self.ensure_user(u, log),
             Action::Verify(c) => {
                 crate::checks::run(c, self.started, log)?;
                 Ok(Outcome::Done { changed: false })
@@ -177,6 +181,42 @@ impl WinExecutor<'_> {
             EXIT_INSTALL_IN_PROGRESS => bail!("another installation is in progress (1618); run again when it finishes"),
             code => bail!("installer exited with {code}"),
         }
+    }
+
+    /// Creates the account if it's missing; otherwise brings its settings in line, leaving the
+    /// password alone unless asked to reset it. Passwords are never logged.
+    fn ensure_user(&mut self, u: &User, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
+        let password = || -> Result<String> {
+            match &u.password {
+                Password::Generate => accounts::generate_password(24),
+                Password::Secret(name) => {
+                    self.secrets.get(name).cloned().ok_or_else(|| anyhow::anyhow!(crate::secrets::missing_hint(name)))
+                }
+            }
+        };
+        let mut changed = false;
+        if accounts::user_exists(&u.name)? {
+            if u.reset_password {
+                accounts::set_password(&u.name, &password()?)?;
+                log("password reset");
+                changed = true;
+            }
+            changed |= accounts::set_password_never_expires(&u.name, u.password_never_expires)?;
+        } else {
+            accounts::create_user(&u.name, &password()?, u.password_never_expires)?;
+            log(&format!("created {}", u.name));
+            changed = true;
+        }
+        if let Some(full_name) = &u.full_name {
+            accounts::set_full_name(&u.name, full_name)?;
+        }
+        for group in &u.groups {
+            if accounts::add_to_group(&u.name, group)? {
+                log(&format!("added to {group}"));
+                changed = true;
+            }
+        }
+        Ok(Outcome::Done { changed })
     }
 
     fn copy(&mut self, f: &FileCopy, log: &mut dyn FnMut(&str)) -> Result<Outcome> {

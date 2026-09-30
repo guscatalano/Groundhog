@@ -4,6 +4,21 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.7.0] - 2026-09-30
+
+### Added
+- **`users:`** creates local accounts and adds them to groups. Existing accounts are brought in
+  line without touching their password (unless `reset-password: true`). Built-in groups work by
+  their English names on any display language (`Administrators`, `Remote Desktop Users`, …).
+  Passwords don't expire by default, so unattended logons keep working.
+- **Secrets.** A Groundhogfile names a password (`password: { secret: NAME }`) or has one
+  generated (`password: generate`), and never contains one. Values come from `pending.json`
+  (`groundhog pending --secret NAME`), `GROUNDHOG_SECRET_<NAME>` environment variables, or
+  `apply --secrets-file`. The agent removes them from `pending.json` as soon as it reads it,
+  never logs them, keeps them DPAPI-encrypted only while a run is paused for a restart, and
+  deletes them when it finishes. `plan` lists which secrets a file needs and whether they're
+  provided.
+
 ## [0.6.0] - 2026-09-30
 
 ### Added
@@ -114,6 +129,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.7.0]: https://github.com/guscatalano/Groundhog/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/guscatalano/Groundhog/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/guscatalano/Groundhog/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/guscatalano/Groundhog/compare/v0.3.0...v0.4.0

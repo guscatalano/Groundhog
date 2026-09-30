@@ -69,6 +69,12 @@ struct PendingArgs {
     /// folder, share or URL holding one (see `groundhog mirror-agent`). Default: GitHub releases.
     #[arg(long, value_name = "SOURCE")]
     agent_update_from: Option<String>,
+    /// A secret the Groundhogfile names: `NAME=value`, or just `NAME` to take the value from
+    /// the NAME environment variable (keeps it off the command line). Repeatable. The agent
+    /// removes secrets from pending.json as soon as it reads it; until then the file holds
+    /// them in plain text, so treat it like a password.
+    #[arg(long = "secret", value_name = "NAME[=VALUE]")]
+    secrets: Vec<String>,
     /// Where to write the file.
     #[arg(short, long, default_value = PENDING_FILE)]
     output: PathBuf,
@@ -117,6 +123,16 @@ fn run(command: Command) -> Result<i32> {
                 allow_http: a.allow_http,
                 agent_update: a.agent_update,
                 agent_update_from: a.agent_update_from,
+                secrets: a
+                    .secrets
+                    .iter()
+                    .map(|s| match s.split_once('=') {
+                        Some((name, value)) => Ok((name.to_owned(), value.to_owned())),
+                        None => std::env::var(s)
+                            .map(|v| (s.clone(), v))
+                            .with_context(|| format!("--secret {s}: no environment variable named {s}")),
+                    })
+                    .collect::<Result<_>>()?,
             };
             write_json_atomic(&a.output, &pending).with_context(|| format!("writing {}", a.output.display()))?;
             println!("wrote {}", a.output.display());

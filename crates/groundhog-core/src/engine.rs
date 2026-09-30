@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
-use crate::model::{App, Check, FileCopy, Groundhogfile, RegistryValue, RunAction, ServiceState};
+use crate::model::{App, Check, FileCopy, Groundhogfile, RegistryValue, RunAction, ServiceState, User};
 use crate::report::Reporter;
 
 /// Stop asking for reboots after this many in one run; something is looping.
@@ -30,6 +30,7 @@ pub enum Action {
     Path { dir: String },
     Registry(RegistryValue),
     Run(RunAction),
+    User(User),
     Verify(Check),
 }
 
@@ -74,6 +75,8 @@ fn title(action: &Action) -> String {
         Action::Run(RunAction::Script { script, .. }) => format!("run script {}", file_name(script)),
         Action::Run(RunAction::Plugin { plugin, .. }) => format!("run plugin {}", file_name(plugin)),
         Action::Verify(c) => format!("verify {}", check_title(c)),
+        Action::User(u) if u.groups.is_empty() => format!("user {}", u.name),
+        Action::User(u) => format!("user {} ({})", u.name, u.groups.join(", ")),
     };
     // Say which build a machine got: the GitHub release when there is one, otherwise the
     // content hash an unpinned reference resolved to.
@@ -136,7 +139,8 @@ fn command_title(command: &str) -> String {
 /// step: when any of them changes (say a "latest" download resolves to a new build), that
 /// run step and every later one run again.
 pub fn plan(file: &Groundhogfile) -> Vec<Step> {
-    let mut actions = Vec::new();
+    // Accounts first: they depend on nothing, and later steps may assume they exist.
+    let mut actions: Vec<Action> = file.users.iter().cloned().map(Action::User).collect();
     if file.apps.iter().any(|a| matches!(a, App::Winget { .. })) {
         actions.push(Action::EnsureWinget);
     }

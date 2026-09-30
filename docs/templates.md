@@ -47,6 +47,12 @@ Ways to get it into the clone:
 - **Anything:** attach a small ISO or disk containing it, or bake a per-clone value into
   cloudbase-init user data.
 
+If the Groundhogfile names secrets (such as a user's password), add them with
+`--secret NAME`, which reads the value from the `NAME` environment variable on the host. Until
+the agent reads `pending.json`, the file holds them in plain text, so treat it like a password
+in transit. The agent removes them from the file immediately and keeps them only encrypted,
+and only until the run finishes. See [Secrets](groundhogfile.md#secrets).
+
 At logon the agent applies it and renames it to `pending.done.json` or `pending.failed.json`.
 If a restart is needed it restarts and continues at the next logon. Progress goes to every
 `report` sink as `status.json` plus `agent.log`, or JSON POSTs for `http(s)` sinks.

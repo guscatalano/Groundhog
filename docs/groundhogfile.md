@@ -3,8 +3,8 @@
 A Groundhogfile is YAML (`.yaml`/`.yml`, or no extension) or JSON (`.json`). Unknown keys are
 errors, so typos fail at load time instead of being ignored.
 
-Steps run in this order: winget bootstrap (if any winget apps), `apps`, `files`, `env`, `path`,
-`registry`, `run`, then the `verify` checks.
+Steps run in this order: `users`, winget bootstrap (if any winget apps), `apps`, `files`, `env`,
+`path`, `registry`, `run`, then the `verify` checks.
 
 ## When steps run again
 
@@ -83,6 +83,44 @@ Bases load first and this file is layered on top:
 - **run** actions and **verify** checks accumulate (base first).
 
 Cycles are detected.
+
+## `users`
+
+```yaml
+users:
+  - name: tester
+    full-name: UI Test User            # optional
+    password: { secret: TESTER_PASSWORD }
+    groups: [Remote Desktop Users]     # added to these; other memberships are left alone
+  - name: svc-agent
+    password: generate                 # random, known to nobody (also the default)
+    password-never-expires: true       # the default: Windows' 42-day expiry would break unattended logons
+```
+
+Local accounts, created if missing. An existing account is brought in line (groups, password
+expiry), but **its password is left alone** unless `reset-password: true` is set. Account
+names follow Windows' rules: up to 20 characters, none of `" / \ [ ] : ; | = , + * ? < > @`.
+
+Built-in groups can be given by their English names (`Administrators`, `Users`,
+`Remote Desktop Users`, `Remote Management Users`, …) on any Windows display language; they're
+resolved by their fixed SIDs, so `Administrators` still works where the group is called
+`Administratoren`. Other names are used as given. Creating accounts needs the agent elevated.
+
+### Secrets
+
+**A password never goes in a Groundhogfile.** Files are shared, cached and logged. A password
+is either `generate`d or named, `{ secret: NAME }`, and supplied when the file is applied:
+
+| Where | How |
+| --- | --- |
+| `pending.json` (templated VMs) | `"secrets": { "TESTER_PASSWORD": "…" }`, written by `groundhog pending --secret TESTER_PASSWORD` (the value comes from the `TESTER_PASSWORD` environment variable, which keeps it off the command line) or `--secret NAME=value` |
+| Environment | `GROUNDHOG_SECRET_TESTER_PASSWORD` |
+| A file | `groundhog-agent apply … --secrets-file secrets.json` with `{ "TESTER_PASSWORD": "…" }` |
+
+The agent takes secrets out of `pending.json` as soon as it reads it. They're never logged or
+recorded in state. If a run pauses for a restart, they're kept until it finishes, encrypted
+with DPAPI so only the same account on the same machine can read them, and then deleted.
+`plan` lists the secrets a file needs and whether each one is provided.
 
 ## `apps`
 

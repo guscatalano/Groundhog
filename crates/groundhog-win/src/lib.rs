@@ -1,6 +1,8 @@
 //! Safe wrappers over the Windows APIs Groundhog needs. All `unsafe` code in the project lives
 //! in this crate, behind small functions that can be read and reviewed on their own.
 
+pub mod accounts;
+pub mod dpapi;
 pub mod env;
 pub mod process;
 pub mod registry;

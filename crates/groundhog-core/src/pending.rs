@@ -35,6 +35,10 @@ pub struct Pending {
     /// one. Default: GitHub releases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_update_from: Option<String>,
+    /// Values for the secrets a Groundhogfile names (`password: { secret: NAME }`). The agent
+    /// removes them from this file as soon as it reads it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secrets: std::collections::BTreeMap<String, String>,
 }
 
 fn yes() -> bool {
