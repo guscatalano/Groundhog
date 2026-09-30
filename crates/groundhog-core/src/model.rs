@@ -18,6 +18,8 @@ pub const CURRENT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Groundhogfile {
     pub users: Vec<User>,
+    pub features: Vec<Feature>,
+    pub capabilities: Vec<Capability>,
     pub apps: Vec<App>,
     pub files: Vec<FileCopy>,
     pub env: BTreeMap<String, String>,
@@ -28,6 +30,41 @@ pub struct Groundhogfile {
     /// The oldest agent that understands this file (the highest `agent:` across `extends`).
     #[serde(skip)]
     pub requires_agent: Option<crate::update::Version>,
+}
+
+/// A Windows optional feature (`NetFx3`, `Microsoft-Windows-Subsystem-Linux`, ...).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Feature {
+    pub name: String,
+    pub enabled: bool,
+    /// Also enable the features it depends on (DISM's /All).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub remove_payload: bool,
+    /// Folders or shares holding the payload (`sources\sxs` of matching install media).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    /// Never ask Windows Update for the payload.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub limit_access: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// A Windows capability, also called a Feature on Demand (`OpenSSH.Server~~~~0.0.1.0`, ...).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Capability {
+    pub name: String,
+    pub present: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub limit_access: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 /// A local user account. Existing accounts are brought in line (groups, password expiry) but
@@ -355,6 +392,46 @@ pub(crate) mod raw {
         pub verify: Vec<Check>,
         #[serde(default)]
         pub users: Vec<User>,
+        #[serde(default)]
+        pub features: Vec<StringOr<Feature>>,
+        #[serde(default)]
+        pub capabilities: Vec<StringOr<Capability>>,
+    }
+
+    #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum FeatureState {
+        Enabled,
+        Disabled,
+    }
+
+    #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum CapabilityState {
+        Present,
+        Removed,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct Feature {
+        pub name: String,
+        pub state: Option<FeatureState>,
+        pub all: Option<bool>,
+        pub remove_payload: Option<bool>,
+        pub source: Option<OneOrMany<String>>,
+        pub limit_access: Option<bool>,
+        pub timeout: Option<Duration>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct Capability {
+        pub name: String,
+        pub state: Option<CapabilityState>,
+        pub source: Option<OneOrMany<String>>,
+        pub limit_access: Option<bool>,
+        pub timeout: Option<Duration>,
     }
 
     #[derive(Debug, Deserialize)]

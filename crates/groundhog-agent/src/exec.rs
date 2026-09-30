@@ -10,10 +10,12 @@ use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{Action, Executor, Outcome, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
-    App, FileCopy, HiveScope, Password, RegistryData, RegistryType, RegistryValue, RunAction, Shell, User,
+    App, Capability, Feature, FileCopy, HiveScope, Password, RegistryData, RegistryType, RegistryValue, RunAction,
+    Shell, User,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
+use groundhog_win::dism::{self, DismError};
 use groundhog_win::process::Proc;
 use groundhog_win::registry::{self, Data, DefaultUserHive};
 use groundhog_win::winget::{self, codes};
@@ -43,11 +45,13 @@ pub struct WinExecutor<'a> {
     /// When this apply started, for checks that only look at what happened since.
     started: SystemTime,
     secrets: crate::secrets::Secrets,
+    /// Opened on first use: only needed for features and capabilities.
+    dism: Option<dism::Session>,
 }
 
 impl<'a> WinExecutor<'a> {
     pub fn new(content: &'a ContentStore<'a>, work_dir: PathBuf, secrets: crate::secrets::Secrets) -> Self {
-        Self { content, work_dir, winget: None, started: SystemTime::now(), secrets }
+        Self { content, work_dir, winget: None, started: SystemTime::now(), secrets, dism: None }
     }
 }
 
@@ -80,6 +84,8 @@ impl Executor for WinExecutor<'_> {
             Action::Registry(r) => set_registry(r),
             Action::Run(r) => self.run_action(r, log),
             Action::User(u) => self.ensure_user(u, log),
+            Action::Feature(f) => self.ensure_feature(f, log),
+            Action::Capability(c) => self.ensure_capability(c, log),
             Action::Verify(c) => {
                 crate::checks::run(c, self.started, log)?;
                 Ok(Outcome::Done { changed: false })
@@ -181,6 +187,78 @@ impl WinExecutor<'_> {
             EXIT_INSTALL_IN_PROGRESS => bail!("another installation is in progress (1618); run again when it finishes"),
             code => bail!("installer exited with {code}"),
         }
+    }
+
+    fn dism(&mut self) -> Result<&dism::Session> {
+        if std::env::var("USERNAME").is_ok_and(|u| u.eq_ignore_ascii_case("WDAGUtilityAccount")) {
+            bail!("Windows features and capabilities can't be changed inside Windows Sandbox; use a VM");
+        }
+        if self.dism.is_none() {
+            self.dism = Some(dism::Session::open(&self.work_dir.join("dism.log"))?);
+        }
+        Ok(self.dism.as_ref().expect("just opened"))
+    }
+
+    /// Brings a Windows optional feature to the wanted state. Checks the live state first, so
+    /// it's idempotent even on a template where someone already enabled it.
+    fn ensure_feature(&mut self, f: &Feature, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
+        let log_path = self.work_dir.join("dism.log");
+        let session = self.dism()?;
+        let state = session.feature_state(&f.name).map_err(|e| explain(e, "feature", &f.name, &log_path))?;
+        if state.is_on() == f.enabled {
+            return Ok(settled(state, log));
+        }
+        if dism::servicing_reboot_pending() {
+            log("Windows servicing is waiting for a restart; retrying after one");
+            return Ok(Outcome::RetryAfterReboot);
+        }
+        let sources = expand_all(&f.sources)?;
+        let timeout = f.timeout_ms.map(std::time::Duration::from_millis);
+        let mut progress = |pct: u32| log(&format!("{pct}%"));
+        let result = if f.enabled {
+            session.enable_feature(&f.name, f.all, &sources, f.limit_access, timeout, &mut progress)
+        } else {
+            session.disable_feature(&f.name, f.remove_payload, timeout, &mut progress)
+        };
+        if let Err(e) = result {
+            return pending_or(e, "feature", &f.name, &log_path, log);
+        }
+        let after = session.feature_state(&f.name).map_err(|e| explain(e, "feature", &f.name, &log_path))?;
+        Ok(if after.is_pending() {
+            Outcome::DoneRestartLater { changed: true }
+        } else {
+            Outcome::Done { changed: true }
+        })
+    }
+
+    fn ensure_capability(&mut self, c: &Capability, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
+        let log_path = self.work_dir.join("dism.log");
+        let session = self.dism()?;
+        let state = session.capability_state(&c.name).map_err(|e| explain(e, "capability", &c.name, &log_path))?;
+        if state.is_on() == c.present {
+            return Ok(settled(state, log));
+        }
+        if dism::servicing_reboot_pending() {
+            log("Windows servicing is waiting for a restart; retrying after one");
+            return Ok(Outcome::RetryAfterReboot);
+        }
+        let sources = expand_all(&c.sources)?;
+        let timeout = c.timeout_ms.map(std::time::Duration::from_millis);
+        let mut progress = |pct: u32| log(&format!("{pct}%"));
+        let result = if c.present {
+            session.add_capability(&c.name, &sources, c.limit_access, timeout, &mut progress)
+        } else {
+            session.remove_capability(&c.name, timeout, &mut progress)
+        };
+        if let Err(e) = result {
+            return pending_or(e, "capability", &c.name, &log_path, log);
+        }
+        let after = session.capability_state(&c.name).map_err(|e| explain(e, "capability", &c.name, &log_path))?;
+        Ok(if after.is_pending() {
+            Outcome::DoneRestartLater { changed: true }
+        } else {
+            Outcome::Done { changed: true }
+        })
     }
 
     /// Creates the account if it's missing; otherwise brings its settings in line, leaving the
@@ -300,6 +378,56 @@ impl WinExecutor<'_> {
             }
         }
     }
+}
+
+/// Already in the wanted state; if that state still waits on a restart, one is owed.
+fn settled(state: dism::State, log: &mut dyn FnMut(&str)) -> Outcome {
+    if state.is_pending() {
+        log("already done; finishes after a restart");
+        Outcome::DoneRestartLater { changed: false }
+    } else {
+        Outcome::Done { changed: false }
+    }
+}
+
+fn expand_all(paths: &[String]) -> Result<Vec<String>> {
+    paths.iter().map(|p| env::expand_path(p)).collect()
+}
+
+/// "Servicing is busy until a restart" means try again after one; anything else is a failure.
+fn pending_or(e: anyhow::Error, kind: &str, name: &str, log_path: &Path, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
+    if e.downcast_ref::<DismError>().is_some_and(|d| d.hresult == dism::codes::PENDING) {
+        log("Windows servicing has a restart pending; retrying after one");
+        return Ok(Outcome::RetryAfterReboot);
+    }
+    Err(explain(e, kind, name, log_path))
+}
+
+/// Turns DISM's most common failures into what to do about them.
+fn explain(e: anyhow::Error, kind: &str, name: &str, log_path: &Path) -> anyhow::Error {
+    let Some(d) = e.downcast_ref::<DismError>() else { return e };
+    let hint = match d.hresult {
+        dism::codes::UNKNOWN_UPDATE => format!(
+            "there's no {kind} named '{name}' on this edition of Windows. Names are exact; \
+             `dism /online /get-features` or `/get-capabilities` lists them (client and Server names differ)"
+        ),
+        dism::codes::SOURCE_MISSING => format!(
+            "Windows couldn't find the files for {name}. Give 'source:' (the sources\\sxs folder of install \
+             media for this exact build, or a Features on Demand folder), or allow Windows Update"
+        ),
+        dism::codes::WSUS_BLOCKED => {
+            "a WSUS policy blocks downloading it. Give 'source:' with 'limit-access: true', or allow Windows \
+             Update for optional content (policy RepairContentServerSource=2)"
+                .to_owned()
+        }
+        dism::codes::DOWNLOAD_FAILED | dism::codes::NETWORK_BLOCKED => {
+            "downloading it from Windows Update failed. Give 'source:' with 'limit-access: true' for offline machines"
+                .to_owned()
+        }
+        _ => String::new(),
+    };
+    let logs = format!("details: {} and C:\\Windows\\Logs\\CBS\\CBS.log", log_path.display());
+    if hint.is_empty() { anyhow::anyhow!("{e:#}; {logs}") } else { anyhow::anyhow!("{e:#}: {hint}; {logs}") }
 }
 
 fn set_registry(r: &RegistryValue) -> Result<Outcome> {

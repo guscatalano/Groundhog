@@ -14,7 +14,9 @@ use url::Url;
 
 use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
-use crate::model::{App, Check, FileCopy, Groundhogfile, RegistryValue, RunAction, ServiceState, User};
+use crate::model::{
+    App, Capability, Check, Feature, FileCopy, Groundhogfile, RegistryValue, RunAction, ServiceState, User,
+};
 use crate::report::Reporter;
 
 /// Stop asking for reboots after this many in one run; something is looping.
@@ -31,6 +33,8 @@ pub enum Action {
     Registry(RegistryValue),
     Run(RunAction),
     User(User),
+    Feature(Feature),
+    Capability(Capability),
     Verify(Check),
 }
 
@@ -75,6 +79,10 @@ fn title(action: &Action) -> String {
         Action::Run(RunAction::Script { script, .. }) => format!("run script {}", file_name(script)),
         Action::Run(RunAction::Plugin { plugin, .. }) => format!("run plugin {}", file_name(plugin)),
         Action::Verify(c) => format!("verify {}", check_title(c)),
+        Action::Feature(f) if f.enabled => format!("enable feature {}", f.name),
+        Action::Feature(f) => format!("disable feature {}", f.name),
+        Action::Capability(c) if c.present => format!("add capability {}", c.name),
+        Action::Capability(c) => format!("remove capability {}", c.name),
         Action::User(u) if u.groups.is_empty() => format!("user {}", u.name),
         Action::User(u) => format!("user {} ({})", u.name, u.groups.join(", ")),
     };
@@ -141,6 +149,10 @@ fn command_title(command: &str) -> String {
 pub fn plan(file: &Groundhogfile) -> Vec<Step> {
     // Accounts first: they depend on nothing, and later steps may assume they exist.
     let mut actions: Vec<Action> = file.users.iter().cloned().map(Action::User).collect();
+    // Windows features next: apps often need them (WSL for Docker, .NET 3.5 for old
+    // installers), and their restarts are best taken before long installs, not in the middle.
+    actions.extend(file.features.iter().cloned().map(Action::Feature));
+    actions.extend(file.capabilities.iter().cloned().map(Action::Capability));
     if file.apps.iter().any(|a| matches!(a, App::Winget { .. })) {
         actions.push(Action::EnsureWinget);
     }
@@ -176,6 +188,25 @@ pub enum Outcome {
     RebootRequired,
     /// The step could not run until Windows restarts; run it again afterwards.
     RetryAfterReboot,
+    /// The step is done but its change finishes only after a restart, which can wait until the
+    /// rest of its section has run: five features then cost one restart, not five.
+    DoneRestartLater {
+        changed: bool,
+    },
+}
+
+/// Steps that share a section can share one deferred restart.
+fn section(action: &Action) -> &'static str {
+    match action {
+        Action::Feature(_) | Action::Capability(_) => "windows features",
+        Action::User(_) => "users",
+        Action::EnsureWinget | Action::App(_) => "apps",
+        Action::File(_) => "files",
+        Action::Env { .. } | Action::Path { .. } => "environment",
+        Action::Registry(_) => "registry",
+        Action::Run(_) => "run",
+        Action::Verify(_) => "verify",
+    }
 }
 
 /// Carries out steps on the actual machine. The agent implements this; tests fake it.
@@ -315,9 +346,28 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
     }
     save(&mut state)?;
 
+    // Restart once, at the end of the section, for every step that asked to restart later.
+    let pause = |state: &mut RunState, owed: &[String]| -> Result<()> {
+        if state.reboots >= MAX_REBOOTS {
+            state.status = RunStatus::Failed;
+            state.message = Some(format!("gave up after {MAX_REBOOTS} reboots"));
+        } else {
+            state.reboots += 1;
+            state.status = RunStatus::RebootPending;
+            state.message = Some(format!("reboot required after: {}", owed.join("; ")));
+        }
+        save(state)
+    };
+    let mut owed: Vec<String> = Vec::new();
+    let mut owed_section = "";
+
     for (i, step) in steps.iter().enumerate() {
         if state.steps[i].status == StepStatus::Done {
             continue;
+        }
+        if !owed.is_empty() && section(&step.action) != owed_section {
+            pause(&mut state, &owed)?;
+            return Ok(state);
         }
         state.steps[i].status = StepStatus::Running;
         reporter.log(&format!("[{}/{}] {}", i + 1, steps.len(), step.title));
@@ -328,6 +378,13 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
                 state.steps[i].status = StepStatus::Done;
                 state.steps[i].changed = changed;
                 state.steps[i].message = (!changed).then(|| "already in desired state".to_owned());
+            }
+            Ok(Outcome::DoneRestartLater { changed }) => {
+                state.steps[i].status = StepStatus::Done;
+                state.steps[i].changed = changed;
+                state.steps[i].message = Some("finishes after a restart".to_owned());
+                owed.push(step.title.clone());
+                owed_section = section(&step.action);
             }
             Ok(outcome @ (Outcome::RebootRequired | Outcome::RetryAfterReboot)) => {
                 let retry = matches!(outcome, Outcome::RetryAfterReboot);
@@ -360,6 +417,10 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
         save(&mut state)?;
     }
 
+    if !owed.is_empty() {
+        pause(&mut state, &owed)?;
+        return Ok(state);
+    }
     state.status = RunStatus::Succeeded;
     let changed = state.steps.iter().filter(|s| s.changed).count();
     state.message = Some(format!("{} steps, {changed} changed", steps.len()));
@@ -584,6 +645,50 @@ mod tests {
         let s = run(&steps, &mut exec, &NullReporter, opts()).unwrap();
         assert_eq!(s.status, RunStatus::Succeeded);
         assert_eq!(exec.1.len(), 2);
+    }
+
+    #[test]
+    fn deferred_restarts_are_batched_per_section() {
+        use crate::model::Feature;
+        struct Features(Vec<String>);
+        impl Executor for Features {
+            fn execute(&mut self, step: &Step, _: &dyn Reporter) -> Result<Outcome> {
+                self.0.push(step.title.clone());
+                Ok(match step.action {
+                    Action::Feature(_) => Outcome::DoneRestartLater { changed: true },
+                    _ => Outcome::Done { changed: true },
+                })
+            }
+        }
+        let feature = |name: &str| Feature {
+            name: name.into(),
+            enabled: true,
+            all: true,
+            remove_payload: false,
+            sources: vec![],
+            limit_access: false,
+            timeout_ms: None,
+        };
+        let mut g = file(&["after"]);
+        g.features = vec![feature("A"), feature("B"), feature("C")];
+        let steps = plan(&g);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let url = Url::parse("https://cfg.test/g.yaml").unwrap();
+        let opts = || RunOptions { source: &url, sources: vec![], state_path: &path, fresh: false };
+
+        let mut exec = Features(vec![]);
+        let first = run(&steps, &mut exec, &NullReporter, opts()).unwrap();
+        assert_eq!(first.status, RunStatus::RebootPending);
+        assert_eq!(first.reboots, 1, "one restart for three features");
+        assert_eq!(exec.0.len(), 3, "all features ran before the restart, the run step didn't");
+        assert!(first.message.unwrap().contains("enable feature A; enable feature B; enable feature C"));
+
+        let second = run(&steps, &mut exec, &NullReporter, opts()).unwrap();
+        assert_eq!(second.status, RunStatus::Succeeded);
+        assert_eq!(exec.0.last().unwrap(), "run: after");
+        assert_eq!(exec.0.len(), 4);
     }
 
     #[test]

@@ -12,8 +12,8 @@ use crate::content::ContentStore;
 use crate::fetch::{self, file_url_to_path};
 use crate::github;
 use crate::model::{
-    App, CURRENT_VERSION, Check, FileCopy, Groundhogfile, HiveScope, Password, RegistryData, RegistryType,
-    RegistryValue, RunAction, ServiceState, Shell, SourceRef, User, raw,
+    App, CURRENT_VERSION, Capability, Check, Feature, FileCopy, Groundhogfile, HiveScope, Password, RegistryData,
+    RegistryType, RegistryValue, RunAction, ServiceState, Shell, SourceRef, User, raw,
 };
 use crate::update::{self, Version};
 
@@ -301,7 +301,7 @@ fn pin(sha256: Option<String>) -> Result<Option<String>> {
 }
 
 fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
-    let raw::File { apps, files, env, path, registry, run, verify, agent, users, .. } = raw;
+    let raw::File { apps, files, env, path, registry, run, verify, agent, users, features, capabilities, .. } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
     let apps = apps
         .into_iter()
@@ -403,7 +403,102 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         .map(|(i, u)| resolve_user(u).with_context(|| format!("users[{i}]")))
         .collect::<Result<_>>()?;
 
-    Ok(Groundhogfile { users, apps, files, env, path, registry, run, verify, requires_agent })
+    let features = features
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| resolve_feature(base, f).with_context(|| format!("features[{i}]")))
+        .collect::<Result<_>>()?;
+    let capabilities = capabilities
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| resolve_capability(base, c).with_context(|| format!("capabilities[{i}]")))
+        .collect::<Result<_>>()?;
+
+    Ok(Groundhogfile { users, features, capabilities, apps, files, env, path, registry, run, verify, requires_agent })
+}
+
+/// A payload source for DISM: a folder or share the machine itself can reach. A relative path
+/// resolves next to the Groundhogfile, which only works when that is a local file.
+fn servicing_source(base: &Url, s: &str) -> Result<String> {
+    let b = s.as_bytes();
+    let absolute = (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        || s.starts_with(r"\\")
+        || s.starts_with('%');
+    if absolute {
+        return Ok(s.to_owned());
+    }
+    if s.contains("://") {
+        bail!(
+            "'{s}': feature and capability sources must be folders or shares (zip and web sources aren't supported yet)"
+        );
+    }
+    if base.scheme() != "file" {
+        bail!("'{s}': a relative source only works when the Groundhogfile is a local file; give a full path or share");
+    }
+    let dir = file_url_to_path(base)?.parent().map(Path::to_path_buf).unwrap_or_default();
+    Ok(dir.join(s).to_string_lossy().into_owned())
+}
+
+fn resolve_feature(base: &Url, f: raw::StringOr<raw::Feature>) -> Result<Feature> {
+    let f = match f {
+        raw::StringOr::Short(name) => raw::Feature {
+            name,
+            state: None,
+            all: None,
+            remove_payload: None,
+            source: None,
+            limit_access: None,
+            timeout: None,
+        },
+        raw::StringOr::Full(f) => f,
+    };
+    if f.name.trim().is_empty() {
+        bail!("a feature needs a name");
+    }
+    let enabled = f.state != Some(raw::FeatureState::Disabled);
+    if enabled && f.remove_payload.is_some() {
+        bail!("feature {}: 'remove-payload' only applies with 'state: disabled'", f.name);
+    }
+    if !enabled && (f.all.is_some() || f.source.is_some() || f.limit_access.is_some()) {
+        bail!("feature {}: 'all', 'source' and 'limit-access' only apply when enabling", f.name);
+    }
+    let sources = f.source.map(raw::OneOrMany::into_vec).unwrap_or_default();
+    Ok(Feature {
+        enabled,
+        all: enabled && f.all.unwrap_or(true),
+        remove_payload: f.remove_payload.unwrap_or(false),
+        sources: sources.iter().map(|s| servicing_source(base, s)).collect::<Result<_>>()?,
+        limit_access: f.limit_access.unwrap_or(false),
+        timeout_ms: f.timeout.map(duration_ms).transpose()?,
+        name: f.name,
+    })
+}
+
+fn resolve_capability(base: &Url, c: raw::StringOr<raw::Capability>) -> Result<Capability> {
+    let c = match c {
+        raw::StringOr::Short(name) => {
+            raw::Capability { name, state: None, source: None, limit_access: None, timeout: None }
+        }
+        raw::StringOr::Full(c) => c,
+    };
+    if c.name.trim().is_empty() {
+        bail!("a capability needs a name");
+    }
+    let present = c.state != Some(raw::CapabilityState::Removed);
+    if !present && (c.source.is_some() || c.limit_access.is_some()) {
+        bail!("capability {}: 'source' and 'limit-access' only apply when adding", c.name);
+    }
+    // Capability names carry a version (OpenSSH.Server~~~~0.0.1.0); almost all are 0.0.1.0,
+    // so a bare name gets that. Anything else must be written out in full.
+    let name = if c.name.contains('~') { c.name } else { format!("{}~~~~0.0.1.0", c.name) };
+    let sources = c.source.map(raw::OneOrMany::into_vec).unwrap_or_default();
+    Ok(Capability {
+        name,
+        present,
+        sources: sources.iter().map(|s| servicing_source(base, s)).collect::<Result<_>>()?,
+        limit_access: c.limit_access.unwrap_or(false),
+        timeout_ms: c.timeout.map(duration_ms).transpose()?,
+    })
 }
 
 fn resolve_user(u: raw::User) -> Result<User> {
@@ -699,10 +794,18 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
         base.users.into_iter().filter(|b| !top.users.iter().any(|t| eq(&t.name, &b.name))).collect();
     users.extend(top.users);
 
+    let mut features: Vec<Feature> =
+        base.features.into_iter().filter(|b| !top.features.iter().any(|t| eq(&t.name, &b.name))).collect();
+    features.extend(top.features);
+
+    let mut capabilities: Vec<Capability> =
+        base.capabilities.into_iter().filter(|b| !top.capabilities.iter().any(|t| eq(&t.name, &b.name))).collect();
+    capabilities.extend(top.capabilities);
+
     // The strictest requirement wins: a base that needs a newer agent still needs it.
     let requires_agent = base.requires_agent.max(top.requires_agent);
 
-    Groundhogfile { users, apps, files, env, path, registry, run, verify, requires_agent }
+    Groundhogfile { users, features, capabilities, apps, files, env, path, registry, run, verify, requires_agent }
 }
 
 /// Convenience for callers: turns user input plus an optional pin into a [`SourceRef`].
@@ -1038,6 +1141,53 @@ files:
         assert!(err("https://cfg.test/literal.yaml").contains("can't be written in a Groundhogfile"));
         assert!(err("https://cfg.test/badname.yaml").contains("not a valid local account name"));
         assert!(err("https://cfg.test/typo.yaml").contains("unknown field `groop`"));
+    }
+
+    #[test]
+    fn features_and_capabilities_parse_with_defaults_and_checks() {
+        let f = MapFetcher::default().with(
+            "https://cfg.test/g.yaml",
+            r#"
+features:
+  - Microsoft-Windows-Subsystem-Linux
+  - name: NetFx3
+    source: \\nas\media\sources\sxs
+    limit-access: true
+    timeout: 30m
+  - name: SMB1Protocol
+    state: disabled
+    remove-payload: true
+capabilities:
+  - OpenSSH.Server
+  - name: Language.Basic~~~de-DE~0.0.1.0
+  - name: App.StepsRecorder
+    state: removed
+"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap().file;
+        assert!(g.features[0].enabled && g.features[0].all, "enabled with /All by default");
+        assert_eq!(g.features[1].sources, [r"\\nas\media\sources\sxs"]);
+        assert!(g.features[1].limit_access);
+        assert_eq!(g.features[1].timeout_ms, Some(30 * 60 * 1000));
+        assert!(!g.features[2].enabled && g.features[2].remove_payload && !g.features[2].all);
+        assert_eq!(g.capabilities[0].name, "OpenSSH.Server~~~~0.0.1.0", "bare names get the usual version");
+        assert_eq!(g.capabilities[1].name, "Language.Basic~~~de-DE~0.0.1.0", "full names are kept");
+        assert!(!g.capabilities[2].present);
+
+        let bad = [
+            ("features: [{ name: X, remove-payload: true }]", "only applies with 'state: disabled'"),
+            ("features: [{ name: X, state: disabled, source: C:/x }]", "only apply when enabling"),
+            ("features: [{ name: X, source: 'https://x.test/fod.zip' }]", "folders or shares"),
+            ("features: [{ name: X, source: relative\\sxs }]", "only works when the Groundhogfile is a local file"),
+            ("capabilities: [{ name: X, state: removed, limit-access: true }]", "only apply when adding"),
+            ("features: [{ name: X, stat: enabled }]", "unknown field `stat`"),
+        ];
+        for (yaml, want) in bad {
+            let f = MapFetcher::default().with("https://cfg.test/b.yaml", yaml);
+            let err = format!("{:#}", load_with(&f, "https://cfg.test/b.yaml", dir.path()).unwrap_err());
+            assert!(err.contains(want), "{yaml}: expected '{want}' in: {err}");
+        }
     }
 
     #[test]

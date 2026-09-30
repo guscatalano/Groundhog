@@ -2,6 +2,7 @@
 //! in this crate, behind small functions that can be read and reviewed on their own.
 
 pub mod accounts;
+pub mod dism;
 pub mod dpapi;
 pub mod env;
 pub mod process;
