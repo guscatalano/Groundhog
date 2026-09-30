@@ -233,11 +233,12 @@ impl WinExecutor<'_> {
         } else {
             session.disable_feature(&f.name, f.remove_payload, timeout, &mut progress)
         };
-        if let Err(e) = result {
-            return pending_or(e, "feature", &f.name, &log_path, log);
-        }
+        let dism_says_restart = match result {
+            Ok(restart) => restart,
+            Err(e) => return pending_or(e, "feature", &f.name, &log_path, log),
+        };
         let after = session.feature_state(&f.name).map_err(|e| explain(e, "feature", &f.name, &log_path))?;
-        Ok(self.restart_later_if(after.is_pending()))
+        Ok(self.restart_later_if(dism_says_restart || after.is_pending() || dism::servicing_reboot_pending()))
     }
 
     fn ensure_capability(&mut self, c: &Capability, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
@@ -261,13 +262,17 @@ impl WinExecutor<'_> {
         } else {
             session.remove_capability(&c.name, timeout, &mut progress)
         };
-        if let Err(e) = result {
-            return pending_or(e, "capability", &c.name, &log_path, log);
-        }
+        let dism_says_restart = match result {
+            Ok(restart) => restart,
+            Err(e) => return pending_or(e, "capability", &c.name, &log_path, log),
+        };
         let after = session.capability_state(&c.name).map_err(|e| explain(e, "capability", &c.name, &log_path))?;
-        Ok(self.restart_later_if(after.is_pending()))
+        Ok(self.restart_later_if(dism_says_restart || after.is_pending() || dism::servicing_reboot_pending()))
     }
 
+    /// DISM's return code, the item's state and CBS's own flag can each be the only one to show
+    /// a restart is due, so any of them counts. The pre-check makes sure a restart that was
+    /// already pending isn't mistaken for ours.
     fn restart_later_if(&mut self, pending: bool) -> Outcome {
         if pending {
             self.deferred_restart = true;

@@ -4,6 +4,16 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.10.1] - 2026-09-30
+
+### Fixed
+- **Features and capabilities that need a restart could finish without one.** Windows reports
+  "done, restart needed" in a way 0.9.0 and 0.10.0 missed, so such a step counted as complete,
+  the run could end as succeeded with Windows still waiting for a restart, and the next
+  feature restarted the machine first instead of the section restarting once at its end (the
+  0.10.0 fix didn't cover this). Found by testing on a fresh Windows 11 VM: enabling WSL and
+  `HypervisorPlatform` now takes one restart, after both.
+
 ## [0.10.0] - 2026-09-30
 
 ### Added
@@ -190,6 +200,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.10.1]: https://github.com/guscatalano/Groundhog/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/guscatalano/Groundhog/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/guscatalano/Groundhog/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/guscatalano/Groundhog/compare/v0.7.0...v0.8.0

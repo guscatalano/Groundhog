@@ -241,7 +241,8 @@ impl Session {
         state
     }
 
-    /// Enables a feature (and, with `all`, the features it depends on).
+    /// Enables a feature (and, with `all`, the features it depends on). These operations return
+    /// whether Windows needs a restart to finish.
     pub fn enable_feature(
         &self,
         name: &str,
@@ -250,7 +251,7 @@ impl Session {
         limit_access: bool,
         timeout: Option<Duration>,
         progress: &mut dyn FnMut(u32),
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let name_w = wide(name);
         let (_owned, source_ptrs) = wide_list(sources);
         self.call(timeout, progress, &format!("enabling feature {name}"), |cancel, cb, user| {
@@ -279,7 +280,7 @@ impl Session {
         remove_payload: bool,
         timeout: Option<Duration>,
         progress: &mut dyn FnMut(u32),
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let name_w = wide(name);
         self.call(timeout, progress, &format!("disabling feature {name}"), |cancel, cb, user| {
             // SAFETY: as above.
@@ -304,7 +305,7 @@ impl Session {
         limit_access: bool,
         timeout: Option<Duration>,
         progress: &mut dyn FnMut(u32),
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let name_w = wide(name);
         let (_owned, source_ptrs) = wide_list(sources);
         self.call(timeout, progress, &format!("adding capability {name}"), |cancel, cb, user| {
@@ -329,7 +330,7 @@ impl Session {
         name: &str,
         timeout: Option<Duration>,
         progress: &mut dyn FnMut(u32),
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let name_w = wide(name);
         self.call(timeout, progress, &format!("removing capability {name}"), |cancel, cb, user| {
             // SAFETY: as above.
@@ -345,7 +346,7 @@ impl Session {
         progress: &mut dyn FnMut(u32),
         what: &str,
         op: impl FnOnce(HANDLE, Option<Progress>, *mut c_void) -> HRESULT,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // SAFETY: an unnamed manual-reset event, closed below.
         let cancel = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if cancel.is_null() {
@@ -377,12 +378,13 @@ impl Session {
         {
             bail!("{what} timed out after {}s and was cancelled", t.as_secs());
         }
-        // 3010 and "reload the session" are successes; callers re-read state to learn about
-        // pending restarts rather than relying on how a restart is reported here.
-        if hr < 0 && hr != codes::REBOOT_REQUIRED_HRESULT {
+        // A change that needs a restart succeeds with ERROR_SUCCESS_REBOOT_REQUIRED (3010), not
+        // S_OK, and the feature's state may not say so yet: this is the reliable signal.
+        let restart = hr == codes::REBOOT_REQUIRED || hr == codes::REBOOT_REQUIRED_HRESULT;
+        if hr < 0 && !restart {
             return Err(error(self.api, hr, what).into());
         }
-        Ok(())
+        Ok(restart)
     }
 }
 
