@@ -345,7 +345,7 @@ fn resolve_check(c: raw::Check) -> Result<Check> {
     let allowed: &[&str] = match kind {
         "process" => &["stable-for", "within"],
         "service" => &["status", "within"],
-        "eventlog" => &[],
+        "eventlog" => &["within"],
         "port" => &["host", "within"],
         "file" => &["within"],
         _ => &["shell", "within"],
@@ -358,7 +358,7 @@ fn resolve_check(c: raw::Check) -> Result<Check> {
         ("within", c.within.is_some()),
     ];
     if let Some((opt, _)) = given.iter().find(|(opt, on)| *on && !allowed.contains(opt)) {
-        bail!("'{opt}' doesn't apply to a {kind} check");
+        bail!("'{opt}' doesn't apply to {kind} checks");
     }
 
     let within_ms = match c.within {
@@ -389,6 +389,7 @@ fn resolve_check(c: raw::Check) -> Result<Check> {
                 must_contain,
                 must_not_contain,
                 since: e.since,
+                within_ms,
             }
         }
         "port" => Check::Port {
@@ -680,7 +681,7 @@ verify:
         let cases = [
             ("verify: [{ process: a, service: b }]", "only be one kind"),
             ("verify: [{ within: 5s }]", "needs one of"),
-            ("verify: [{ service: a, stable-for: 5s }]", "'stable-for' doesn't apply to a service check"),
+            ("verify: [{ service: a, stable-for: 5s }]", "'stable-for' doesn't apply to service checks"),
             ("verify: [{ process: a, within: soon }]", "invalid duration"),
             ("verify: [{ eventlog: { provider: p } }]", "must-contain"),
             ("verify: [{ proces: a }]", "unknown field"),

@@ -54,14 +54,20 @@ The binaries aren't code-signed yet, so SmartScreen may warn on first run.
 
 ## Releasing
 
-Bump `version` in the root `Cargo.toml`, commit, then tag and push:
+1. Bump `version` in the root `Cargo.toml`.
+2. Add a section for it to [`CHANGELOG.md`](CHANGELOG.md), written for people using Groundhog.
+   It becomes the release notes.
+3. Commit, then tag and push:
 
-```powershell
-git tag v0.2.0; git push origin v0.2.0
-```
+   ```powershell
+   git tag v0.5.0; git push origin v0.5.0
+   ```
 
-The `Release` workflow builds x64 and ARM64, smoke-tests them, and publishes the release. Tags
-with a `-` (such as `v0.2.0-rc.1`) are published as prereleases.
+The `Release` workflow checks that the tag matches the version and that the changelog has a
+section for it. Then it builds x64 and ARM64, smoke-tests them, and publishes the release with
+those notes plus download and verification instructions. Tags with a `-` (such as
+`v0.5.0-rc.1`) are published as prereleases. `scripts/release-notes.sh vX.Y.Z` previews the
+notes locally.
 
 ## Quick start
 

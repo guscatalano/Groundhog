@@ -44,7 +44,8 @@ pub enum Check {
         within_ms: u64,
     },
     /// Looks at events from `provider` in `log`. Text matching is a case-insensitive substring
-    /// test against each event's rendered message.
+    /// test against each event's rendered message. `must_contain` waits up to `within_ms` for
+    /// the events to show up; a `must_not_contain` match fails at once.
     EventLog {
         log: String,
         provider: String,
@@ -53,6 +54,7 @@ pub enum Check {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         must_not_contain: Vec<String>,
         since: EventsSince,
+        within_ms: u64,
     },
     /// Something accepts TCP connections on `host:port`.
     Port {

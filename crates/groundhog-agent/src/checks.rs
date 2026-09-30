@@ -68,24 +68,34 @@ pub fn run(check: &Check, started: SystemTime, log: &mut dyn FnMut(&str)) -> Res
                 })
             })
         }),
-        Check::EventLog { log: event_log, provider, must_contain, must_not_contain, since } => {
+        Check::EventLog { log: event_log, provider, must_contain, must_not_contain, since, within_ms } => {
             let since = (*since == EventsSince::Apply).then_some(started);
-            let events = system::provider_events(event_log, provider, since, MAX_EVENTS)?;
-            let lowered: Vec<String> = events.iter().map(|e| e.to_lowercase()).collect();
-            for pattern in must_not_contain {
-                let p = pattern.to_lowercase();
-                if let Some(i) = lowered.iter().position(|e| e.contains(&p)) {
-                    bail!("a {provider} event contains '{pattern}': {}", summarize(&events[i]));
+            let deadline = Instant::now() + Duration::from_millis(*within_ms);
+            // Wanted events may still be on their way (a service logs "started" a moment after
+            // its process appears), so keep looking until `within`. An unwanted one fails at once.
+            loop {
+                let events = system::provider_events(event_log, provider, since, MAX_EVENTS)?;
+                let lowered: Vec<String> = events.iter().map(|e| e.to_lowercase()).collect();
+                for pattern in must_not_contain {
+                    let p = pattern.to_lowercase();
+                    if let Some(i) = lowered.iter().position(|e| e.contains(&p)) {
+                        bail!("a {provider} event contains '{pattern}': {}", summarize(&events[i]));
+                    }
+                }
+                let missing = must_contain.iter().find(|p| !lowered.iter().any(|e| e.contains(&p.to_lowercase())));
+                match missing {
+                    None => {
+                        log(&format!("{} {provider} events checked", events.len()));
+                        return Ok(());
+                    }
+                    Some(p) if Instant::now() >= deadline => bail!(
+                        "no {provider} event in {event_log} contains '{p}' ({} events checked, waited {})",
+                        events.len(),
+                        seconds(*within_ms)
+                    ),
+                    Some(_) => std::thread::sleep(POLL),
                 }
             }
-            for pattern in must_contain {
-                let p = pattern.to_lowercase();
-                if !lowered.iter().any(|e| e.contains(&p)) {
-                    bail!("no {provider} event in {event_log} contains '{pattern}' ({} events checked)", events.len());
-                }
-            }
-            log(&format!("{} {provider} events checked", events.len()));
-            Ok(())
         }
     }
 }
@@ -247,10 +257,30 @@ mod tests {
             must_contain: must_contain.iter().map(|s| s.to_string()).collect(),
             must_not_contain: must_not_contain.iter().map(|s| s.to_string()).collect(),
             since: EventsSince::Apply,
+            within_ms: 1000,
         };
+        let started = Instant::now();
         assert!(check(&eventlog(&[], &["0xC0000142"])).is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1), "nothing to wait for, so no waiting");
+
         let err = check(&eventlog(&["started"], &[])).unwrap_err();
         assert!(err.to_string().contains("no groundhog-no-such-provider event"), "{err}");
+        assert!(err.to_string().contains("waited 1s"), "must-contain waits for its event: {err}");
+    }
+
+    #[test]
+    fn eventlog_checks_find_real_events() {
+        // The event log service writes to the System log whenever Windows starts.
+        let c = Check::EventLog {
+            log: "System".into(),
+            provider: "EventLog".into(),
+            must_contain: vec!["eventlog".into()],
+            must_not_contain: vec!["groundhog-never-logged".into()],
+            since: EventsSince::Any,
+            within_ms: 0,
+        };
+        let lines = check(&c).unwrap();
+        assert!(lines[0].ends_with("EventLog events checked"), "{lines:?}");
     }
 
     #[test]

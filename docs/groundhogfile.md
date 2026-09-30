@@ -220,8 +220,9 @@ verify:
       provider: RdpeekAgentSvc
       log: Application             # default
       must-not-contain: '0xC0000142'   # one string or a list
-      must-contain: 'started'          # optional
+      must-contain: '(startup, Native)'  # optional; waits up to `within` for it to appear
       since: apply                 # apply (default): only events from this run; any: whole log
+    within: 1m                     # like every check (default 30s)
   - port: 3389                     # something accepts TCP connections
     host: 127.0.0.1                # default
   - file: C:\rdpeek\bundle\rdpeek-agent.exe
@@ -242,5 +243,6 @@ that don't apply to that kind are an error.
 Event log matching is a case-insensitive substring test against each event's rendered message
 and its data fields, so it works for providers without a message file and on any Windows
 display language. No events, or a provider that has never logged anything, count as "contains
-nothing": a `must-not-contain` check passes. Event log checks don't retry; put them after the
-checks that wait for things to start.
+nothing": a `must-not-contain` check passes. A `must-contain` pattern is waited for, up to
+`within`, because a service may log "started" a moment after its process appears. A
+`must-not-contain` match fails the check at once.

@@ -1,6 +1,7 @@
 name: Release
 
-# Push a tag like v0.2.0 (matching the workspace version) to build and publish a release.
+# Push a tag like v0.5.0 to build and publish a release. The tag must match the workspace
+# version, and CHANGELOG.md must have a section for it: that section becomes the release notes.
 # Run it manually from the Actions tab to build and smoke-test without publishing.
 on:
   push:
@@ -42,6 +43,14 @@ jobs:
             throw "tag $env:GITHUB_REF_NAME does not match workspace version v$version"
           }
 
+      # Before spending minutes on a build: the release notes come from CHANGELOG.md, and a
+      # version without a section there must not ship.
+      - name: Check CHANGELOG.md has notes for this version
+        shell: bash
+        run: |
+          version="$(cargo pkgid -p groundhog-agent | sed 's/.*[#@]//')"
+          scripts/release-notes.sh "v$version" > /dev/null
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p groundhog-agent -p groundhog
 
@@ -53,7 +62,7 @@ jobs:
           # The agent alone, so VMs can download it straight from a stable URL.
           Copy-Item "$bin/groundhog-agent.exe" "dist/groundhog-agent-${{ matrix.arch }}.exe"
           # The host needs the agent next to it (groundhog sandbox copies it into the sandbox).
-          Copy-Item "$bin/groundhog.exe", "$bin/groundhog-agent.exe", README.md "stage/groundhog-${{ matrix.arch }}"
+          Copy-Item "$bin/groundhog.exe", "$bin/groundhog-agent.exe", README.md, CHANGELOG.md "stage/groundhog-${{ matrix.arch }}"
           Compress-Archive -Path "stage/groundhog-${{ matrix.arch }}/*" -DestinationPath "dist/groundhog-${{ matrix.arch }}.zip"
           Get-ChildItem dist | Format-Table Name, Length
 
@@ -85,6 +94,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # tags, so the notes can link the changes since the previous release
       - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
@@ -93,6 +105,8 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Release notes
+        run: scripts/release-notes.sh "$GITHUB_REF_NAME" > notes.md && cat notes.md
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -100,4 +114,5 @@ jobs:
           prerelease=""
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease="--prerelease"; fi
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag $prerelease
+            --repo "$GITHUB_REPOSITORY" --title "Groundhog $GITHUB_REF_NAME" --notes-file notes.md \
+            --verify-tag $prerelease
