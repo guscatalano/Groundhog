@@ -1205,8 +1205,10 @@ capabilities:
             if !name.ends_with(".groundhog.yaml") {
                 continue;
             }
-            let url = library::expand(&Url::parse(&format!("groundhog:{}", name.trim_end_matches(".groundhog.yaml"))).unwrap())
-                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            let url = library::expand(
+                &Url::parse(&format!("groundhog:{}", name.trim_end_matches(".groundhog.yaml"))).unwrap(),
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e:#}"));
             let mut raw = parse(&std::fs::read(&path).unwrap(), &url).unwrap_or_else(|e| panic!("{e:#}"));
             for base in std::mem::take(&mut raw.extends).into_vec() {
                 let base = resolve_source_ref(&url, base).unwrap();
@@ -1224,11 +1226,17 @@ capabilities:
         let v = env!("CARGO_PKG_VERSION");
         let lib = format!("https://raw.githubusercontent.com/guscatalano/Groundhog/v{v}/library");
         let f = MapFetcher::default()
-            .with(&format!("{lib}/bundle.groundhog.yaml"), "extends: [part.groundhog.yaml]
-apps: [b]")
+            .with(
+                &format!("{lib}/bundle.groundhog.yaml"),
+                "extends: [part.groundhog.yaml]
+apps: [b]",
+            )
             .with(&format!("{lib}/part.groundhog.yaml"), "apps: [a]")
-            .with("https://cfg.test/top.yaml", "extends: groundhog:bundle
-apps: [c]");
+            .with(
+                "https://cfg.test/top.yaml",
+                "extends: groundhog:bundle
+apps: [c]",
+            );
         let dir = tempfile::tempdir().unwrap();
         let loaded = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap();
         let ids: Vec<_> = loaded

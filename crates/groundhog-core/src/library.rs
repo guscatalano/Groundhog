@@ -49,13 +49,18 @@ mod tests {
             exp("groundhog:windows-internals").unwrap(),
             format!("{RAW}/v{v}/library/windows-internals.groundhog.yaml")
         );
-        assert_eq!(exp("groundhog:sysinternals@main").unwrap(), format!("{RAW}/main/library/sysinternals.groundhog.yaml"));
+        assert_eq!(
+            exp("groundhog:sysinternals@main").unwrap(),
+            format!("{RAW}/main/library/sysinternals.groundhog.yaml")
+        );
         assert_eq!(exp("groundhog:windbg@v0.10.0").unwrap(), format!("{RAW}/v0.10.0/library/windbg.groundhog.yaml"));
     }
 
     #[test]
     fn rejects_odd_names_and_refs() {
-        for bad in ["groundhog:", "groundhog:Sys", "groundhog:a/b", "groundhog:a@", "groundhog:a@../x", "groundhog:a@x y"] {
+        for bad in
+            ["groundhog:", "groundhog:Sys", "groundhog:a/b", "groundhog:a@", "groundhog:a@../x", "groundhog:a@x y"]
+        {
             assert!(exp(bad).is_err(), "{bad}");
         }
     }

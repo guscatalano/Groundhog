@@ -54,7 +54,15 @@ pub struct WinExecutor<'a> {
 
 impl<'a> WinExecutor<'a> {
     pub fn new(content: &'a ContentStore<'a>, work_dir: PathBuf, secrets: crate::secrets::Secrets) -> Self {
-        Self { content, work_dir, winget: None, started: SystemTime::now(), secrets, dism: None, deferred_restart: false }
+        Self {
+            content,
+            work_dir,
+            winget: None,
+            started: SystemTime::now(),
+            secrets,
+            dism: None,
+            deferred_restart: false,
+        }
     }
 }
 
