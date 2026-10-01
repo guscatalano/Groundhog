@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -94,12 +95,50 @@ impl DefaultFetcher {
             req = req.header(&rule.name, &rule.value);
         }
         let mut resp = req.call().with_context(|| format!("GET {url}"))?;
+        if let Some(date) = resp.headers().get("date").and_then(|v| v.to_str().ok()) {
+            note_server_date(host, date);
+        }
         resp.body_mut()
             .with_config()
             .limit(4 * 1024 * 1024 * 1024)
             .read_to_vec()
             .with_context(|| format!("reading body of {url}"))
     }
+}
+
+/// How far ahead of this machine's clock a server's was, in seconds (negative: this machine
+/// is ahead), and which server: taken from the first HTTP response with a `Date` header. Only
+/// for a warning; a machine whose clock is hours off gets baffling TLS errors and timestamps.
+pub fn observed_clock_skew() -> Option<(i64, String)> {
+    CLOCK_SKEW.get().cloned()
+}
+
+static CLOCK_SKEW: OnceLock<(i64, String)> = OnceLock::new();
+
+fn note_server_date(host: &str, value: &str) {
+    let (Some(server), Ok(now)) = (parse_http_date(value), SystemTime::now().duration_since(UNIX_EPOCH)) else {
+        return;
+    };
+    let _ = CLOCK_SKEW.set((server - now.as_secs() as i64, host.to_owned()));
+}
+
+/// Seconds since 1970 for an HTTP date in its standard form, `Thu, 01 Oct 2026 07:38:37 GMT`.
+fn parse_http_date(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    let [_, day, month, year, time, "GMT"] = parts.as_slice() else { return None };
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let month = MONTHS.iter().position(|m| m == month)? as i64 + 1;
+    let (day, year): (i64, i64) = (day.parse().ok()?, year.parse().ok()?);
+    let hms: Vec<i64> = time.split(':').map(|n| n.parse().ok()).collect::<Option<_>>()?;
+    let [h, m, sec] = hms.as_slice() else { return None };
+    // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + m * 60 + sec)
 }
 
 /// The shared HTTP client. TLS goes through Windows (schannel) and trusts the machine's
@@ -179,6 +218,19 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_http_dates() {
+        // Checked against `[DateTimeOffset]::Parse(...).ToUnixTimeSeconds()`.
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(parse_http_date("Thu, 01 Oct 2026 07:38:37 GMT"), Some(1_790_840_317));
+        assert_eq!(parse_http_date("Tue, 29 Feb 2028 23:59:59 GMT"), Some(1_835_481_599));
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777));
+        for bad in ["", "Thu, 01 Oct 2026 07:38:37 PST", "Thu, 01 Foo 2026 07:38:37 GMT", "Thu, 01 Oct 2026 07:38 GMT"]
+        {
+            assert_eq!(parse_http_date(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn parses_paths_and_urls() {

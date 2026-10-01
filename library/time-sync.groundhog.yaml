@@ -1,0 +1,47 @@
+# Keep the clock right: the Windows Time service runs at boot and syncs from time.windows.com,
+# and a large error (a VM whose clock starts hours off) is corrected in one go rather than
+# refused. Checked against an NTP server at the end of every apply.
+#
+# It doesn't touch how Windows reads the hardware clock (RealTimeIsUniversal): that has to
+# match the hypervisor's setting (on Proxmox, `localtime`), and getting it wrong would make
+# things worse. Needs outbound NTP (UDP 123).
+
+agent: ">=0.13.1"
+
+registry:
+  # 0xFFFFFFFF: correct any error. By default Windows refuses corrections over 15 hours or so,
+  # and a VM that boots far off would then stay wrong.
+  - key: HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config
+    name: MaxPosPhaseCorrection
+    type: dword
+    value: 0xFFFFFFFF
+  - key: HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config
+    name: MaxNegPhaseCorrection
+    type: dword
+    value: 0xFFFFFFFF
+
+run:
+  - command: |
+      # sync the clock now
+      Set-Service w32time -StartupType Automatic
+      if ((Get-Service w32time).Status -ne 'Running') { Start-Service w32time }
+      w32tm /config /update | Out-Null
+      # The first resync after the service starts often has no samples yet.
+      foreach ($i in 1..5) {
+        w32tm /resync /force | Out-Null
+        if ($LASTEXITCODE -eq 0) { exit 0 }
+        Start-Sleep 5
+      }
+      Write-Output "w32tm /resync kept failing; is outbound NTP (UDP 123) blocked?"
+      exit 1
+    always: true
+
+verify:
+  - service: w32time
+  - command: |
+      # clock within a minute of time.windows.com
+      $line = w32tm /stripchart /computer:time.windows.com /dataonly /samples:1 | Select-String ', [+-]\d' | Select-Object -Last 1
+      if (-not $line) { Write-Output 'no answer from time.windows.com'; exit 1 }
+      $offset = [double]($line.Line -replace '^.*, ([+-][\d.]+)s.*$', '$1')
+      if ([math]::Abs($offset) -gt 60) { Write-Output "clock is off by $offset s"; exit 1 }
+    within: 2m

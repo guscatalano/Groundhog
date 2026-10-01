@@ -117,6 +117,7 @@ machine that can't reach GitHub can use a copy from your own share by path inste
 | `symbols` | Machine-wide `_NT_SYMBOL_PATH` for Microsoft's symbol server, cached in `C:\Symbols`. |
 | `crash-dumps` | Full dumps of crashing programs in `C:\CrashDumps`; kernel dumps kept. |
 | `explorer-dev` | Explorer shows extensions, hidden and system files, and full paths. |
+| `time-sync` | Windows Time runs at boot, corrects even a large error in one go, and is checked against time.windows.com. Not part of `windows-internals`. Needs outbound NTP (UDP 123). |
 
 ## `users`
 

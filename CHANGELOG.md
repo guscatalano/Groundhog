@@ -4,6 +4,19 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.13.1] - 2026-10-01
+
+### Added
+- **A warning when the machine's clock is off.** The agent compares its clock with the `Date`
+  of the first server it downloads from and says so when they differ by more than 5 minutes
+  ("this machine's clock is 7h behind raw.githubusercontent.com's"). A VM whose clock starts
+  hours off otherwise gets certificate errors and timestamps that look like anything but a
+  clock problem. It only warns; it never changes the clock.
+- **`groundhog:time-sync`** turns on Windows Time, lets it correct a large error in one go,
+  syncs now and checks the result against time.windows.com. Tested on a fleet VM that booted
+  7 hours slow. It doesn't change how Windows reads the hardware clock, which has to match the
+  hypervisor's setting.
+
 ## [0.13.0] - 2026-10-01
 
 ### Added
@@ -278,6 +291,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.13.1]: https://github.com/guscatalano/Groundhog/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/guscatalano/Groundhog/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/guscatalano/Groundhog/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/guscatalano/Groundhog/compare/v0.10.1...v0.11.0

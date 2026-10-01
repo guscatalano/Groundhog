@@ -298,6 +298,7 @@ fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<Applied> {
         }
         _ => Ok((url, loaded)),
     });
+    warn_about_clock_skew(reporter);
     let (url, loaded) = match loaded {
         Ok(v) => v,
         Err(e) => {
@@ -366,6 +367,26 @@ fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<Applied> {
         _ => secrets::delete_store(home)?,
     }
     Ok(Applied::Ran(Box::new(state)))
+}
+
+/// Beyond this, a wrong clock is worth saying out loud.
+const CLOCK_SKEW_WARNING_SECS: i64 = 5 * 60;
+
+/// Says when this machine's clock is far from a server's. It only warns: a VM whose clock
+/// is hours off gets certificate errors that look like anything but a clock problem, and
+/// timestamps that disagree with the host's logs. Fixing it belongs to the template or the
+/// hypervisor (or `groundhog:time-sync`), not to a run that happens to notice.
+fn warn_about_clock_skew(reporter: &dyn Reporter) {
+    let Some((skew, host)) = groundhog_core::fetch::observed_clock_skew() else { return };
+    if skew.abs() < CLOCK_SKEW_WARNING_SECS {
+        return;
+    }
+    let by = humantime::format_duration(std::time::Duration::from_secs(skew.unsigned_abs() / 60 * 60));
+    let direction = if skew > 0 { "behind" } else { "ahead of" };
+    reporter.log(&format!(
+        "warning: this machine's clock is {by} {direction} {host}'s; certificates and timestamps can go wrong. \
+         Turn on time sync (groundhog:time-sync), or fix the VM's clock setting"
+    ));
 }
 
 fn failed_before_start(p: &Pending, e: &anyhow::Error) -> RunState {
