@@ -4,6 +4,16 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.13.0] - 2026-10-01
+
+### Added
+- **`groundhog-agent clean`** removes everything runs leave in the agent's folder (results,
+  state, logs, cached downloads, secrets and the secret salt) and keeps the installed agent and
+  its logon task. Run it before sealing a template: otherwise every clone starts with the
+  template build's `pending.done.json`, so a host that watches for it reports a run as
+  finished before any has started, and clones carry the template's download cache and share
+  one secret salt. [docs/templates.md](docs/templates.md#baking-a-base-layer) now includes it.
+
 ## [0.12.0] - 2026-10-01
 
 ### Added
@@ -268,6 +278,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.13.0]: https://github.com/guscatalano/Groundhog/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/guscatalano/Groundhog/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/guscatalano/Groundhog/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/guscatalano/Groundhog/compare/v0.10.0...v0.10.1

@@ -52,6 +52,10 @@ enum Command {
     InstallTask,
     /// Show the last result for each Groundhogfile applied on this machine.
     Status,
+    /// Remove everything runs leave behind (results, state, logs, downloads, secrets), keeping
+    /// the installed agent and its logon task. Run it before sealing a template, so clones
+    /// start with no history, no cached downloads and their own secret salt.
+    Clean,
     /// Update this agent now, without applying anything (for maintaining templates).
     Update {
         /// `latest`, or a version to move to.
@@ -166,6 +170,10 @@ fn run(home: &Path, command: Command) -> Result<i32> {
         }
         Command::Status => {
             print_status(home)?;
+            Ok(0)
+        }
+        Command::Clean => {
+            clean(home)?;
             Ok(0)
         }
         Command::Update { to, from } => {
@@ -481,6 +489,54 @@ fn print_plan(home: &Path, p: &Pending) -> Result<()> {
     Ok(())
 }
 
+/// What a run leaves in the home folder. `bin` (the installed agent) is kept.
+const RUN_LEFTOVERS: &[&str] = &[
+    PENDING_FILE,
+    "pending.done.json",
+    "pending.failed.json",
+    secrets::STORE,
+    secrets::SALT,
+    "last-run",
+    "runs",
+    "objects",
+    "work",
+    "bundles",
+    "versions",
+];
+
+fn clean(home: &Path) -> Result<()> {
+    if home.join(PENDING_FILE).exists() {
+        println!("note: removing a queued {PENDING_FILE}; it will not be applied");
+    }
+    let mut removed = 0;
+    for name in RUN_LEFTOVERS {
+        let path = home.join(name);
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else if path.exists() {
+            std::fs::remove_file(&path)
+        } else {
+            continue;
+        };
+        result.with_context(|| format!("removing {}", path.display()))?;
+        println!("removed {}", path.display());
+        removed += 1;
+    }
+    // Copies an update set aside; one still running (this one, say) stays until next time.
+    if let Ok(entries) = std::fs::read_dir(home.join("bin")) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.file_name().to_string_lossy().contains(".old-") && std::fs::remove_file(entry.path()).is_ok() {
+                println!("removed {}", entry.path().display());
+                removed += 1;
+            }
+        }
+    }
+    if removed == 0 {
+        println!("nothing to clean in {}", home.display());
+    }
+    Ok(())
+}
+
 fn print_status(home: &Path) -> Result<()> {
     let runs = home.join("runs");
     let Ok(entries) = std::fs::read_dir(&runs) else {
@@ -504,6 +560,47 @@ fn print_status(home: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_leaves_only_the_installed_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        for d in ["bin", "last-run", "runs", "objects/sha256", "work/downloads", "bundles", "versions/0.1.0"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        for f in [
+            "bin/groundhog-agent.exe",
+            "bin/groundhog-agent.exe.old-1",
+            "pending.json",
+            "pending.done.json",
+            "pending.failed.json",
+            "secrets.bin",
+            "secret-salt.bin",
+            "runs/x.json",
+        ] {
+            std::fs::write(home.join(f), "x").unwrap();
+        }
+        clean(home).unwrap();
+        let left: Vec<String> = walk(home);
+        assert_eq!(left, ["bin", "bin/groundhog-agent.exe"]);
+        clean(home).unwrap();
+
+        fn walk(root: &Path) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d).unwrap().filter_map(Result::ok) {
+                    let p = e.path();
+                    out.push(p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"));
+                    if p.is_dir() {
+                        stack.push(p);
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+    }
 
     #[test]
     fn headers_bind_to_the_source_host_by_default() {

@@ -116,8 +116,16 @@ the template VM **before** sealing it:
 
 ```powershell
 groundhog-agent apply base.groundhog.yaml --reboot   # features, capabilities, common apps
+groundhog-agent clean                                # forget this run before sealing
 sysprep /generalize /oobe /shutdown /unattend:C:\unattend.xml
 ```
+
+**Always `clean` before sealing**, after anything that ran the agent in the template. It
+removes everything runs leave in `%ProgramData%\groundhog` (results, state, logs, cached
+downloads, secrets and the secret salt) and keeps the installed agent and its logon task.
+Without it, every clone starts with the template's `pending.done.json`, so a host that looks
+for that file reports a run as finished before any has started, and clones carry the
+template's download cache and share one secret salt.
 
 Clones then extend the base (`extends: base.groundhog.yaml`). The base's steps find the
 machine already in the right state and take seconds, not minutes, and a feature that needed

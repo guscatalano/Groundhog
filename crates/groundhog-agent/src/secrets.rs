@@ -14,7 +14,7 @@ use groundhog_win::dpapi;
 
 pub type Secrets = BTreeMap<String, String>;
 
-const STORE: &str = "secrets.bin";
+pub const STORE: &str = "secrets.bin";
 const ENV_PREFIX: &str = "GROUNDHOG_SECRET_";
 
 fn store(home: &Path) -> PathBuf {
@@ -59,7 +59,7 @@ pub fn gather(home: &Path, supplied: &Secrets) -> Result<Secrets> {
     Ok(all)
 }
 
-const SALT: &str = "secret-salt.bin";
+pub const SALT: &str = "secret-salt.bin";
 
 /// A salted hash of each secret's value, for step ids: a step that uses a secret reruns when
 /// the value changes, and the id can't be used to test guesses at it. The salt is random,
