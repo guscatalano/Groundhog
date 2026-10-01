@@ -4,6 +4,34 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.11.0] - 2026-09-30
+
+### Added
+- **Machine-wide `env` and `path`.** `scope: machine` puts a variable or PATH entry in the
+  system environment, which every account, service and SYSTEM sees, instead of the agent
+  user's own:
+  ```yaml
+  env:
+    _NT_SYMBOL_PATH: { value: 'srv*C:\Symbols*https://msdl.microsoft.com/download/symbols', scope: machine }
+  path:
+    - { dir: 'C:\Program Files\Sysinternals', scope: machine }
+  ```
+  Entries are only ever appended, and a machine PATH that can't be read is left alone rather
+  than rewritten. Existing user-scope steps keep their ids, so they don't run again.
+- **More of the debugging toolchain in the library:** `debuggers` (cdb, kd, gflags, umdh,
+  symchk, dbgsrv from the Windows SDK's Debugging Tools only), `ttd` (`TTD.exe`) and
+  `dotnet-diag` (.NET 10 SDK with dotnet-dump, -gcdump, -trace and -counters).
+  `windows-internals` now includes all three, so tools that drive these programs, such as an
+  MCP debugging server, find everything they expect.
+
+### Changed
+- **`sysinternals` moved to `C:\Program Files\Sysinternals` and onto the machine PATH**, and
+  accepts the EULA for SYSTEM too, so services and SYSTEM shells find the tools without a
+  prompt. A folder on the machine PATH must be writable only by administrators, which
+  `C:\Tools` isn't. A copy in `C:\Tools\Sysinternals` from 0.10 is left in place; delete it
+  when nothing uses it.
+- `symbols` sets `_NT_SYMBOL_PATH` machine-wide.
+
 ## [0.10.1] - 2026-09-30
 
 ### Fixed
@@ -200,6 +228,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.11.0]: https://github.com/guscatalano/Groundhog/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/guscatalano/Groundhog/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/guscatalano/Groundhog/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/guscatalano/Groundhog/compare/v0.8.0...v0.9.0

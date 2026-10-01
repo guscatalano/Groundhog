@@ -1,5 +1,6 @@
-# A machine for Windows internals work: Sysinternals, WinDbg, the Windows Performance Toolkit,
-# the public symbol server, crash dumps kept, and Explorer showing everything.
+# A machine for Windows internals work: Sysinternals, WinDbg and the console debuggers, Time
+# Travel Debugging, the Windows Performance Toolkit, .NET diagnostics, the public symbol
+# server, crash dumps kept, and Explorer showing everything.
 #
 #   groundhog-agent apply groundhog:windows-internals
 #
@@ -8,7 +9,10 @@
 extends:
   - sysinternals.groundhog.yaml
   - windbg.groundhog.yaml
+  - debuggers.groundhog.yaml
+  - ttd.groundhog.yaml
   - wpt.groundhog.yaml
+  - dotnet-diag.groundhog.yaml
   - symbols.groundhog.yaml
   - crash-dumps.groundhog.yaml
   - explorer-dev.groundhog.yaml

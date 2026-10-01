@@ -1,14 +1,21 @@
-# Sysinternals Suite (Process Explorer, Process Monitor, Autoruns, PsExec, …) in
-# C:\Tools\Sysinternals, on PATH, with the EULA accepted so tools don't stop at a dialog.
+# Sysinternals Suite (Process Explorer, Process Monitor, ProcDump, Autoruns, PsExec, …) in
+# C:\Program Files\Sysinternals, on the machine PATH so every account and service finds it,
+# with the EULA accepted so tools don't stop at a dialog.
 # Follows the suite's download, so a new build of the suite reapplies this.
+#
+# Program Files, not a folder like C:\Tools: anything on the machine PATH must be writable
+# only by administrators, or any user could plant a program that admins and services run.
+
+agent: ">=0.11.0"   # machine-scope env and PATH
 
 files:
   - from: https://download.sysinternals.com/files/SysinternalsSuite.zip
-    to: C:\Tools\Sysinternals
+    to: C:\Program Files\Sysinternals
     extract: true
 
 path:
-  - C:\Tools\Sysinternals
+  - dir: C:\Program Files\Sysinternals
+    scope: machine
 
 registry:
   - key: HKCU\Software\Sysinternals
@@ -16,6 +23,11 @@ registry:
     type: dword
     value: 1
     scope: [current-user, default-user]
+  # LocalSystem, for tools run from services and SYSTEM shells.
+  - key: HKU\S-1-5-18\Software\Sysinternals
+    name: EulaAccepted
+    type: dword
+    value: 1
 
 verify:
-  - file: C:\Tools\Sysinternals\procexp64.exe
+  - file: C:\Program Files\Sysinternals\procexp64.exe

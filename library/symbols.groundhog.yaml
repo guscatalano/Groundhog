@@ -1,5 +1,10 @@
-# Microsoft's public symbol server, cached in C:\Symbols, for WinDbg, WPA, Process Explorer
-# and anything else that reads _NT_SYMBOL_PATH.
+# Microsoft's public symbol server, cached in C:\Symbols, for WinDbg, cdb, WPA, Process
+# Explorer and anything else that reads _NT_SYMBOL_PATH. Machine-wide, so debuggers running
+# as other accounts or as services use it too.
+
+agent: ">=0.11.0"   # machine-scope env and PATH
 
 env:
-  _NT_SYMBOL_PATH: srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+  _NT_SYMBOL_PATH:
+    value: srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+    scope: machine

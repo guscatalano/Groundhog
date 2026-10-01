@@ -85,8 +85,8 @@ target\release\groundhog.exe sandbox examples\dev\groundhog.yaml --cache C:\grou
 ```
 
 Or start from the [built-in library](docs/groundhogfile.md#the-built-in-library): a machine
-for Windows internals work (Sysinternals, WinDbg, the Performance Toolkit, symbols, crash
-dumps) is one line:
+for Windows internals work (Sysinternals, WinDbg and the console debuggers, TTD, the
+Performance Toolkit, .NET diagnostics, symbols, crash dumps) is one line:
 
 ```powershell
 groundhog-agent apply groundhog:windows-internals

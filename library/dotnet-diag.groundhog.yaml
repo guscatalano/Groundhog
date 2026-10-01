@@ -1,0 +1,26 @@
+# .NET diagnostics: dotnet-dump, dotnet-gcdump, dotnet-trace and dotnet-counters, as global
+# tools of the .NET 10 SDK, for this user.
+
+apps:
+  - Microsoft.DotNet.SDK.10
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+path:
+  - '%USERPROFILE%\.dotnet\tools'
+
+run:
+  - command: |
+      # install the .NET diagnostic tools
+      # dotnet.exe by full path: the SDK was installed by this run, after the agent started.
+      $dotnet = Join-Path $env:ProgramFiles 'dotnet\dotnet.exe'
+      foreach ($tool in 'dotnet-dump', 'dotnet-gcdump', 'dotnet-trace', 'dotnet-counters') {
+        & $dotnet tool update --global $tool
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      }
+
+verify:
+  - file: '%USERPROFILE%\.dotnet\tools\dotnet-dump.exe'
+  - file: '%USERPROFILE%\.dotnet\tools\dotnet-trace.exe'

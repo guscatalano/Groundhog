@@ -22,8 +22,8 @@ pub struct Groundhogfile {
     pub capabilities: Vec<Capability>,
     pub apps: Vec<App>,
     pub files: Vec<FileCopy>,
-    pub env: BTreeMap<String, String>,
-    pub path: Vec<String>,
+    pub env: BTreeMap<String, EnvVar>,
+    pub path: Vec<PathEntry>,
     pub registry: Vec<RegistryValue>,
     pub run: Vec<RunAction>,
     pub verify: Vec<Check>,
@@ -246,6 +246,39 @@ pub enum RegistryType {
     Qword,
 }
 
+/// Where an environment variable or PATH entry is stored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnvScope {
+    /// `HKCU\Environment`: the account the agent runs as.
+    #[default]
+    User,
+    /// The system environment: every account, including services and SYSTEM.
+    Machine,
+}
+
+impl EnvScope {
+    pub fn is_user(&self) -> bool {
+        *self == EnvScope::User
+    }
+}
+
+/// An environment variable's value. `scope` is left out of the serialized form when it's the
+/// default, so step ids from before machine scope existed don't change.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EnvVar {
+    pub value: String,
+    #[serde(skip_serializing_if = "EnvScope::is_user")]
+    pub scope: EnvScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PathEntry {
+    pub dir: String,
+    #[serde(skip_serializing_if = "EnvScope::is_user")]
+    pub scope: EnvScope,
+}
+
 /// Which user hives a `HKCU\...` value is written to. Ignored for other roots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -366,7 +399,7 @@ pub(crate) mod raw {
 
     use serde::Deserialize;
 
-    use super::{EventsSince, HiveScope, RegistryType, ServiceState, Shell};
+    use super::{EnvScope, EventsSince, HiveScope, RegistryType, ServiceState, Shell};
 
     #[derive(Debug, Default, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -381,9 +414,9 @@ pub(crate) mod raw {
         #[serde(default)]
         pub files: Vec<FileCopy>,
         #[serde(default)]
-        pub env: BTreeMap<String, String>,
+        pub env: BTreeMap<String, StringOr<EnvFull>>,
         #[serde(default)]
-        pub path: Vec<String>,
+        pub path: Vec<StringOr<PathFull>>,
         #[serde(default)]
         pub registry: Vec<RegistryValue>,
         #[serde(default)]
@@ -549,6 +582,22 @@ pub(crate) mod raw {
             }
             d.deserialize_any(V(std::marker::PhantomData))
         }
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct EnvFull {
+        pub value: String,
+        #[serde(default)]
+        pub scope: EnvScope,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct PathFull {
+        pub dir: String,
+        #[serde(default)]
+        pub scope: EnvScope,
     }
 
     #[derive(Debug, Deserialize)]

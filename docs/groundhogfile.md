@@ -108,10 +108,13 @@ machine that can't reach GitHub can use a copy from your own share by path inste
 | Name | What it sets up |
 | --- | --- |
 | `windows-internals` | All of the below. |
-| `sysinternals` | Sysinternals Suite in `C:\Tools\Sysinternals`, on PATH, EULA accepted. |
+| `sysinternals` | Sysinternals Suite in `C:\Program Files\Sysinternals`, on the machine PATH, EULA accepted (also for SYSTEM). |
 | `windbg` | WinDbg. |
+| `debuggers` | Debugging Tools for Windows (`cdb`, `kd`, `gflags`, `umdh`, `symchk`, `dbgsrv`, …) from the Windows SDK, on the machine PATH. |
+| `ttd` | Time Travel Debugging's recorder, `TTD.exe`. |
 | `wpt` | Windows Performance Toolkit (WPR, WPA, xperf) from the Windows ADK. |
-| `symbols` | `_NT_SYMBOL_PATH` for Microsoft's symbol server, cached in `C:\Symbols`. |
+| `dotnet-diag` | .NET 10 SDK with `dotnet-dump`, `dotnet-gcdump`, `dotnet-trace` and `dotnet-counters`. |
+| `symbols` | Machine-wide `_NT_SYMBOL_PATH` for Microsoft's symbol server, cached in `C:\Symbols`. |
 | `crash-dumps` | Full dumps of crashing programs in `C:\CrashDumps`; kernel dumps kept. |
 | `explorer-dev` | Explorer shows extensions, hidden and system files, and full paths. |
 
@@ -324,11 +327,28 @@ as a zip. This works in `files:` and in `apps:` (`url: github:…`).
 env:
   DOTNET_CLI_TELEMETRY_OPTOUT: "1"
   TOOLS: '%USERPROFILE%\tools'        # stored as REG_EXPAND_SZ when it contains %
+  _NT_SYMBOL_PATH:                    # machine-wide: every account and service sees it
+    value: srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+    scope: machine
 path:
   - C:\tools\bin
+  - dir: C:\Program Files\Sysinternals
+    scope: machine
 ```
 
-These are user-level variables (`HKCU\Environment`). Running programs are notified of the change.
+By default these are the agent user's own variables (`HKCU\Environment`). `scope: machine`
+writes the system environment instead, which every account, service and SYSTEM starts with;
+that needs the agent elevated. `path` entries are appended if missing, never reordered or
+removed, and a machine PATH that can't be read is left alone rather than rewritten.
+`env: PATH` with `scope: machine` is refused, since it would replace the whole system PATH.
+
+Running programs are notified of the change, but a program that's already running keeps the
+environment it started with: one that needs a new PATH entry must be restarted, or re-read
+it from the registry.
+
+**A folder on the machine PATH must be writable only by administrators**, such as one under
+`C:\Program Files`. If ordinary users can write to it (a new folder directly under `C:\`
+usually can be), any of them can plant a program that administrators and services then run.
 
 ## `registry`
 

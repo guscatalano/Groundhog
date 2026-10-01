@@ -1,0 +1,8 @@
+# Time Travel Debugging's command-line recorder, TTD.exe, for recording a process to replay
+# later in WinDbg. Installed for this user; TTD.exe is then on PATH through its app alias.
+
+apps:
+  - Microsoft.TimeTravelDebugging
+
+verify:
+  - file: '%LOCALAPPDATA%\Microsoft\WindowsApps\TTD.exe'

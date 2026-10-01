@@ -1,4 +1,5 @@
-//! User environment variables and PATH, persisted in `HKCU\Environment`.
+//! Environment variables and PATH, persisted for the user (`HKCU\Environment`) or the whole
+//! machine (the system environment every account and service starts with).
 
 use std::io;
 
@@ -8,12 +9,29 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
 };
 use winreg::RegKey;
-use winreg::enums::HKEY_CURRENT_USER;
+use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
 use crate::registry::{self, Data};
 use crate::wide;
 
 const ENV_KEY: &str = "Environment";
+const MACHINE_ENV_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+
+/// Where a variable is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    User,
+    Machine,
+}
+
+impl Scope {
+    fn key(self) -> (RegKey, &'static str) {
+        match self {
+            Scope::User => (RegKey::predef(HKEY_CURRENT_USER), ENV_KEY),
+            Scope::Machine => (RegKey::predef(HKEY_LOCAL_MACHINE), MACHINE_ENV_KEY),
+        }
+    }
+}
 
 /// Expands `%VARS%` using the current process environment.
 pub fn expand(s: &str) -> Result<String> {
@@ -41,20 +59,27 @@ pub fn expand_path(s: &str) -> Result<String> {
     expand(&s)
 }
 
-/// Sets a persistent user environment variable and mirrors it into this process, so later
-/// steps see it. Returns whether it changed.
-pub fn set_user_var(name: &str, value: &str) -> Result<bool> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+/// Sets a persistent environment variable and mirrors it into this process, so later steps
+/// see it. Returns whether it changed. Machine scope needs the agent elevated.
+pub fn set_var(scope: Scope, name: &str, value: &str) -> Result<bool> {
+    let (root, key) = scope.key();
     let data = if value.contains('%') { Data::ExpandString(value) } else { Data::String(value) };
-    let changed = registry::set_value(&hkcu, ENV_KEY, Some(name), &data)?;
+    let changed = registry::set_value(&root, key, Some(name), &data)?;
     set_process_var(name, &expand(value)?);
     Ok(changed)
 }
 
-/// Appends a directory to the user PATH if it is not already there. Returns whether it changed.
-pub fn add_user_path(dir: &str) -> Result<bool> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let current = registry::get_string(&hkcu, ENV_KEY, "Path").unwrap_or_default();
+/// Appends a directory to the user or machine PATH if it is not already there. Returns whether
+/// it changed. Machine scope needs the agent elevated.
+pub fn add_path(scope: Scope, dir: &str) -> Result<bool> {
+    let (root, key) = scope.key();
+    let current = match (registry::get_string(&root, key, "Path"), scope) {
+        (Some(p), _) => p,
+        (None, Scope::User) => String::new(),
+        // Every Windows has a system PATH. Failing to read it must never become "it's empty",
+        // which would write back a PATH holding only `dir`.
+        (None, Scope::Machine) => bail!("can't read the machine PATH ({MACHINE_ENV_KEY}); not changing it"),
+    };
     let norm = |p: &str| p.trim().trim_end_matches('\\').to_ascii_lowercase();
     let present = current.split(';').any(|p| norm(p) == norm(dir));
 
@@ -65,7 +90,7 @@ pub fn add_user_path(dir: &str) -> Result<bool> {
             "" => dir.to_owned(),
             cur => format!("{cur};{dir}"),
         };
-        registry::set_value(&hkcu, ENV_KEY, Some("Path"), &Data::ExpandString(&updated))?
+        registry::set_value(&root, key, Some("Path"), &Data::ExpandString(&updated))?
     };
 
     let process_path = std::env::var("PATH").unwrap_or_default();

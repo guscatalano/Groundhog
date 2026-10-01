@@ -15,7 +15,7 @@ use url::Url;
 use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
-    App, Capability, Check, Feature, FileCopy, Groundhogfile, RegistryValue, RunAction, ServiceState, User,
+    App, Capability, Check, EnvScope, Feature, FileCopy, Groundhogfile, RegistryValue, RunAction, ServiceState, User,
 };
 use crate::report::Reporter;
 
@@ -28,8 +28,17 @@ pub enum Action {
     EnsureWinget,
     App(App),
     File(FileCopy),
-    Env { name: String, value: String },
-    Path { dir: String },
+    Env {
+        name: String,
+        value: String,
+        #[serde(skip_serializing_if = "EnvScope::is_user")]
+        scope: EnvScope,
+    },
+    Path {
+        dir: String,
+        #[serde(skip_serializing_if = "EnvScope::is_user")]
+        scope: EnvScope,
+    },
     Registry(RegistryValue),
     Run(RunAction),
     User(User),
@@ -72,8 +81,10 @@ fn title(action: &Action) -> String {
             };
             format!("copy {name} -> {}", f.to)
         }
-        Action::Env { name, .. } => format!("set env {name}"),
-        Action::Path { dir } => format!("add {dir} to PATH"),
+        Action::Env { name, scope: EnvScope::User, .. } => format!("set env {name}"),
+        Action::Env { name, scope: EnvScope::Machine, .. } => format!("set machine env {name}"),
+        Action::Path { dir, scope: EnvScope::User } => format!("add {dir} to PATH"),
+        Action::Path { dir, scope: EnvScope::Machine } => format!("add {dir} to machine PATH"),
         Action::Registry(r) => format!("set {}\\{}", r.key, r.name.as_deref().unwrap_or("(default)")),
         Action::Run(RunAction::Command { command, .. }) => format!("run: {}", command_title(command)),
         Action::Run(RunAction::Script { script, .. }) => format!("run script {}", file_name(script)),
@@ -158,8 +169,12 @@ pub fn plan(file: &Groundhogfile) -> Vec<Step> {
     }
     actions.extend(file.apps.iter().cloned().map(Action::App));
     actions.extend(file.files.iter().cloned().map(Action::File));
-    actions.extend(file.env.iter().map(|(name, value)| Action::Env { name: name.clone(), value: value.clone() }));
-    actions.extend(file.path.iter().map(|dir| Action::Path { dir: dir.clone() }));
+    actions.extend(file.env.iter().map(|(name, v)| Action::Env {
+        name: name.clone(),
+        value: v.value.clone(),
+        scope: v.scope,
+    }));
+    actions.extend(file.path.iter().map(|p| Action::Path { dir: p.dir.clone(), scope: p.scope }));
     actions.extend(file.registry.iter().cloned().map(Action::Registry));
     actions.extend(file.run.iter().cloned().map(Action::Run));
     actions.extend(file.verify.iter().cloned().map(Action::Verify));
@@ -497,10 +512,23 @@ mod tests {
     }
 
     #[test]
+    fn user_scope_keeps_the_step_ids_from_before_scopes() {
+        // Ids are hashes of the serialized action: these must stay exactly what 0.10 wrote, or
+        // every machine would rerun its env and PATH steps after updating.
+        let env = Action::Env { name: "A".into(), value: "1".into(), scope: EnvScope::User };
+        let path = Action::Path { dir: r"C:\bin".into(), scope: EnvScope::User };
+        assert_eq!(serde_json::to_string(&env).unwrap(), r#"{"action":"env","name":"A","value":"1"}"#);
+        assert_eq!(serde_json::to_string(&path).unwrap(), r#"{"action":"path","dir":"C:\\bin"}"#);
+        let machine = Action::Path { dir: r"C:\bin".into(), scope: EnvScope::Machine };
+        assert_eq!(serde_json::to_string(&machine).unwrap(), r#"{"action":"path","dir":"C:\\bin","scope":"machine"}"#);
+        assert_eq!(title(&machine), r"add C:\bin to machine PATH");
+    }
+
+    #[test]
     fn declarative_steps_are_independent_and_run_steps_follow_them() {
         let with_file = |content: &str| {
             let mut g = file(&["unzip"]);
-            g.env.insert("A".into(), "1".into());
+            g.env.insert("A".into(), crate::model::EnvVar { value: "1".into(), scope: EnvScope::User });
             g.files.push(FileCopy {
                 from: Url::parse("https://dl.test/latest/app.zip").unwrap(),
                 to: r"C:\app.zip".into(),

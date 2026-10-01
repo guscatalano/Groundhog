@@ -13,8 +13,8 @@ use crate::fetch::{self, file_url_to_path};
 use crate::github;
 use crate::library;
 use crate::model::{
-    App, CURRENT_VERSION, Capability, Check, Feature, FileCopy, Groundhogfile, HiveScope, Password, RegistryData,
-    RegistryType, RegistryValue, RunAction, ServiceState, Shell, SourceRef, User, raw,
+    App, CURRENT_VERSION, Capability, Check, EnvScope, EnvVar, Feature, FileCopy, Groundhogfile, HiveScope, Password,
+    PathEntry, RegistryData, RegistryType, RegistryValue, RunAction, ServiceState, Shell, SourceRef, User, raw,
 };
 use crate::update::{self, Version};
 
@@ -382,6 +382,26 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     if let Some(bad) = env.keys().find(|k| k.is_empty() || k.contains('=')) {
         bail!("invalid environment variable name '{bad}'");
     }
+    let env = env
+        .into_iter()
+        .map(|(name, v)| {
+            let var = match v {
+                raw::StringOr::Short(value) => EnvVar { value, scope: EnvScope::User },
+                raw::StringOr::Full(f) => EnvVar { value: f.value, scope: f.scope },
+            };
+            if var.scope == EnvScope::Machine && name.eq_ignore_ascii_case("path") {
+                bail!("env: add to the machine PATH with `path:` entries (scope: machine); this would replace it");
+            }
+            Ok((name, var))
+        })
+        .collect::<Result<_>>()?;
+    let path = path
+        .into_iter()
+        .map(|p| match p {
+            raw::StringOr::Short(dir) => PathEntry { dir, scope: EnvScope::User },
+            raw::StringOr::Full(f) => PathEntry { dir: f.dir, scope: f.scope },
+        })
+        .collect();
 
     let registry = registry.into_iter().map(resolve_registry).collect::<Result<_>>()?;
 
@@ -777,7 +797,7 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
 
     let mut path = base.path;
     for p in top.path {
-        if !path.iter().any(|x| eq(x.trim_end_matches('\\'), p.trim_end_matches('\\'))) {
+        if !path.iter().any(|x| x.scope == p.scope && eq(x.dir.trim_end_matches('\\'), p.dir.trim_end_matches('\\'))) {
             path.push(p);
         }
     }
@@ -903,9 +923,9 @@ run:
 
         let ids: Vec<_> = g.apps.iter().map(App::id).collect();
         assert_eq!(ids, ["git.git", "Microsoft.PowerShell"]);
-        assert_eq!(g.env["A"], "base");
-        assert_eq!(g.env["B"], "top");
-        assert_eq!(g.path, ["C:\\tools\\"]);
+        assert_eq!(g.env["A"].value, "base");
+        assert_eq!(g.env["B"].value, "top");
+        assert_eq!(g.path.iter().map(|p| p.dir.as_str()).collect::<Vec<_>>(), ["C:\\tools\\"]);
         assert_eq!(g.run.len(), 2);
         assert_eq!(g.files[0].from.as_str(), "https://cfg.test/gitconfig");
         assert_eq!(loaded.sources.len(), 3);
@@ -1192,6 +1212,45 @@ capabilities:
             let f = MapFetcher::default().with("https://cfg.test/b.yaml", yaml);
             let err = format!("{:#}", load_with(&f, "https://cfg.test/b.yaml", dir.path()).unwrap_err());
             assert!(err.contains(want), "{yaml}: expected '{want}' in: {err}");
+        }
+    }
+
+    #[test]
+    fn env_and_path_take_a_machine_scope() {
+        let f = MapFetcher::default().with(
+            "https://cfg.test/g.yaml",
+            r"
+env:
+  A: user-value
+  B: { value: machine-value, scope: machine }
+path:
+  - C:\user\bin
+  - { dir: 'C:\Program Files\Tool', scope: machine }
+  - { dir: C:\user\bin, scope: machine }
+",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap().file;
+        assert_eq!(g.env["A"], EnvVar { value: "user-value".into(), scope: EnvScope::User });
+        assert_eq!(g.env["B"], EnvVar { value: "machine-value".into(), scope: EnvScope::Machine });
+        let scopes: Vec<_> = g.path.iter().map(|p| (p.dir.as_str(), p.scope)).collect();
+        assert_eq!(
+            scopes,
+            [
+                (r"C:\user\bin", EnvScope::User),
+                (r"C:\Program Files\Tool", EnvScope::Machine),
+                (r"C:\user\bin", EnvScope::Machine),
+            ]
+        );
+
+        for (bad, why) in [
+            ("env: { PATH: { value: 'C:\\x', scope: machine } }", "would replace it"),
+            ("env: { A: { value: x, scop: machine } }", "unknown field `scop`"),
+            ("path: [{ dir: x, scope: system }]", "unknown variant `system`"),
+        ] {
+            let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
+            let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
+            assert!(err.contains(why), "{bad}: {err}");
         }
     }
 

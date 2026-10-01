@@ -10,8 +10,8 @@ use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{Action, Executor, Outcome, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
-    App, Capability, Feature, FileCopy, HiveScope, Password, RegistryData, RegistryType, RegistryValue, RunAction,
-    Shell, User,
+    App, Capability, EnvScope, Feature, FileCopy, HiveScope, Password, RegistryData, RegistryType, RegistryValue,
+    RunAction, Shell, User,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
@@ -78,15 +78,15 @@ impl Executor for WinExecutor<'_> {
                 self.url_install(url, sha256.as_deref().or(resolved.as_deref()), args.as_deref(), *timeout_ms, log)
             }
             Action::File(f) => self.copy(f, log),
-            Action::Env { name, value } => {
-                let changed = env::set_user_var(name, value)?;
+            Action::Env { name, value, scope } => {
+                let changed = env::set_var(env_scope(*scope), name, value)?;
                 if changed {
                     env::broadcast_change();
                 }
                 Ok(Outcome::Done { changed })
             }
-            Action::Path { dir } => {
-                let changed = env::add_user_path(dir)?;
+            Action::Path { dir, scope } => {
+                let changed = env::add_path(env_scope(*scope), dir)?;
                 if changed {
                     env::broadcast_change();
                 }
@@ -398,6 +398,13 @@ impl WinExecutor<'_> {
                 })
             }
         }
+    }
+}
+
+fn env_scope(scope: EnvScope) -> env::Scope {
+    match scope {
+        EnvScope::User => env::Scope::User,
+        EnvScope::Machine => env::Scope::Machine,
     }
 }
 
