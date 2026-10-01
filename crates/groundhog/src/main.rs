@@ -89,6 +89,11 @@ pub(crate) struct PendingOptions {
     /// them in plain text, so treat it like a password.
     #[arg(long = "secret", value_name = "NAME[=VALUE]")]
     secrets: Vec<String>,
+    /// A header for requests to one host, as `Name: value` (the source's host) or
+    /// `host=Name: value`: downloads from it and status POSTs to a report sink on it. The value
+    /// may be `${secret:NAME}` (with `--secret NAME`) to keep a token out of the plain fields.
+    #[arg(long = "header", value_name = "HEADER")]
+    headers: Vec<String>,
 }
 
 impl PendingOptions {
@@ -101,7 +106,15 @@ impl PendingOptions {
             sha256: self.sha256.clone(),
             cache: self.cache.clone(),
             report: self.report.clone(),
-            headers: Vec::new(),
+            headers: {
+                let source_host = groundhog_core::fetch::parse_location(source, &std::env::current_dir()?)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_owned));
+                self.headers
+                    .iter()
+                    .map(|h| groundhog_core::fetch::HeaderRule::parse(h, source_host.as_deref()))
+                    .collect::<Result<_>>()?
+            },
             allow_reboot: !self.no_reboot,
             allow_http: self.allow_http,
             agent_update: self.agent_update.clone(),

@@ -16,4 +16,5 @@ pub mod model;
 pub mod pending;
 pub mod plugin;
 pub mod report;
+pub mod secret;
 pub mod update;

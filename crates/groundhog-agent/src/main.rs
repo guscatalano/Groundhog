@@ -8,6 +8,7 @@ mod exec;
 mod secrets;
 mod update;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +20,7 @@ use groundhog_core::fetch::{DefaultFetcher, HeaderRule};
 use groundhog_core::loader::{Loaded, Loader, NeedsAgent, required_secrets, source_ref};
 use groundhog_core::pending::{PENDING_FILE, Pending, default_home};
 use groundhog_core::report::{ConsoleReporter, FolderReporter, MultiReporter, Reporter, parse_report_sink};
+use groundhog_core::secret::Redactor;
 use groundhog_core::update::{Policy, Version};
 use groundhog_win::process::Proc;
 use groundhog_win::{tasks, token};
@@ -199,15 +201,7 @@ fn to_pending(args: &SourceArgs, report: Vec<String>, allow_reboot: bool) -> Res
 }
 
 fn parse_header(s: &str, default_host: Option<&str>) -> Result<HeaderRule> {
-    let (left, value) = s.split_once(':').with_context(|| format!("header '{s}' must look like 'Name: value'"))?;
-    let (host, name) = match left.split_once('=') {
-        Some((host, name)) => (host.trim().to_owned(), name.trim().to_owned()),
-        None => (
-            default_host.context("a header without 'host=' needs an http(s) source to attach to")?.to_owned(),
-            left.trim().to_owned(),
-        ),
-    };
-    Ok(HeaderRule { host, name, value: value.trim().to_owned() })
+    HeaderRule::parse(s, default_host)
 }
 
 struct Session {
@@ -225,13 +219,30 @@ impl Session {
             sources.push(parse_cache_source(c)?);
         }
         let cache = Cache::new(sources);
+        // A header's value may be ${secret:NAME}, so a token can travel with the secrets
+        // (scrubbed from pending.json on read) instead of in plain text beside them.
+        let headers = if p.headers.iter().any(|h| groundhog_core::secret::mentions(&h.value)) {
+            let secrets = secrets::gather(home, &p.secrets)?;
+            p.headers
+                .iter()
+                .map(|h| {
+                    let value = groundhog_core::secret::substitute(&h.value, |n| {
+                        secrets.get(n).cloned().ok_or_else(|| anyhow::anyhow!(secrets::missing_hint(n)))
+                    })
+                    .with_context(|| format!("header {} for {}", h.name, h.host))?;
+                    Ok(HeaderRule { value, ..h.clone() })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            p.headers.clone()
+        };
         let mut reporters: Vec<Box<dyn Reporter>> =
             vec![Box::new(ConsoleReporter), Box::new(FolderReporter { dir: home.join("last-run") })];
         for sink in &p.report {
-            reporters.push(parse_report_sink(sink)?);
+            reporters.push(parse_report_sink(sink, &headers)?);
         }
         Ok(Self {
-            fetcher: DefaultFetcher { headers: p.headers.clone(), allow_http: p.allow_http },
+            fetcher: DefaultFetcher { headers, allow_http: p.allow_http },
             cache,
             reporter: MultiReporter(reporters),
         })
@@ -294,14 +305,51 @@ fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<Applied> {
         }
     };
 
-    let steps = plan(&loaded.file);
     let secrets = secrets::gather(home, &p.secrets)?;
+    // Every ${secret:NAME} must have a usable value before anything changes. (Account
+    // passwords are checked when an account needs one: an existing account doesn't.)
+    let referenced: BTreeSet<String> = plan(&loaded.file).iter().flat_map(|s| engine::secrets_in(&s.action)).collect();
+    let missing: Vec<&String> = referenced.iter().filter(|n| !secrets.contains_key(*n)).collect();
+    let short: Vec<&String> = referenced
+        .iter()
+        .filter(|n| secrets.get(*n).is_some_and(|v| v.len() < groundhog_core::secret::MIN_REDACTABLE))
+        .collect();
+    let problem = if missing.len() == 1 {
+        Some(secrets::missing_hint(missing[0]))
+    } else if !missing.is_empty() {
+        let names: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
+        Some(format!(
+            "secrets not provided: {}. Add them to \"secrets\" in pending.json (groundhog pending --secret NAME), \
+             set GROUNDHOG_SECRET_<NAME>, or pass --secrets-file",
+            names.join(", ")
+        ))
+    } else if !short.is_empty() {
+        let names: Vec<&str> = short.iter().map(|s| s.as_str()).collect();
+        Some(format!(
+            "secrets shorter than {} characters can't be kept out of logs, so they can't be used in ${{secret:...}}: {}",
+            groundhog_core::secret::MIN_REDACTABLE,
+            names.join(", ")
+        ))
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        let e = anyhow::anyhow!(problem);
+        let state = failed_before_start(p, &e);
+        reporter.log(&format!("failed: {e:#}"));
+        reporter.status(&state);
+        return Ok(Applied::Ran(Box::new(state)));
+    }
+
+    let prints = secrets::fingerprints(home, &secrets)?;
+    let steps = engine::plan_with_secrets(&loaded.file, &|name| prints.get(name).cloned());
+    let redact = Redactor::new(secrets.values());
     let mut exec = WinExecutor::new(&content, home.join("work"), secrets.clone());
     let state = engine::run(
         &steps,
         &mut exec,
         reporter,
-        RunOptions { source: &url, sources: loaded.sources, state_path: &state_file(home, &url), fresh },
+        RunOptions { source: &url, sources: loaded.sources, state_path: &state_file(home, &url), fresh, redact },
     )?;
     reporter.log(&format!("{:?}: {}", state.status, state.message.as_deref().unwrap_or_default()));
     // Secrets outlive a run only while it's paused for a restart, encrypted for this user.

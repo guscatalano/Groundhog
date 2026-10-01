@@ -43,6 +43,22 @@ pub struct HeaderRule {
     pub value: String,
 }
 
+impl HeaderRule {
+    /// `Name: value` (for `default_host`, the source's own host) or `host=Name: value`. The
+    /// value may be `${secret:NAME}`, filled in by the agent from its secrets.
+    pub fn parse(s: &str, default_host: Option<&str>) -> Result<HeaderRule> {
+        let (left, value) = s.split_once(':').with_context(|| format!("header '{s}' must look like 'Name: value'"))?;
+        let (host, name) = match left.split_once('=') {
+            Some((host, name)) => (host.trim().to_owned(), name.trim().to_owned()),
+            None => (
+                default_host.context("a header without 'host=' needs an http(s) source to attach to")?.to_owned(),
+                left.trim().to_owned(),
+            ),
+        };
+        Ok(HeaderRule { host, name, value: value.trim().to_owned() })
+    }
+}
+
 pub trait Fetcher: Send + Sync {
     fn fetch(&self, url: &Url) -> Result<Vec<u8>>;
 }

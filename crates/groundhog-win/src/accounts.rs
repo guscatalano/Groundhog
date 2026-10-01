@@ -213,12 +213,9 @@ pub fn delete_user(name: &str) -> Result<()> {
     }
 }
 
-/// A random password from the system's secure generator. It always has upper and lower case
-/// letters, digits and symbols, so it passes Windows' complexity policy.
-pub fn generate_password(len: usize) -> Result<String> {
-    const SETS: [&[u8]; 4] = [b"ABCDEFGHJKLMNPQRSTUVWXYZ", b"abcdefghijkmnopqrstuvwxyz", b"23456789", b"!#%+-=?@^_"];
-    let len = len.max(SETS.len());
-    let mut rnd = vec![0u8; len * 2];
+/// Bytes from the system's secure random generator.
+pub fn random_bytes(len: usize) -> Result<Vec<u8>> {
+    let mut rnd = vec![0u8; len];
     // SAFETY: the buffer and its length are passed together.
     let status = unsafe {
         BCryptGenRandom(std::ptr::null_mut(), rnd.as_mut_ptr(), rnd.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
@@ -226,6 +223,15 @@ pub fn generate_password(len: usize) -> Result<String> {
     if status != 0 {
         bail!("the system random generator failed ({status:#x})");
     }
+    Ok(rnd)
+}
+
+/// A random password from the system's secure generator. It always has upper and lower case
+/// letters, digits and symbols, so it passes Windows' complexity policy.
+pub fn generate_password(len: usize) -> Result<String> {
+    const SETS: [&[u8]; 4] = [b"ABCDEFGHJKLMNPQRSTUVWXYZ", b"abcdefghijkmnopqrstuvwxyz", b"23456789", b"!#%+-=?@^_"];
+    let len = len.max(SETS.len());
+    let rnd = random_bytes(len * 2)?;
     // One character from each set, the rest from all of them, then a shuffle so the guaranteed
     // ones aren't always first.
     let all: Vec<u8> = SETS.concat();

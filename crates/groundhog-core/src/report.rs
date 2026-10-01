@@ -46,16 +46,20 @@ impl Reporter for FolderReporter {
 /// POSTs the status JSON on every change. Best effort: a dead endpoint never fails a run.
 pub struct HttpReporter {
     pub url: Url,
+    /// Sent with every POST: the `headers` rules whose host is this URL's host.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Reporter for HttpReporter {
     fn log(&self, _: &str) {}
     fn status(&self, state: &RunState) {
         if let Ok(body) = serde_json::to_vec(state) {
-            let _ = crate::fetch::http_agent()
-                .post(self.url.as_str())
-                .header("content-type", "application/json")
-                .send(&body[..]);
+            let mut request =
+                crate::fetch::http_agent().post(self.url.as_str()).header("content-type", "application/json");
+            for (name, value) in &self.headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            let _ = request.send(&body[..]);
         }
     }
 }
@@ -72,11 +76,18 @@ impl Reporter for MultiReporter {
     }
 }
 
-/// Parses a `--report` argument: an `http(s)://` URL or a folder path.
-pub fn parse_report_sink(s: &str) -> Result<Box<dyn Reporter>> {
+/// Parses a `--report` argument: an `http(s)://` URL or a folder path. An HTTP sink sends the
+/// `headers` rules for its host, the same rules that authenticate downloads from that host.
+pub fn parse_report_sink(s: &str, headers: &[crate::fetch::HeaderRule]) -> Result<Box<dyn Reporter>> {
     if s.starts_with("http://") || s.starts_with("https://") {
         let url = Url::parse(s).with_context(|| format!("invalid report URL '{s}'"))?;
-        return Ok(Box::new(HttpReporter { url }));
+        let host = url.host_str().unwrap_or_default();
+        let headers = headers
+            .iter()
+            .filter(|r| r.host.eq_ignore_ascii_case(host))
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
+        return Ok(Box::new(HttpReporter { url, headers }));
     }
     Ok(Box::new(FolderReporter { dir: PathBuf::from(s) }))
 }

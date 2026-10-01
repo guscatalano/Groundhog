@@ -32,6 +32,10 @@ pub struct Proc {
     pub capture_stdout: bool,
     /// Kill the process, and every process it started, if it runs longer than this.
     pub timeout: Option<Duration>,
+    /// Extra environment variables for the child, on top of this process's own. This is how
+    /// secrets reach a command: unlike arguments, a process's environment isn't visible in
+    /// process listings or command-line auditing.
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -75,6 +79,7 @@ impl Proc {
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
         }
+        cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
         let mut child = cmd.spawn().with_context(|| format!("starting {}", self.program.display()))?;
         // With a timeout, the process runs in a job, so a timeout ends everything it started.
         // Killing only the process isn't enough: an installer's children keep its output

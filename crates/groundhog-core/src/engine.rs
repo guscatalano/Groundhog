@@ -4,7 +4,7 @@
 //! re-running after a reboot, a failure or an edit to the Groundhogfile skips what is already
 //! done and runs only what is new or failed.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -15,9 +15,11 @@ use url::Url;
 use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
-    App, Capability, Check, EnvScope, Feature, FileCopy, Groundhogfile, RegistryValue, RunAction, ServiceState, User,
+    App, Capability, Check, EnvScope, Feature, FileCopy, Groundhogfile, RegistryData, RegistryValue, RunAction,
+    ServiceState, User,
 };
 use crate::report::Reporter;
+use crate::secret::{self, Redactor};
 
 /// Stop asking for reboots after this many in one run; something is looping.
 pub const MAX_REBOOTS: u32 = 5;
@@ -72,12 +74,13 @@ fn title(action: &Action) -> String {
         Action::App(App::Winget { id, version: Some(v), .. }) => format!("install {id} {v} (winget)"),
         Action::App(App::Winget { id, .. }) => format!("install {id} (winget)"),
         Action::App(App::Url { id, url, .. }) => format!("install {id} from {}", file_name(url)),
-        Action::File(f) => {
+        Action::File(FileCopy { from: None, to, .. }) => format!("write {to}"),
+        Action::File(f @ FileCopy { from: Some(from), .. }) => {
             // A release's source archive is named after its tag; "source" reads better next to "@tag".
-            let name = if f.release.is_some() && f.from.path().contains("/archive/refs/tags/") {
+            let name = if f.release.is_some() && from.path().contains("/archive/refs/tags/") {
                 "source".to_owned()
             } else {
-                file_name(&f.from)
+                file_name(from)
             };
             format!("copy {name} -> {}", f.to)
         }
@@ -158,6 +161,14 @@ fn command_title(command: &str) -> String {
 /// step: when any of them changes (say a "latest" download resolves to a new build), that
 /// run step and every later one run again.
 pub fn plan(file: &Groundhogfile) -> Vec<Step> {
+    plan_with_secrets(file, &|_| None)
+}
+
+/// Like [`plan`], for a run that has the secrets. A step that uses a secret also depends on
+/// its value, so a rotated token reruns it, but the value itself must never be stored: the
+/// id covers `fingerprint(name)`, a salted hash the agent computes. With no fingerprint (a
+/// secret that wasn't supplied) the id covers that instead.
+pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Option<String>) -> Vec<Step> {
     // Accounts first: they depend on nothing, and later steps may assume they exist.
     let mut actions: Vec<Action> = file.users.iter().cloned().map(Action::User).collect();
     // Windows features next: apps often need them (WSL for Docker, .NET 3.5 for old
@@ -183,7 +194,15 @@ pub fn plan(file: &Groundhogfile) -> Vec<Step> {
     actions
         .into_iter()
         .map(|action| {
-            let own = sha256_hex(&serde_json::to_vec(&action).expect("actions serialize"));
+            let mut own = sha256_hex(&serde_json::to_vec(&action).expect("actions serialize"));
+            let secrets = secrets_in(&action);
+            if !secrets.is_empty() {
+                let prints: Vec<String> = secrets
+                    .iter()
+                    .map(|n| format!("{n}={}", fingerprint(n).unwrap_or_else(|| "unset".into())))
+                    .collect();
+                own = sha256_hex(format!("{own}|{}", prints.join("|")).as_bytes());
+            }
             let id = match action {
                 Action::Run(_) => sha256_hex(format!("{chain}{own}").as_bytes()),
                 _ => own,
@@ -193,6 +212,25 @@ pub fn plan(file: &Groundhogfile) -> Vec<Step> {
             Step { title: title(&action), id, action }
         })
         .collect()
+}
+
+/// The secrets an action refers to with `${secret:NAME}`. (User passwords aren't included:
+/// an existing account's password is left alone, so rotating one isn't a reason to rerun.)
+pub fn secrets_in(action: &Action) -> BTreeSet<String> {
+    let texts: Vec<&str> = match action {
+        Action::File(FileCopy { content: Some(c), .. }) => vec![c],
+        Action::Env { value, .. } => vec![value],
+        Action::Registry(r) => match &r.data {
+            RegistryData::String(v) => vec![v],
+            RegistryData::MultiString(vs) => vs.iter().map(String::as_str).collect(),
+            RegistryData::Dword(_) | RegistryData::Qword(_) => vec![],
+        },
+        Action::Run(RunAction::Command { command, .. }) => vec![command],
+        Action::Run(RunAction::Script { args: Some(a), .. }) => vec![a],
+        _ => vec![],
+    };
+    // Validated when the file was loaded, so a parse error can't happen here.
+    texts.into_iter().flat_map(|t| secret::names(t).unwrap_or_default()).collect()
 }
 
 pub enum Outcome {
@@ -314,9 +352,28 @@ pub struct RunOptions<'a> {
     pub state_path: &'a Path,
     /// Ignore previous progress and run every step again.
     pub fresh: bool,
+    /// Scrubs secret values from every log line, status update and stored error message,
+    /// whichever step or reporter they come from.
+    pub redact: Redactor,
+}
+
+/// Passes everything through `redact` on its way to the real reporter.
+struct Scrubbed<'a> {
+    inner: &'a dyn Reporter,
+    redact: &'a Redactor,
+}
+
+impl Reporter for Scrubbed<'_> {
+    fn log(&self, line: &str) {
+        self.inner.log(&self.redact.scrub(line));
+    }
+    fn status(&self, state: &RunState) {
+        self.inner.status(state);
+    }
 }
 
 pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opts: RunOptions) -> Result<RunState> {
+    let reporter = &Scrubbed { inner: reporter, redact: &opts.redact };
     let prior = if opts.fresh { None } else { read_state(opts.state_path) };
     let done: HashSet<String> = prior
         .iter()
@@ -419,7 +476,7 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
                 return Ok(state);
             }
             Err(e) => {
-                let msg = format!("{e:#}");
+                let msg = opts.redact.scrub(&format!("{e:#}"));
                 reporter.log(&format!("  failed: {msg}"));
                 state.steps[i].status = StepStatus::Failed;
                 state.steps[i].message = Some(msg.clone());
@@ -497,7 +554,8 @@ mod tests {
 
     fn go(steps: &[Step], exec: &mut Fake, path: &Path) -> RunState {
         let url = Url::parse("https://cfg.test/g.yaml").unwrap();
-        let opts = RunOptions { source: &url, sources: vec![], state_path: path, fresh: false };
+        let opts =
+            RunOptions { source: &url, sources: vec![], state_path: path, fresh: false, redact: Redactor::default() };
         run(steps, exec, &NullReporter, opts).unwrap()
     }
 
@@ -525,12 +583,70 @@ mod tests {
     }
 
     #[test]
+    fn a_step_using_a_secret_reruns_when_its_fingerprint_changes() {
+        let mut g = file(&[]);
+        g.env.insert("TOKEN".into(), crate::model::EnvVar { value: "${secret:T}".into(), scope: EnvScope::User });
+        g.env.insert("PLAIN".into(), crate::model::EnvVar { value: "x".into(), scope: EnvScope::User });
+        let id = |fp: Option<&str>, name: &str| {
+            plan_with_secrets(&g, &|_| fp.map(str::to_owned))
+                .into_iter()
+                .find(|s| s.title == format!("set env {name}"))
+                .unwrap()
+                .id
+        };
+        assert_ne!(id(Some("print-1"), "TOKEN"), id(Some("print-2"), "TOKEN"), "rotation reruns it");
+        assert_eq!(id(Some("print-1"), "TOKEN"), id(Some("print-1"), "TOKEN"));
+        assert_eq!(id(Some("print-1"), "PLAIN"), id(Some("print-2"), "PLAIN"), "others are unaffected");
+        assert_eq!(id(None, "PLAIN"), id(Some("print-1"), "PLAIN"));
+        let titles: Vec<String> = plan(&g).into_iter().map(|s| s.title).collect();
+        assert!(titles.contains(&"set env TOKEN".to_owned()));
+    }
+
+    #[test]
+    fn secret_values_are_scrubbed_from_logs_and_saved_state() {
+        struct Leaky;
+        impl Executor for Leaky {
+            fn execute(&mut self, _: &Step, reporter: &dyn Reporter) -> Result<Outcome> {
+                reporter.log("connecting with hunter2-token");
+                bail!("server said: bad token hunter2-token");
+            }
+        }
+        struct Capture(RefCell<Vec<String>>);
+        impl Reporter for Capture {
+            fn log(&self, line: &str) {
+                self.0.borrow_mut().push(line.to_owned());
+            }
+            fn status(&self, state: &RunState) {
+                self.0.borrow_mut().push(serde_json::to_string(state).unwrap());
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let url = Url::parse("https://cfg.test/g.yaml").unwrap();
+        let secret = "hunter2-token".to_owned();
+        let opts = RunOptions {
+            source: &url,
+            sources: vec![],
+            state_path: &path,
+            fresh: false,
+            redact: Redactor::new([&secret]),
+        };
+        let seen = Capture(RefCell::new(vec![]));
+        let state = run(&plan(&file(&["x"])), &mut Leaky, &seen, opts).unwrap();
+        assert_eq!(state.status, RunStatus::Failed);
+        let everything = seen.0.borrow().join("\n") + &std::fs::read_to_string(&path).unwrap();
+        assert!(!everything.contains("hunter2"), "{everything}");
+        assert!(everything.contains("bad token ***"));
+    }
+
+    #[test]
     fn declarative_steps_are_independent_and_run_steps_follow_them() {
         let with_file = |content: &str| {
             let mut g = file(&["unzip"]);
             g.env.insert("A".into(), crate::model::EnvVar { value: "1".into(), scope: EnvScope::User });
             g.files.push(FileCopy {
-                from: Url::parse("https://dl.test/latest/app.zip").unwrap(),
+                from: Some(Url::parse("https://dl.test/latest/app.zip").unwrap()),
+                content: None,
                 to: r"C:\app.zip".into(),
                 sha256: None,
                 resolved: Some(sha256_hex(content.as_bytes())),
@@ -565,7 +681,13 @@ mod tests {
             }
         }
         let url = Url::parse("https://cfg.test/g.yaml").unwrap();
-        let opts = || RunOptions { source: &url, sources: vec![], state_path: &path, fresh: false };
+        let opts = || RunOptions {
+            source: &url,
+            sources: vec![],
+            state_path: &path,
+            fresh: false,
+            redact: Redactor::default(),
+        };
         let mut exec = Count(vec![]);
         run(&steps, &mut exec, &NullReporter, opts()).unwrap();
         run(&steps, &mut exec, &NullReporter, opts()).unwrap();
@@ -589,7 +711,8 @@ mod tests {
         assert!(steps[1].action.always_runs());
 
         let file_from_release = Action::File(FileCopy {
-            from: Url::parse("https://github.com/o/r/releases/download/1.0.268/release.zip").unwrap(),
+            from: Some(Url::parse("https://github.com/o/r/releases/download/1.0.268/release.zip").unwrap()),
+            content: None,
             to: r"C:\app".into(),
             sha256: Some("ab".repeat(32)),
             resolved: None,
@@ -666,7 +789,13 @@ mod tests {
         let path = dir.path().join("state.json");
         let url = Url::parse("https://cfg.test/g.yaml").unwrap();
         let steps = plan(&file(&["a"]));
-        let opts = || RunOptions { source: &url, sources: vec![], state_path: &path, fresh: false };
+        let opts = || RunOptions {
+            source: &url,
+            sources: vec![],
+            state_path: &path,
+            fresh: false,
+            redact: Redactor::default(),
+        };
 
         let mut exec = RetryOnce(true, vec![]);
         assert_eq!(run(&steps, &mut exec, &NullReporter, opts()).unwrap().status, RunStatus::RebootPending);
@@ -704,7 +833,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         let url = Url::parse("https://cfg.test/g.yaml").unwrap();
-        let opts = || RunOptions { source: &url, sources: vec![], state_path: &path, fresh: false };
+        let opts = || RunOptions {
+            source: &url,
+            sources: vec![],
+            state_path: &path,
+            fresh: false,
+            redact: Redactor::default(),
+        };
 
         let mut exec = Features(vec![]);
         let first = run(&steps, &mut exec, &NullReporter, opts()).unwrap();

@@ -212,7 +212,14 @@ impl App {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FileCopy {
-    pub from: Url,
+    /// Where the file comes from. `None` for inline `content`. Serialized exactly as before
+    /// inline content existed, so step ids of `from:` files don't change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<Url>,
+    /// The file's text, written as UTF-8. May contain `${secret:NAME}` references, filled in
+    /// only when the step runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     /// Destination; may contain `~` and `%VARS%`, expanded on the target machine.
     pub to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -617,7 +624,8 @@ pub(crate) mod raw {
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct FileCopy {
-        pub from: String,
+        pub from: Option<String>,
+        pub content: Option<String>,
         pub to: String,
         pub sha256: Option<String>,
         #[serde(default)]

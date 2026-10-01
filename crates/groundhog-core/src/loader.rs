@@ -16,6 +16,7 @@ use crate::model::{
     App, CURRENT_VERSION, Capability, Check, EnvScope, EnvVar, Feature, FileCopy, Groundhogfile, HiveScope, Password,
     PathEntry, RegistryData, RegistryType, RegistryValue, RunAction, ServiceState, Shell, SourceRef, User, raw,
 };
+use crate::secret;
 use crate::update::{self, Version};
 
 /// File names looked for when a source is a directory or a zip bundle, in order.
@@ -76,7 +77,9 @@ impl Loader<'_> {
             }
         }
         for f in &mut file.files {
-            from_github(&mut f.from, &mut f.sha256, &mut f.release)?;
+            if let Some(from) = &mut f.from {
+                from_github(from, &mut f.sha256, &mut f.release)?;
+            }
         }
 
         let mut seen: HashMap<Url, String> = HashMap::new();
@@ -106,7 +109,9 @@ impl Loader<'_> {
             }
         }
         for f in &mut file.files {
-            resolve(&f.from, &f.sha256, &mut f.resolved)?;
+            if let Some(from) = &f.from {
+                resolve(from, &f.sha256, &mut f.resolved)?;
+            }
         }
         for r in &mut file.run {
             match r {
@@ -352,23 +357,51 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     let files = files
         .into_iter()
         .map(|f| {
-            let mut from = resolve_ref(base, &f.from)?;
+            let from_text = match (f.from, &f.content) {
+                (Some(from), None) => from,
+                (None, Some(content)) => {
+                    let download_only = [
+                        ("sha256", f.sha256.is_some()),
+                        ("extract", f.extract),
+                        ("strip", f.strip.is_some()),
+                        ("prerelease", f.prerelease),
+                    ];
+                    if let Some((opt, _)) = download_only.iter().find(|(_, set)| *set) {
+                        bail!("file {}: '{opt}' only applies to files with 'from'", f.to);
+                    }
+                    secret::parse(content).with_context(|| format!("file {}", f.to))?;
+                    return Ok(FileCopy {
+                        from: None,
+                        content: f.content,
+                        to: f.to,
+                        sha256: None,
+                        resolved: None,
+                        extract: false,
+                        strip: 0,
+                        release: None,
+                    });
+                }
+                (Some(_), Some(_)) => bail!("file {}: give 'from' or 'content', not both", f.to),
+                (None, None) => bail!("file {}: needs 'from' (a path or URL) or 'content' (the text)", f.to),
+            };
+            let mut from = resolve_ref(base, &from_text)?;
             if f.prerelease {
                 if !github::is_github(&from) {
-                    bail!("'{}': 'prerelease' only applies to github: sources", f.from);
+                    bail!("'{from_text}': 'prerelease' only applies to github: sources");
                 }
                 github::allow_prerelease(&mut from);
             }
             let path = from.path().to_ascii_lowercase();
             let is_zip = path.ends_with(".zip") || (github::is_github(&from) && path.ends_with("/source"));
             if f.extract && !is_zip {
-                bail!("'{}': 'extract' needs a .zip file", f.from);
+                bail!("'{from_text}': 'extract' needs a .zip file");
             }
             if f.strip.is_some() && !f.extract {
-                bail!("'{}': 'strip' only applies with 'extract: true'", f.from);
+                bail!("'{from_text}': 'strip' only applies with 'extract: true'");
             }
             Ok(FileCopy {
-                from,
+                from: Some(from),
+                content: None,
                 to: f.to,
                 sha256: pin(f.sha256)?,
                 resolved: None,
@@ -439,7 +472,65 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         .map(|(i, c)| resolve_capability(base, c).with_context(|| format!("capabilities[{i}]")))
         .collect::<Result<_>>()?;
 
-    Ok(Groundhogfile { users, features, capabilities, apps, files, env, path, registry, run, verify, requires_agent })
+    let file =
+        Groundhogfile { users, features, capabilities, apps, files, env, path, registry, run, verify, requires_agent };
+    check_secret_references(&file)?;
+    Ok(file)
+}
+
+/// `${secret:NAME}` may appear in inline file `content`, `env` values, registry string values,
+/// and run commands and script `args`. Anywhere else it would reach the machine as literal
+/// text, so it's an error, as is a malformed reference.
+fn check_secret_references(g: &Groundhogfile) -> Result<()> {
+    let misplaced = |what: &str, s: &str| -> Result<()> {
+        if secret::mentions(s) {
+            bail!(
+                "{what}: ${{secret:...}} can't be used here, only in files 'content', env values, \
+                 registry string values, and run commands and args"
+            );
+        }
+        Ok(())
+    };
+    for app in &g.apps {
+        let (App::Winget { id, args, .. } | App::Url { id, args, .. }) = app;
+        misplaced(&format!("app {id}"), args.as_deref().unwrap_or_default())?;
+    }
+    for f in &g.files {
+        misplaced(&format!("file {}", f.to), &f.to)?;
+    }
+    for (name, v) in &g.env {
+        secret::parse(&v.value).with_context(|| format!("env {name}"))?;
+        if v.scope == EnvScope::Machine && secret::mentions(&v.value) {
+            bail!("env {name}: a secret can't go in a machine-scope variable, which every account can read");
+        }
+    }
+    for p in &g.path {
+        misplaced(&format!("path {}", p.dir), &p.dir)?;
+    }
+    for r in &g.registry {
+        let what = format!("registry {}\\{}", r.key, r.name.as_deref().unwrap_or("(default)"));
+        misplaced(&what, &r.key)?;
+        misplaced(&what, r.name.as_deref().unwrap_or_default())?;
+        match &r.data {
+            RegistryData::String(v) => drop(secret::parse(v).with_context(|| what.clone())?),
+            RegistryData::MultiString(vs) => {
+                for v in vs {
+                    secret::parse(v).with_context(|| what.clone())?;
+                }
+            }
+            RegistryData::Dword(_) | RegistryData::Qword(_) => {}
+        }
+    }
+    for (i, r) in g.run.iter().enumerate() {
+        match r {
+            RunAction::Command { command, .. } => drop(secret::parse(command).with_context(|| format!("run[{i}]"))?),
+            RunAction::Script { args, .. } => {
+                drop(secret::parse(args.as_deref().unwrap_or_default()).with_context(|| format!("run[{i}]"))?)
+            }
+            RunAction::Plugin { plugin, with, .. } => misplaced(&format!("plugin {plugin}"), &with.to_string())?,
+        }
+    }
+    Ok(())
 }
 
 /// A payload source for DISM: a folder or share the machine itself can reach. A relative path
@@ -540,8 +631,14 @@ fn resolve_user(u: raw::User) -> Result<User> {
     let password = match u.password {
         None => Password::Generate,
         Some(raw::StringOr::Short(s)) if s == "generate" => Password::Generate,
+        // `${secret:NAME}` on its own is the same as `{ secret: NAME }`.
+        Some(raw::StringOr::Short(s)) if matches!(secret::parse(&s).as_deref(), Ok([secret::Part::Secret(_)])) => {
+            let name = secret::names(&s)?.into_iter().next().expect("one reference");
+            Password::Secret(name)
+        }
         Some(raw::StringOr::Short(_)) => bail!(
-            "user '{}': a password can't be written in a Groundhogfile; use 'generate' or {{ secret: NAME }} and supply NAME at run time",
+            "user '{}': a password can't be written in a Groundhogfile; use 'generate', or ${{secret:NAME}} \
+             (or {{ secret: NAME }}) and supply NAME at run time",
             u.name
         ),
         Some(raw::StringOr::Full(r)) => {
@@ -563,13 +660,13 @@ fn resolve_user(u: raw::User) -> Result<User> {
 
 /// Every secret a Groundhogfile needs at run time.
 pub fn required_secrets(file: &Groundhogfile) -> std::collections::BTreeSet<String> {
-    file.users
-        .iter()
-        .filter_map(|u| match &u.password {
-            Password::Secret(name) => Some(name.clone()),
-            Password::Generate => None,
-        })
-        .collect()
+    let mut names: std::collections::BTreeSet<String> =
+        crate::engine::plan(file).iter().flat_map(|s| crate::engine::secrets_in(&s.action)).collect();
+    names.extend(file.users.iter().filter_map(|u| match &u.password {
+        Password::Secret(name) => Some(name.clone()),
+        Password::Generate => None,
+    }));
+    names
 }
 
 fn resolve_run(base: &Url, r: raw::RunFull) -> Result<RunAction> {
@@ -891,7 +988,7 @@ run:
         assert_eq!(g.apps[0], App::Winget { id: "git.git".into(), version: None, args: None, timeout_ms: None });
         let App::Url { url, .. } = &g.apps[1] else { panic!() };
         assert_eq!(url.as_str(), "https://cfg.test/dl/tool.msi");
-        assert_eq!(g.files[0].from.as_str(), "https://cfg.test/dev/config/.gitconfig");
+        assert_eq!(g.files[0].from.as_ref().unwrap().as_str(), "https://cfg.test/dev/config/.gitconfig");
         assert_eq!(g.registry[0].data, RegistryData::Dword(16));
         assert_eq!(g.registry[0].scope, vec![HiveScope::CurrentUser, HiveScope::DefaultUser]);
         assert_eq!(
@@ -927,7 +1024,7 @@ run:
         assert_eq!(g.env["B"].value, "top");
         assert_eq!(g.path.iter().map(|p| p.dir.as_str()).collect::<Vec<_>>(), ["C:\\tools\\"]);
         assert_eq!(g.run.len(), 2);
-        assert_eq!(g.files[0].from.as_str(), "https://cfg.test/gitconfig");
+        assert_eq!(g.files[0].from.as_ref().unwrap().as_str(), "https://cfg.test/gitconfig");
         assert_eq!(loaded.sources.len(), 3);
     }
 
@@ -1114,10 +1211,13 @@ files:
         let dir = tempfile::tempdir().unwrap();
         let g = load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap().file;
 
-        assert_eq!(g.files[0].from.as_str(), "https://github.com/o/r/releases/download/1.0.268/release.zip");
+        assert_eq!(
+            g.files[0].from.as_ref().unwrap().as_str(),
+            "https://github.com/o/r/releases/download/1.0.268/release.zip"
+        );
         assert_eq!(g.files[0].sha256.as_deref(), Some("cd".repeat(32).as_str()), "GitHub's digest pins it");
         assert_eq!(g.files[0].resolved, None, "so plan doesn't download it");
-        assert_eq!(g.files[1].from.as_str(), "https://github.com/o/r/archive/refs/tags/1.0.268.zip");
+        assert_eq!(g.files[1].from.as_ref().unwrap().as_str(), "https://github.com/o/r/archive/refs/tags/1.0.268.zip");
         assert!(g.files[1].resolved.is_some(), "source zips have no digest and are resolved by content");
         assert_eq!((g.files[0].release.as_deref(), g.files[1].release.as_deref()), (Some("1.0.268"), Some("1.0.268")));
         assert_eq!(g.files[1].strip, 1);
@@ -1212,6 +1312,61 @@ capabilities:
             let f = MapFetcher::default().with("https://cfg.test/b.yaml", yaml);
             let err = format!("{:#}", load_with(&f, "https://cfg.test/b.yaml", dir.path()).unwrap_err());
             assert!(err.contains(want), "{yaml}: expected '{want}' in: {err}");
+        }
+    }
+
+    #[test]
+    fn secrets_can_be_referenced_in_content_env_registry_and_run() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/g.yaml",
+                r#"
+users:
+  - { name: tester, password: "${secret:TESTER_PW}" }
+files:
+  - to: C:\ProgramData\Deskhand\deskhand.json
+    content: |
+      { "token": "${secret:DESKHAND_TOKEN}", "port": 8791 }
+env:
+  OPENAI_API_KEY: ${secret:API_KEY}
+registry:
+  - { key: HKCU\Software\X, name: T, value: "${secret:DESKHAND_TOKEN}" }
+run:
+  - command: Set-Thing -Key ${secret:API_KEY}
+  - { script: s.ps1, args: "-Key ${secret:SCRIPT_KEY}" }
+"#,
+            )
+            .with("https://cfg.test/s.ps1", "param($Key)");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap().file;
+        assert_eq!(g.users[0].password, Password::Secret("TESTER_PW".into()));
+        assert!(g.files[0].from.is_none());
+        assert!(g.files[0].content.as_deref().unwrap().contains("${secret:DESKHAND_TOKEN}"), "kept as written");
+        assert_eq!(
+            required_secrets(&g).into_iter().collect::<Vec<_>>(),
+            ["API_KEY", "DESKHAND_TOKEN", "SCRIPT_KEY", "TESTER_PW"]
+        );
+    }
+
+    #[test]
+    fn secrets_are_refused_where_they_would_leak_or_be_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        for (bad, why) in [
+            ("env: { K: { value: '${secret:A}', scope: machine } }", "every account can read"),
+            ("apps: [{ id: x, args: '--key ${secret:A}' }]", "can't be used here"),
+            ("files: [{ to: 'C:\\${secret:A}', content: x }]", "can't be used here"),
+            ("path: ['C:\\${secret:A}']", "can't be used here"),
+            ("run: [{ plugin: p.exe, with: { k: '${secret:A}' } }]", "can't be used here"),
+            ("env: { K: '${secret:A-B}' }", "letters, digits and '_'"),
+            ("files: [{ to: C:\\a, content: '${secret:A' }]", "unterminated"),
+            ("files: [{ to: C:\\a }]", "needs 'from'"),
+            ("files: [{ to: C:\\a, from: x, content: y }]", "not both"),
+            ("files: [{ to: C:\\a, content: y, extract: true }]", "only applies to files with 'from'"),
+            ("users: [{ name: a, password: hunter2 }]", "${secret:NAME}"),
+        ] {
+            let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad).with("https://cfg.test/p.exe", "x");
+            let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
+            assert!(err.contains(why), "{bad}: {err}");
         }
     }
 
@@ -1342,7 +1497,7 @@ apps: [c]",
         std::fs::write(src.join("groundhog.yaml"), "files: [{ from: config/a.txt, to: C:\\a.txt }]").unwrap();
 
         let loaded = load_with(&MapFetcher::default(), src.to_str().unwrap(), dir.path()).unwrap();
-        assert!(loaded.file.files[0].from.as_str().ends_with("/src/config/a.txt"));
+        assert!(loaded.file.files[0].from.as_ref().unwrap().as_str().ends_with("/src/config/a.txt"));
 
         let mut zip_bytes = Vec::new();
         {

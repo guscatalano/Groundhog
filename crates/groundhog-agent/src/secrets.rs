@@ -59,6 +59,39 @@ pub fn gather(home: &Path, supplied: &Secrets) -> Result<Secrets> {
     Ok(all)
 }
 
+const SALT: &str = "secret-salt.bin";
+
+/// A salted hash of each secret's value, for step ids: a step that uses a secret reruns when
+/// the value changes, and the id can't be used to test guesses at it. The salt is random,
+/// made once per machine and kept DPAPI-encrypted, because the state files holding the ids
+/// sit under ProgramData, which every user can read. If the salt can't be read (another
+/// account, a damaged file), a new one is made and steps that use secrets run once more.
+pub fn fingerprints(home: &Path, secrets: &Secrets) -> Result<BTreeMap<String, String>> {
+    if secrets.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let path = home.join(SALT);
+    let salt = match std::fs::read(&path).ok().and_then(|sealed| dpapi::unprotect(&sealed).ok()) {
+        Some(salt) => salt,
+        None => {
+            let salt = groundhog_win::accounts::random_bytes(32)?;
+            std::fs::create_dir_all(home)?;
+            std::fs::write(&path, dpapi::protect(&salt)?).context("saving the secret salt")?;
+            salt
+        }
+    };
+    Ok(secrets
+        .iter()
+        .map(|(name, value)| {
+            let mut input = salt.clone();
+            input.extend_from_slice(name.as_bytes());
+            input.push(0);
+            input.extend_from_slice(value.as_bytes());
+            (name.clone(), groundhog_core::fetch::sha256_hex(&input))
+        })
+        .collect())
+}
+
 /// Reads `{ "NAME": "value", ... }` from a file (for `apply --secrets-file`).
 pub fn read_file(path: &Path) -> Result<Secrets> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -88,6 +121,21 @@ mod tests {
         delete_store(dir.path()).unwrap();
         assert!(load_store(dir.path()).unwrap().is_empty());
         delete_store(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn fingerprints_follow_the_value_and_hide_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = Secrets::from([("TOKEN".to_owned(), "abc123".to_owned())]);
+        let two = Secrets::from([("TOKEN".to_owned(), "rotated".to_owned())]);
+        let a = fingerprints(dir.path(), &one).unwrap();
+        assert_eq!(a, fingerprints(dir.path(), &one).unwrap(), "stable for the same value");
+        assert_ne!(a["TOKEN"], fingerprints(dir.path(), &two).unwrap()["TOKEN"], "changes when rotated");
+        assert_ne!(a["TOKEN"], groundhog_core::fetch::sha256_hex(b"abc123"), "salted");
+        let other = tempfile::tempdir().unwrap();
+        assert_ne!(a, fingerprints(other.path(), &one).unwrap(), "each machine has its own salt");
+        let raw = std::fs::read(dir.path().join(SALT)).unwrap();
+        assert!(raw.len() > 32, "stored encrypted, not as the bare 32 bytes");
     }
 
     #[test]

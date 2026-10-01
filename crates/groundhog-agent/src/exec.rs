@@ -15,12 +15,15 @@ use groundhog_core::model::{
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
+use groundhog_core::secret::{self, Part};
 use groundhog_win::dism::{self, DismError};
 use groundhog_win::process::Proc;
 use groundhog_win::registry::{self, Data, DefaultUserHive};
 use groundhog_win::winget::{self, codes};
 use groundhog_win::{accounts, env};
 use url::Url;
+
+use crate::secrets::Secrets;
 
 /// Windows Installer and common convention: success, restart required.
 const EXIT_REBOOT_REQUIRED: i32 = 3010;
@@ -79,7 +82,7 @@ impl Executor for WinExecutor<'_> {
             }
             Action::File(f) => self.copy(f, log),
             Action::Env { name, value, scope } => {
-                let changed = env::set_var(env_scope(*scope), name, value)?;
+                let changed = env::set_var(env_scope(*scope), name, &fill(&self.secrets, value)?)?;
                 if changed {
                     env::broadcast_change();
                 }
@@ -92,7 +95,7 @@ impl Executor for WinExecutor<'_> {
                 }
                 Ok(Outcome::Done { changed })
             }
-            Action::Registry(r) => set_registry(r),
+            Action::Registry(r) => set_registry(&fill_registry(&self.secrets, r)?),
             Action::Run(r) => self.run_action(r, log),
             Action::User(u) => self.ensure_user(u, log),
             Action::Feature(f) => self.ensure_feature(f, log),
@@ -320,13 +323,22 @@ impl WinExecutor<'_> {
 
     fn copy(&mut self, f: &FileCopy, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
         let dest = PathBuf::from(env::expand_path(&f.to)?);
-        if f.from.scheme() == "file" {
-            let src = file_url_to_path(&f.from)?;
+        let Some(from) = &f.from else {
+            // Inline content: secrets are filled in here and only here, on the way to `to`.
+            let text = fill(&self.secrets, f.content.as_deref().unwrap_or_default())?;
+            let changed = write_if_different(&dest, text.as_bytes())?;
+            if changed {
+                log(&format!("wrote {}", dest.display()));
+            }
+            return Ok(Outcome::Done { changed });
+        };
+        if from.scheme() == "file" {
+            let src = file_url_to_path(from)?;
             if src.is_dir() {
                 return Ok(Outcome::Done { changed: copy_dir(&src, &dest)? });
             }
         }
-        let bytes = self.content.get(&f.from, f.sha256.as_deref().or(f.resolved.as_deref()))?.bytes;
+        let bytes = self.content.get(from, f.sha256.as_deref().or(f.resolved.as_deref()))?.bytes;
         if f.extract {
             replace_with_zip(&bytes, &dest, f.strip as usize)?;
             log(&format!("unpacked into {}", dest.display()));
@@ -343,11 +355,13 @@ impl WinExecutor<'_> {
         let timeout_ms = action.timeout_ms();
         match action {
             RunAction::Command { command, shell, .. } => {
+                let (command, secret_env) = secrets_as_env(&self.secrets, command, *shell)?;
                 let proc = match shell {
-                    Shell::Powershell | Shell::Pwsh => powershell(*shell, command),
-                    Shell::Cmd => cmd(command)?,
+                    Shell::Powershell | Shell::Pwsh => powershell(*shell, &command),
+                    Shell::Cmd => cmd(&command)?,
                     Shell::Direct => bail!("'shell: direct' only applies to scripts"),
                 };
+                let proc = Proc { env: secret_env, ..proc };
                 exit_to_outcome(proc.timeout_ms(timeout_ms).run(log)?.code, "command")
             }
             RunAction::Script { script, sha256, resolved, args, shell, .. } => {
@@ -357,6 +371,9 @@ impl WinExecutor<'_> {
                     None => shell_for(&path)?,
                 };
                 let p = path.to_string_lossy().into_owned();
+                // Arguments are a command line by nature, so secrets in them are filled in as
+                // text (and are visible to process listings: prefer reading them from env).
+                let args = args.as_deref().map(|a| fill(&self.secrets, a)).transpose()?;
                 let mut proc = match shell {
                     Shell::Powershell | Shell::Pwsh => Proc::new(ps_exe(shell))
                         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", p.as_str()])
@@ -406,6 +423,57 @@ fn env_scope(scope: EnvScope) -> env::Scope {
         EnvScope::User => env::Scope::User,
         EnvScope::Machine => env::Scope::Machine,
     }
+}
+
+/// Puts secret values in place of `${secret:NAME}` (and undoes `$${secret:` escapes).
+fn fill(secrets: &Secrets, s: &str) -> Result<String> {
+    if !secret::mentions(s) {
+        return Ok(s.to_owned());
+    }
+    secret::substitute(s, |name| secret_value(secrets, name))
+}
+
+fn secret_value(secrets: &Secrets, name: &str) -> Result<String> {
+    secrets.get(name).cloned().ok_or_else(|| anyhow::anyhow!(crate::secrets::missing_hint(name)))
+}
+
+fn fill_registry(secrets: &Secrets, r: &RegistryValue) -> Result<RegistryValue> {
+    let data = match &r.data {
+        RegistryData::String(v) => RegistryData::String(fill(secrets, v)?),
+        RegistryData::MultiString(vs) => {
+            RegistryData::MultiString(vs.iter().map(|v| fill(secrets, v)).collect::<Result<_>>()?)
+        }
+        other => other.clone(),
+    };
+    Ok(RegistryValue { data, ..r.clone() })
+}
+
+/// For a command, a secret becomes a reference to an environment variable the child gets,
+/// `GROUNDHOG_SECRET_<NAME>`, not text spliced into the script. That keeps the value off the
+/// command line (`-EncodedCommand` is visible to process listings and command-line auditing)
+/// and out of any batch file on disk, and a value containing quotes can't break or inject
+/// into the script. So write it where a variable expands: bare or in double quotes in
+/// PowerShell, not in single quotes.
+fn secrets_as_env(secrets: &Secrets, command: &str, shell: Shell) -> Result<(String, Vec<(String, String)>)> {
+    if !secret::mentions(command) {
+        return Ok((command.to_owned(), Vec::new()));
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut vars = Vec::new();
+    for part in secret::parse(command)? {
+        match part {
+            Part::Text(t) => out.push_str(t),
+            Part::Secret(name) => {
+                let var = format!("GROUNDHOG_SECRET_{name}");
+                out.push_str(&match shell {
+                    Shell::Cmd => format!("%{var}%"),
+                    _ => format!("${{env:{var}}}"),
+                });
+                vars.push((var, secret_value(secrets, name)?));
+            }
+        }
+    }
+    Ok((out, vars))
 }
 
 /// Already in the wanted state; if that state still waits on a restart, one is owed.
@@ -637,6 +705,61 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn secrets(pairs: &[(&str, &str)]) -> Secrets {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
+    #[test]
+    fn values_fill_in_text_but_commands_get_an_environment_variable() {
+        let s = secrets(&[("TOKEN", "t0k-en")]);
+        assert_eq!(fill(&s, r#"{"token": "${secret:TOKEN}"}"#).unwrap(), r#"{"token": "t0k-en"}"#);
+        assert_eq!(fill(&s, "literal $${secret:TOKEN}").unwrap(), "literal ${secret:TOKEN}");
+        assert!(fill(&s, "${secret:OTHER}").unwrap_err().to_string().contains("OTHER was not provided"));
+
+        let (ps, env) = secrets_as_env(&s, "Set-Thing -Token ${secret:TOKEN}", Shell::Powershell).unwrap();
+        assert_eq!(ps, "Set-Thing -Token ${env:GROUNDHOG_SECRET_TOKEN}");
+        assert_eq!(env, [("GROUNDHOG_SECRET_TOKEN".to_owned(), "t0k-en".to_owned())]);
+        assert!(!ps.contains("t0k-en"), "the value never enters the script text");
+        let (cmd, _) = secrets_as_env(&s, "tool.exe --token \"${secret:TOKEN}\"", Shell::Cmd).unwrap();
+        assert_eq!(cmd, "tool.exe --token \"%GROUNDHOG_SECRET_TOKEN%\"");
+    }
+
+    #[test]
+    fn a_secret_with_quotes_reaches_powershell_intact_and_cant_inject() {
+        // A value that would break or inject into a script if spliced in as text.
+        let nasty = r#"p'a"ss; exit 7 $(exit 9)"#;
+        let s = secrets(&[("PW", nasty)]);
+        let script =
+            format!("if (\"${{secret:PW}}\" -ceq '{}') {{ exit 0 }} else {{ exit 5 }}", nasty.replace('\'', "''"));
+        let (command, env) = secrets_as_env(&s, &script, Shell::Powershell).unwrap();
+        let proc = Proc { env, ..powershell(Shell::Powershell, &command) };
+        assert_eq!(proc.run(&mut |_| {}).unwrap().code, 0);
+        assert!(!proc.args.iter().any(|a| a.contains("ss; exit 7")), "not on the command line");
+        let encoded = proc.args.last().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+        let text =
+            String::from_utf16_lossy(&decoded.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>());
+        assert!(text.contains("${env:GROUNDHOG_SECRET_PW}"));
+    }
+
+    #[test]
+    fn registry_strings_fill_and_numbers_pass_through() {
+        let s = secrets(&[("K", "value-1")]);
+        let r = RegistryValue {
+            key: r"HKCU\Software\X".into(),
+            name: Some("Token".into()),
+            kind: RegistryType::String,
+            data: RegistryData::MultiString(vec!["a=${secret:K}".into(), "b".into()]),
+            scope: vec![HiveScope::CurrentUser],
+        };
+        assert_eq!(
+            fill_registry(&s, &r).unwrap().data,
+            RegistryData::MultiString(vec!["a=value-1".into(), "b".into()])
+        );
+        let n = RegistryValue { data: RegistryData::Dword(3), ..r };
+        assert_eq!(fill_registry(&s, &n).unwrap().data, RegistryData::Dword(3));
+    }
 
     #[test]
     fn replacing_a_folder_drops_stale_files_and_survives_a_running_program() {

@@ -140,10 +140,56 @@ Built-in groups can be given by their English names (`Administrators`, `Users`,
 resolved by their fixed SIDs, so `Administrators` still works where the group is called
 `Administratoren`. Other names are used as given. Creating accounts needs the agent elevated.
 
-### Secrets
+## Secrets
 
-**A password never goes in a Groundhogfile.** Files are shared, cached and logged. A password
-is either `generate`d or named, `{ secret: NAME }`, and supplied when the file is applied:
+**A secret never goes in a Groundhogfile.** Files are shared, cached and logged. Name it
+instead, as `${secret:NAME}`, and supply the value when the file is applied. A password is
+`generate`d or named the same way (`password: ${secret:NAME}`, or `{ secret: NAME }`).
+References work in these places:
+
+```yaml
+files:
+  - to: C:\ProgramData\Deskhand\deskhand.json
+    content: |                              # inline file content
+      { "token": "${secret:DESKHAND_TOKEN}", "port": 8791 }
+env:
+  OPENAI_API_KEY: ${secret:OPENAI_KEY}      # user-scope env values
+registry:
+  - key: HKCU\Software\Tool
+    name: ApiKey
+    value: ${secret:TOOL_KEY}               # string, expand-string and multi-string values
+run:
+  - command: Connect-Thing -Token "${secret:API_TOKEN}"
+  - script: setup.ps1
+    args: -Key ${secret:SETUP_KEY}
+```
+
+- **Only there.** A reference anywhere else (`to`, app `args`, plugin `with`, paths) is a load
+  error, so it can't reach the machine as literal text. So is a machine-scope env value, which
+  every account can read.
+- **In `run` commands the value isn't spliced into the script.** The reference becomes an
+  environment variable the command gets, `${env:GROUNDHOG_SECRET_NAME}` in PowerShell or
+  `%GROUNDHOG_SECRET_NAME%` in cmd. That keeps it off the command line, where process
+  listings and command-line auditing see it, and a value with quotes in it can't break or
+  inject into the script. Write the reference where a variable expands: bare or inside double
+  quotes, **not inside single quotes**. Script `args` are a command line by nature, so there the
+  value is filled in as text; a script can read `$env:GROUNDHOG_SECRET_NAME` instead.
+- **Never shown.** `plan`, step titles, `status.json` and the agent's state only ever contain
+  `${secret:NAME}`. Values are scrubbed (as `***`) from every log line and error message,
+  including a program's own output. Values shorter than 4 characters can't be scrubbed
+  reliably, so a reference to one is refused.
+- **Rotation works.** A step that uses a secret runs again when the value changes, and only
+  then. Its identity includes a salted hash of the value; the salt is random per machine and
+  kept encrypted, so the stored ids can't be used to test guesses.
+- **Missing values stop the run before it starts**, naming every missing secret. (An account's
+  password is only needed when the account is created or reset.)
+- `$${secret:` writes a literal `${secret:`.
+- **Declare `agent: ">=0.12.0"`** in a file that uses references. Older agents don't know them
+  and would write the text `${secret:NAME}` itself into env, registry or commands; with the
+  requirement they stop and say they need updating (and update themselves from
+  `pending.json`).
+
+Values are supplied when the file is applied:
 
 | Where | How |
 | --- | --- |
@@ -155,6 +201,17 @@ The agent takes secrets out of `pending.json` as soon as it reads it. They're ne
 recorded in state. If a run pauses for a restart, they're kept until it finishes, encrypted
 with DPAPI so only the same account on the same machine can read them, and then deleted.
 `plan` lists the secrets a file needs and whether each one is provided.
+
+### Authenticated downloads and report sinks
+
+`--header` (and `headers` in `pending.json`) attaches a header to every request to one host:
+downloads from it, and status POSTs to an `http(s)` `--report` sink on it. A header's value
+can be a secret, so a token travels with the secrets rather than in plain text:
+
+```powershell
+groundhog pending https://cfg.example/dev.yaml --report https://status.example/vm42 `
+  --header "status.example=Authorization: Bearer `${secret:STATUS_TOKEN}" --secret STATUS_TOKEN
+```
 
 ## `features` and `capabilities`
 
@@ -263,9 +320,13 @@ files:
   - from: https://example.com/profile.ps1
     to: ~/Documents/PowerShell/Microsoft.PowerShell_profile.ps1
     sha256: <64 hex>
+  - to: C:\ProgramData\Tool\config.json
+    content: |                       # or the text itself, written as UTF-8
+      { "endpoint": "https://api.example", "key": "${secret:TOOL_KEY}" }
 ```
 
-A file whose contents already match is left alone.
+A file whose contents already match is left alone. `content` can hold
+[secret references](#secrets); `from` files are copied as they are.
 
 ### Unpacking archives
 

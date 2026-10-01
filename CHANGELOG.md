@@ -4,6 +4,46 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.12.0] - 2026-10-01
+
+### Added
+- **Secrets anywhere a config needs one.** `${secret:NAME}` works in inline file `content`,
+  `env` values, registry string values, and `run` commands and script `args`, so an API key
+  or a per-VM token can be part of a declarative setup:
+  ```yaml
+  agent: ">=0.12.0"
+  files:
+    - to: C:\ProgramData\Deskhand\deskhand.json
+      content: |
+        { "token": "${secret:DESKHAND_TOKEN}", "port": 8791 }
+  ```
+  Values come from the same places as before (`pending.json`, `GROUNDHOG_SECRET_<NAME>`,
+  `--secrets-file`), and the same rules hold: never logged, never stored, encrypted only
+  while a run waits for a restart.
+  - Plans, titles, `status.json` and state only ever show `${secret:NAME}`, and values are
+    scrubbed (`***`) from every log line and error, a program's own output included.
+  - A step that uses a secret reruns when the value changes, so a rotated token lands. The
+    step's identity holds a salted hash of the value; the salt is per machine and kept
+    encrypted.
+  - In `run` commands the value reaches the command as an environment variable
+    (`${env:GROUNDHOG_SECRET_NAME}`), not as script text, keeping it off the command line and
+    safe from quotes in the value. Write the reference where variables expand, not inside
+    single quotes.
+  - A missing secret stops the run before anything changes, naming all of them. References
+    anywhere else, malformed ones, secrets in machine-wide env, and values shorter than 4
+    characters (too short to scrub) are refused.
+  - `password: ${secret:NAME}` is the same as `{ secret: NAME }`.
+- **Inline file content:** `files:` entries take `content:` (the text) instead of `from:`.
+- **Authenticated report sinks.** `--header` rules now also apply to status POSTs to a report
+  sink on that host, a header's value can be `${secret:NAME}`, and `groundhog pending` takes
+  `--header`.
+
+### Upgrading
+- Add `agent: ">=0.12.0"` to a Groundhogfile that uses `${secret:...}`. An older agent doesn't
+  know references and would write the text `${secret:NAME}` into env, registry or commands;
+  with the requirement it says it needs updating instead (and updates itself from
+  `pending.json`).
+
 ## [0.11.0] - 2026-09-30
 
 ### Added
@@ -228,6 +268,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.12.0]: https://github.com/guscatalano/Groundhog/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/guscatalano/Groundhog/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/guscatalano/Groundhog/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/guscatalano/Groundhog/compare/v0.9.0...v0.10.0
