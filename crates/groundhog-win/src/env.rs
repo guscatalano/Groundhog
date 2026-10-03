@@ -163,6 +163,30 @@ pub fn remove_path(scope: Scope, dir: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Rebuilds this process's PATH the way Windows does at logon (machine entries, then the
+/// user's), keeping any entry this process has that neither has. Installers change PATH in
+/// the registry, never in processes already running, so without this a tool installed by an
+/// earlier step (winget's SDKs, say) isn't found by a later `run` step of the same apply.
+pub fn refresh_process_path() {
+    let read = |scope: Scope| {
+        let (root, key) = scope.key();
+        registry::get_string(&root, key, "Path").unwrap_or_default()
+    };
+    let mut entries: Vec<String> = Vec::new();
+    for e in read(Scope::Machine).split(';').chain(read(Scope::User).split(';')) {
+        let e = expand(e).unwrap_or_else(|_| e.to_owned());
+        if !e.trim().is_empty() && !entries.iter().any(|x| same_dir(x, &e)) {
+            entries.push(e);
+        }
+    }
+    for e in std::env::var("PATH").unwrap_or_default().split(';') {
+        if !e.trim().is_empty() && !entries.iter().any(|x| same_dir(x, e)) {
+            entries.push(e.to_owned());
+        }
+    }
+    set_process_var("PATH", &entries.join(";"));
+}
+
 fn set_process_var(name: &str, value: &str) {
     // SAFETY: the agent changes its environment only from the main thread, between steps,
     // while no other thread reads it.
@@ -198,5 +222,17 @@ mod tests {
         assert_eq!(expand_path(r"~\.gitconfig").unwrap(), format!(r"{profile}\.gitconfig"));
         assert_eq!(expand_path("~other").unwrap(), "~other");
         assert_eq!(expand("%USERPROFILE%").unwrap(), profile);
+    }
+
+    #[test]
+    fn refreshing_path_keeps_this_processes_own_entries() {
+        let before = std::env::var("PATH").unwrap_or_default();
+        let marker = r"C:\groundhog-test-only-in-process";
+        set_process_var("PATH", &format!("{before};{marker}"));
+        refresh_process_path();
+        let after = std::env::var("PATH").unwrap();
+        assert!(after.split(';').any(|e| same_dir(e, marker)), "kept the process-only entry");
+        assert!(after.to_ascii_lowercase().contains("system32"), "machine entries are there");
+        set_process_var("PATH", &before);
     }
 }

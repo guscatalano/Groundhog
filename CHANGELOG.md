@@ -4,6 +4,15 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.14.1] - 2026-10-03
+
+### Fixed
+- **A tool installed by `apps:` wasn't on PATH for later steps of the same apply.** Installers
+  change PATH in the registry, not in the running agent, so a `run` step after
+  `Microsoft.DotNet.SDK.8` couldn't find `dotnet`. The agent now re-reads PATH from the
+  registry before every step (keeping anything it added itself). Tested: `git` runs by name
+  right after `Git.Git` installs. Reported on the FindNeedle runbook.
+
 ## [0.14.0] - 2026-10-03
 
 ### Added
@@ -339,6 +348,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.14.1]: https://github.com/guscatalano/Groundhog/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/guscatalano/Groundhog/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/guscatalano/Groundhog/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/guscatalano/Groundhog/compare/v0.12.0...v0.13.0

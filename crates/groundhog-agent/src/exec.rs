@@ -72,6 +72,8 @@ impl<'a> WinExecutor<'a> {
 impl Executor for WinExecutor<'_> {
     fn execute(&mut self, step: &Step, reporter: &dyn Reporter) -> Result<Outcome> {
         let log = &mut |line: &str| reporter.log(&format!("    {line}"));
+        // Pick up PATH changes earlier steps' installers made (they change the registry only).
+        env::refresh_process_path();
         match &step.action {
             Action::EnsureWinget => self.ensure_winget(log),
             Action::App(App::Winget { id, version, args, timeout_ms, upgrade, state }) => {
