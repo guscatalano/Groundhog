@@ -1,5 +1,6 @@
 //! Fetching bytes from `file://`, `https://` (and, when allowed, `http://`) URLs.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,6 +13,43 @@ use url::Url;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Hashes a file without reading it all into memory.
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hashing = HashingWriter::new(std::io::sink());
+    std::io::copy(&mut file, &mut hashing).with_context(|| format!("reading {}", path.display()))?;
+    Ok(hashing.finish())
+}
+
+/// Passes bytes through to `inner` while hashing them, so a download is hashed as it streams
+/// to disk instead of being held in memory.
+pub struct HashingWriter<W> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> HashingWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self { inner, hasher: Sha256::new() }
+    }
+
+    /// The SHA-256 of everything written, as lowercase hex.
+    pub fn finish(self) -> String {
+        hex::encode(self.hasher.finalize())
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Normalizes a user-supplied hash (`sha256:` prefix and case are tolerated).
@@ -62,6 +100,12 @@ impl HeaderRule {
 
 pub trait Fetcher: Send + Sync {
     fn fetch(&self, url: &Url) -> Result<Vec<u8>>;
+
+    /// Streams the content into `out`. This default reads it whole first; [`DefaultFetcher`]
+    /// streams, so a multi-gigabyte download never sits in memory.
+    fn fetch_to(&self, url: &Url, out: &mut dyn Write) -> Result<()> {
+        out.write_all(&self.fetch(url)?).context("writing download")
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -79,8 +123,25 @@ impl Fetcher for DefaultFetcher {
                 let path = file_url_to_path(url)?;
                 std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
             }
-            "https" => self.http_get(url),
-            "http" if self.allow_http => self.http_get(url),
+            "https" | "http" => {
+                let mut out = Vec::new();
+                self.fetch_to(url, &mut out)?;
+                Ok(out)
+            }
+            other => bail!("unsupported URL scheme '{other}' in {url}"),
+        }
+    }
+
+    fn fetch_to(&self, url: &Url, out: &mut dyn Write) -> Result<()> {
+        match url.scheme() {
+            "file" => {
+                let path = file_url_to_path(url)?;
+                let mut file = std::fs::File::open(&path).with_context(|| format!("reading {}", path.display()))?;
+                std::io::copy(&mut file, out).with_context(|| format!("copying {}", path.display()))?;
+                Ok(())
+            }
+            "https" => self.http_get(url, out),
+            "http" if self.allow_http => self.http_get(url, out),
             "http" => bail!("refusing plain http for {url} (use https, or allow insecure http)"),
             other => bail!("unsupported URL scheme '{other}' in {url}"),
         }
@@ -88,7 +149,7 @@ impl Fetcher for DefaultFetcher {
 }
 
 impl DefaultFetcher {
-    fn http_get(&self, url: &Url) -> Result<Vec<u8>> {
+    fn http_get(&self, url: &Url, out: &mut dyn Write) -> Result<()> {
         let host = url.host_str().unwrap_or_default();
         let mut req = http_agent().get(url.as_str());
         for rule in self.headers.iter().filter(|r| r.host.eq_ignore_ascii_case(host)) {
@@ -98,11 +159,9 @@ impl DefaultFetcher {
         if let Some(date) = resp.headers().get("date").and_then(|v| v.to_str().ok()) {
             note_server_date(host, date);
         }
-        resp.body_mut()
-            .with_config()
-            .limit(4 * 1024 * 1024 * 1024)
-            .read_to_vec()
-            .with_context(|| format!("reading body of {url}"))
+        let mut body = resp.body_mut().with_config().limit(u64::MAX).reader();
+        std::io::copy(&mut body, out).with_context(|| format!("downloading {url}"))?;
+        Ok(())
     }
 }
 

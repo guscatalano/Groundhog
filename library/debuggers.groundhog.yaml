@@ -1,8 +1,8 @@
 # Debugging Tools for Windows: cdb, kd, ntsd, gflags, umdh, symchk, dbgsrv and friends, the
 # console debuggers scripts and agents drive. Only that feature of the Windows SDK is
-# installed, and its folder goes on the machine PATH.
+# installed, and the folder for this machine's architecture goes on the machine PATH.
 
-agent: ">=0.11.0"   # machine-scope env and PATH
+agent: ">=0.14.0"   # ${var:arch}
 
 apps:
   - id: Microsoft.WindowsSDK.10.0.28000
@@ -10,9 +10,9 @@ apps:
     timeout: 30m
 
 path:
-  - dir: C:\Program Files (x86)\Windows Kits\10\Debuggers\x64
+  - dir: C:\Program Files (x86)\Windows Kits\10\Debuggers\${var:arch}
     scope: machine
 
 verify:
-  - file: C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe
-  - file: C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\gflags.exe
+  - file: C:\Program Files (x86)\Windows Kits\10\Debuggers\${var:arch}\cdb.exe
+  - file: C:\Program Files (x86)\Windows Kits\10\Debuggers\${var:arch}\gflags.exe

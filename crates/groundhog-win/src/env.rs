@@ -100,6 +100,69 @@ pub fn add_path(scope: Scope, dir: &str) -> Result<bool> {
     Ok(changed)
 }
 
+/// Whether the variable is already set to exactly this value.
+pub fn var_matches(scope: Scope, name: &str, value: &str) -> bool {
+    let (root, key) = scope.key();
+    let data = if value.contains('%') { Data::ExpandString(value) } else { Data::String(value) };
+    registry::value_matches(&root, key, Some(name), &data)
+}
+
+pub fn var_exists(scope: Scope, name: &str) -> bool {
+    let (root, key) = scope.key();
+    registry::value_exists(&root, key, Some(name))
+}
+
+/// Removes a persistent variable (and from this process). Returns whether it was set.
+pub fn remove_var(scope: Scope, name: &str) -> Result<bool> {
+    if name.eq_ignore_ascii_case("path") {
+        bail!("refusing to remove PATH as a whole; remove entries with `path:` and state: absent");
+    }
+    let (root, key) = scope.key();
+    let removed = registry::delete_value(&root, key, Some(name))?;
+    // SAFETY: as in set_process_var.
+    unsafe { std::env::remove_var(name) };
+    Ok(removed)
+}
+
+fn path_entries(scope: Scope) -> Result<Option<String>> {
+    let (root, key) = scope.key();
+    Ok(match (registry::get_string(&root, key, "Path"), scope) {
+        (Some(p), _) => Some(p),
+        (None, Scope::User) => None,
+        (None, Scope::Machine) => bail!("can't read the machine PATH ({MACHINE_ENV_KEY}); not changing it"),
+    })
+}
+
+fn same_dir(a: &str, b: &str) -> bool {
+    let norm = |p: &str| p.trim().trim_end_matches('\\').to_ascii_lowercase();
+    norm(a) == norm(b)
+}
+
+/// Whether the PATH (user or machine) has this folder.
+pub fn path_contains(scope: Scope, dir: &str) -> Result<bool> {
+    Ok(path_entries(scope)?.is_some_and(|p| p.split(';').any(|e| same_dir(e, dir))))
+}
+
+/// Takes a folder out of the user or machine PATH, keeping every other entry as it was.
+/// Returns whether it was there.
+pub fn remove_path(scope: Scope, dir: &str) -> Result<bool> {
+    let Some(current) = path_entries(scope)? else { return Ok(false) };
+    if !current.split(';').any(|e| same_dir(e, dir)) {
+        return Ok(false);
+    }
+    let kept: Vec<&str> = current.split(';').filter(|e| !same_dir(e, dir)).collect();
+    let (root, key) = scope.key();
+    registry::set_value(&root, key, Some("Path"), &Data::ExpandString(&kept.join(";")))?;
+    let process: Vec<String> = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(';')
+        .filter(|e| !same_dir(e, dir) && !expand(dir).is_ok_and(|x| same_dir(e, &x)))
+        .map(str::to_owned)
+        .collect();
+    set_process_var("PATH", &process.join(";"));
+    Ok(true)
+}
+
 fn set_process_var(name: &str, value: &str) {
     // SAFETY: the agent changes its environment only from the main thread, between steps,
     // while no other thread reads it.

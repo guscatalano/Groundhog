@@ -4,6 +4,7 @@
 //! path, URL or zip bundle. Hosts (Sandbox, Hyper-V, Proxmox, ...) only start it and watch.
 
 mod checks;
+mod ensure;
 mod exec;
 mod secrets;
 mod update;
@@ -45,7 +46,7 @@ enum Command {
     /// Apply a Groundhogfile (path, URL or zip bundle), resuming any earlier progress.
     Apply(ApplyArgs),
     /// Show the steps a Groundhogfile would run, without changing anything.
-    Plan(SourceArgs),
+    Plan(PlanArgs),
     /// Apply the bootstrap file (`<home>\pending.json`) if there is one. Meant for a logon task.
     RunPending,
     /// Install this agent into <home>\bin and register a logon task that runs `run-pending`.
@@ -86,6 +87,25 @@ struct SourceArgs {
     /// Allow plain http:// for documents and downloads.
     #[arg(long)]
     allow_http: bool,
+    /// A value for `${var:NAME}` in the Groundhogfile, as `NAME=value`. Repeatable; wins over
+    /// the file's own `vars`.
+    #[arg(long = "var", value_name = "NAME=VALUE")]
+    vars: Vec<String>,
+}
+
+#[derive(Args)]
+struct PlanArgs {
+    #[command(flatten)]
+    source: SourceArgs,
+    /// Also look at this machine and say, step by step, what applying would change: `ok`
+    /// (already so), `change`, `run` (commands and checks always run), `done` (applied by an
+    /// earlier run) or `?` (can't tell without doing it). Changes nothing.
+    #[arg(long)]
+    check: bool,
+    /// Secrets for the check, as `apply --secrets-file` takes them; without them, steps that
+    /// use a secret show as `?`.
+    #[arg(long, value_name = "FILE")]
+    secrets_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -152,8 +172,11 @@ fn run(home: &Path, command: Command) -> Result<i32> {
             Ok(exit_code(state.status))
         }
         Command::Plan(args) => {
-            let pending = to_pending(&args, Vec::new(), false)?;
-            print_plan(home, &pending)?;
+            let mut pending = to_pending(&args.source, Vec::new(), false)?;
+            if let Some(file) = &args.secrets_file {
+                pending.secrets = secrets::read_file(file)?;
+            }
+            print_plan(home, &pending, args.check)?;
             Ok(0)
         }
         Command::RunPending => run_pending(home),
@@ -205,7 +228,25 @@ fn to_pending(args: &SourceArgs, report: Vec<String>, allow_reboot: bool) -> Res
         agent_update: None,
         agent_update_from: None,
         secrets: Default::default(),
+        vars: args
+            .vars
+            .iter()
+            .map(|s| {
+                let (name, value) = s.split_once('=').with_context(|| format!("--var {s}: write it as NAME=value"))?;
+                Ok((name.trim().to_owned(), value.to_owned()))
+            })
+            .collect::<Result<_>>()?,
     })
+}
+
+/// What `when:` conditions and built-in variables see: this machine.
+fn machine_facts() -> groundhog_core::vars::Facts {
+    let (build, server) = groundhog_win::system::windows_version();
+    groundhog_core::vars::Facts {
+        build,
+        os: if server { "server" } else { "client" }.to_owned(),
+        ..groundhog_core::vars::Facts::of_this_process()
+    }
 }
 
 fn parse_header(s: &str, default_host: Option<&str>) -> Result<HeaderRule> {
@@ -259,7 +300,7 @@ impl Session {
     fn load(&self, home: &Path, p: &Pending) -> Result<(url::Url, Loaded)> {
         let root = source_ref(&p.source, p.sha256.clone(), &std::env::current_dir()?)?;
         let content = ContentStore { fetcher: &self.fetcher, cache: &self.cache };
-        let loader = Loader { content: &content, bundle_dir: home.join("bundles") };
+        let loader = Loader::new(&content, home.join("bundles")).with_facts(machine_facts()).with_vars(p.vars.clone());
         let loaded = loader.load(&root)?;
         Ok((root.url, loaded))
     }
@@ -481,7 +522,7 @@ fn exit_code(status: RunStatus) -> i32 {
     }
 }
 
-fn print_plan(home: &Path, p: &Pending) -> Result<()> {
+fn print_plan(home: &Path, p: &Pending, check: bool) -> Result<()> {
     let session = Session::new(home, &Pending { report: Vec::new(), ..p.clone() })?;
     println!("groundhog-agent {}", Version::current());
     let (_, loaded) = session.load(home, p)?;
@@ -503,10 +544,39 @@ fn print_plan(home: &Path, p: &Pending) -> Result<()> {
     {
         bail!("this Groundhogfile needs groundhog-agent {required} or newer, and this is {}", Version::current());
     }
-    let steps = plan(&loaded.file);
-    for (i, step) in steps.iter().enumerate() {
-        println!("{:>3}. [{}] {}", i + 1, step.id, step.title);
+    if !check {
+        for (i, step) in plan(&loaded.file).iter().enumerate() {
+            println!("{:>3}. [{}] {}", i + 1, step.id, step.title);
+        }
+        return Ok(());
     }
+
+    // The same step ids apply would use, so "applied by an earlier run" is exact.
+    let secrets = secrets::gather(home, &p.secrets)?;
+    let prints = secrets::fingerprints(home, &secrets)?;
+    let steps = engine::plan_with_secrets(&loaded.file, &|name| prints.get(name).cloned());
+    let url = source_ref(&p.source, p.sha256.clone(), &std::env::current_dir()?)?.url;
+    let content = ContentStore { fetcher: &session.fetcher, cache: &session.cache };
+    let mut exec = WinExecutor::new(&content, home.join("work"), secrets);
+    let previews = engine::preview(&steps, &mut exec, &state_file(home, &url));
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for (i, (step, preview)) in steps.iter().zip(&previews).enumerate() {
+        let (mark, note) = match preview {
+            engine::Preview::Applied => ("done", String::new()),
+            engine::Preview::Probe(engine::Probe::Satisfied) => ("ok", String::new()),
+            engine::Preview::Probe(engine::Probe::WouldChange) => ("change", String::new()),
+            engine::Preview::Probe(engine::Probe::WillRun) => ("run", String::new()),
+            engine::Preview::Probe(engine::Probe::Unknown) => ("?", String::new()),
+            engine::Preview::Error(e) => ("error", format!("  ({e})")),
+        };
+        *counts.entry(mark).or_default() += 1;
+        println!("{:>3}. [{}] {mark:<6} {}{note}", i + 1, step.id, step.title);
+    }
+    let summary: Vec<String> = ["change", "run", "?", "error", "ok", "done"]
+        .iter()
+        .filter_map(|m| counts.get(m).map(|n| format!("{n} {m}")))
+        .collect();
+    println!("{}", summary.join(", "));
     Ok(())
 }
 

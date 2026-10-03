@@ -18,3 +18,4 @@ pub mod plugin;
 pub mod report;
 pub mod secret;
 pub mod update;
+pub mod vars;

@@ -4,12 +4,13 @@
 //! against its hash. A cache can therefore be a mapped folder, an SMB share or a dumb static
 //! HTTP server, and never has to be trusted.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use url::Url;
 
-use crate::fetch::{self, DefaultFetcher, Fetcher, sha256_hex};
+use crate::fetch::{self, DefaultFetcher, Fetcher, HashingWriter, sha256_hex};
 
 pub trait CacheSource: Send + Sync {
     fn describe(&self) -> String;
@@ -17,6 +18,22 @@ pub trait CacheSource: Send + Sync {
     /// Stores content if the source is writable. Read-only sources do nothing.
     fn put(&self, _sha256: &str, _bytes: &[u8]) -> Result<()> {
         Ok(())
+    }
+
+    /// A local file said to hold this content (unverified), for sources that are folders.
+    fn local_path(&self, _sha256: &str) -> Option<PathBuf> {
+        None
+    }
+
+    /// Streams the content into `out`; false when this source doesn't have it.
+    fn fetch_to(&self, sha256: &str, out: &mut dyn Write) -> bool {
+        self.get(sha256).is_some_and(|bytes| out.write_all(&bytes).is_ok())
+    }
+
+    /// Stores the (verified) file at `src`, moving it when `take` allows. Returns where the
+    /// content now lives locally, for folder sources.
+    fn put_file(&self, _sha256: &str, _src: &Path, _take: bool) -> Result<Option<PathBuf>> {
+        Ok(None)
     }
 }
 
@@ -38,6 +55,30 @@ impl CacheSource for FolderCache {
 
     fn get(&self, sha256: &str) -> Option<Vec<u8>> {
         std::fs::read(self.entry(sha256)).ok()
+    }
+
+    fn local_path(&self, sha256: &str) -> Option<PathBuf> {
+        Some(self.entry(sha256)).filter(|p| p.is_file())
+    }
+
+    fn put_file(&self, sha256: &str, src: &Path, take: bool) -> Result<Option<PathBuf>> {
+        let path = self.entry(sha256);
+        if path.exists() {
+            return Ok(Some(path));
+        }
+        let dir = path.parent().expect("entry has a parent");
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        // Moving is free on the same volume; otherwise copy to a temp name, then rename, so a
+        // concurrent reader never sees a partial file.
+        if take && std::fs::rename(src, &path).is_ok() {
+            return Ok(Some(path));
+        }
+        let tmp = dir.join(format!("{sha256}.{}.tmp", std::process::id()));
+        std::fs::copy(src, &tmp).with_context(|| format!("writing {}", tmp.display()))?;
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Ok(Some(path))
     }
 
     fn put(&self, sha256: &str, bytes: &[u8]) -> Result<()> {
@@ -83,6 +124,11 @@ impl CacheSource for HttpCache {
         let url = self.base.join(&format!("sha256/{sha256}")).ok()?;
         self.fetcher.fetch(&url).ok()
     }
+
+    fn fetch_to(&self, sha256: &str, out: &mut dyn Write) -> bool {
+        let Ok(url) = self.base.join(&format!("sha256/{sha256}")) else { return false };
+        self.fetcher.fetch_to(&url, out).is_ok()
+    }
 }
 
 /// Parses a `--cache` argument: an `http(s)://` URL or a folder path (local or UNC).
@@ -127,6 +173,44 @@ impl Cache {
         for s in &self.sources {
             let _ = s.put(sha256, bytes);
         }
+    }
+
+    /// A local file whose content has this hash (checked), from the first folder source
+    /// that has one.
+    pub fn local_file(&self, sha256: &str) -> Option<PathBuf> {
+        self.sources
+            .iter()
+            .filter_map(|s| s.local_path(sha256))
+            .find(|p| fetch::sha256_file(p).is_ok_and(|h| h == sha256))
+    }
+
+    /// Streams the content from a source that isn't local into `dest`, checking its hash.
+    pub fn fetch_file(&self, sha256: &str, dest: &Path) -> bool {
+        for s in self.sources.iter().filter(|s| s.local_path(sha256).is_none()) {
+            let Ok(file) = std::fs::File::create(dest) else { return false };
+            let mut out = HashingWriter::new(std::io::BufWriter::new(file));
+            if s.fetch_to(sha256, &mut out) && out.flush().is_ok() && out.finish() == sha256 {
+                return true;
+            }
+        }
+        let _ = std::fs::remove_file(dest);
+        false
+    }
+
+    /// Stores a verified file in every writable source; returns the first local copy. `src`
+    /// is a temporary file the caller no longer needs, so the last source may take it.
+    pub fn put_file(&self, sha256: &str, src: &Path) -> Option<PathBuf> {
+        let mut local: Option<PathBuf> = None;
+        for s in &self.sources {
+            // Once one source has taken the file, the others copy from its copy.
+            let from = local.clone().unwrap_or_else(|| src.to_path_buf());
+            if let Ok(Some(path)) = s.put_file(sha256, &from, local.is_none())
+                && local.is_none()
+            {
+                local = Some(path);
+            }
+        }
+        local
     }
 }
 

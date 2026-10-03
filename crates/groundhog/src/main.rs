@@ -94,6 +94,10 @@ pub(crate) struct PendingOptions {
     /// may be `${secret:NAME}` (with `--secret NAME`) to keep a token out of the plain fields.
     #[arg(long = "header", value_name = "HEADER")]
     headers: Vec<String>,
+    /// A value for `${var:NAME}` in the Groundhogfile, as `NAME=value`. Repeatable; wins over
+    /// the file's own `vars`.
+    #[arg(long = "var", value_name = "NAME=VALUE")]
+    vars: Vec<String>,
 }
 
 impl PendingOptions {
@@ -120,8 +124,20 @@ impl PendingOptions {
             agent_update: self.agent_update.clone(),
             agent_update_from: self.agent_update_from.clone(),
             secrets: self.secrets.iter().map(|s| secret_value(s)).collect::<Result<_>>()?,
+            vars: parse_vars(&self.vars)?,
         })
     }
+}
+
+/// `NAME=value` pairs from `--var`.
+pub(crate) fn parse_vars(specs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    specs
+        .iter()
+        .map(|s| {
+            let (name, value) = s.split_once('=').with_context(|| format!("--var {s}: write it as NAME=value"))?;
+            Ok((name.trim().to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 /// `NAME=value`, or `NAME` with the value taken from the NAME environment variable.
@@ -153,7 +169,7 @@ fn run(command: Command) -> Result<i32> {
             let cache = Cache::default();
             let content = ContentStore { fetcher: &fetcher, cache: &cache };
             let scratch = std::env::temp_dir().join("groundhog-plan");
-            let loaded = Loader { content: &content, bundle_dir: scratch }.load(&root)?;
+            let loaded = Loader::new(&content, scratch).load(&root)?;
             for s in &loaded.sources {
                 println!("source  {}  sha256:{}", s.url, s.sha256);
             }

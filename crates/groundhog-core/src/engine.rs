@@ -15,8 +15,8 @@ use url::Url;
 use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
-    App, Capability, Check, EnvScope, Feature, FileCopy, Groundhogfile, RegistryData, RegistryValue, RunAction,
-    ServiceState, User,
+    App, Capability, CertScope, Certificate, Check, DefenderExclusion, EnvScope, Feature, FileCopy, FirewallRule,
+    Groundhogfile, Presence, RegistryData, RegistryValue, RunAction, Service, ServiceState, User,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -35,11 +35,15 @@ pub enum Action {
         value: String,
         #[serde(skip_serializing_if = "EnvScope::is_user")]
         scope: EnvScope,
+        #[serde(skip_serializing_if = "Presence::is_present")]
+        state: Presence,
     },
     Path {
         dir: String,
         #[serde(skip_serializing_if = "EnvScope::is_user")]
         scope: EnvScope,
+        #[serde(skip_serializing_if = "Presence::is_present")]
+        state: Presence,
     },
     Registry(RegistryValue),
     Run(RunAction),
@@ -47,6 +51,14 @@ pub enum Action {
     Feature(Feature),
     Capability(Capability),
     Verify(Check),
+    Certificate(Certificate),
+    Service(Service),
+    Firewall(FirewallRule),
+    Defender(DefenderExclusion),
+    /// A built-in Store app to remove, by package name (wildcards allowed).
+    RemoveApp {
+        name: String,
+    },
 }
 
 impl Action {
@@ -56,6 +68,8 @@ impl Action {
         match self {
             Action::Verify(_) => true,
             Action::Run(r) => r.always(),
+            // Whether there's a newer version changes without the file changing.
+            Action::App(App::Winget { upgrade: true, .. }) => true,
             _ => false,
         }
     }
@@ -71,9 +85,12 @@ pub struct Step {
 fn title(action: &Action) -> String {
     let base = match action {
         Action::EnsureWinget => "ensure winget is available".into(),
+        Action::App(App::Winget { id, state: Presence::Absent, .. }) => format!("uninstall {id} (winget)"),
         Action::App(App::Winget { id, version: Some(v), .. }) => format!("install {id} {v} (winget)"),
+        Action::App(App::Winget { id, upgrade: true, .. }) => format!("install or upgrade {id} (winget)"),
         Action::App(App::Winget { id, .. }) => format!("install {id} (winget)"),
         Action::App(App::Url { id, url, .. }) => format!("install {id} from {}", file_name(url)),
+        Action::File(FileCopy { state: Presence::Absent, to, .. }) => format!("remove {to}"),
         Action::File(FileCopy { from: None, to, .. }) => format!("write {to}"),
         Action::File(f @ FileCopy { from: Some(from), .. }) => {
             // A release's source archive is named after its tag; "source" reads better next to "@tag".
@@ -84,11 +101,58 @@ fn title(action: &Action) -> String {
             };
             format!("copy {name} -> {}", f.to)
         }
-        Action::Env { name, scope: EnvScope::User, .. } => format!("set env {name}"),
-        Action::Env { name, scope: EnvScope::Machine, .. } => format!("set machine env {name}"),
-        Action::Path { dir, scope: EnvScope::User } => format!("add {dir} to PATH"),
-        Action::Path { dir, scope: EnvScope::Machine } => format!("add {dir} to machine PATH"),
+        Action::Env { name, scope, state, .. } => {
+            let verb = if state.is_present() { "set" } else { "remove" };
+            let machine = if *scope == EnvScope::Machine { "machine " } else { "" };
+            format!("{verb} {machine}env {name}")
+        }
+        Action::Path { dir, scope, state } => {
+            let which = if *scope == EnvScope::Machine { "machine PATH" } else { "PATH" };
+            if state.is_present() { format!("add {dir} to {which}") } else { format!("remove {dir} from {which}") }
+        }
+        Action::Registry(RegistryValue { key, name: None, state: Presence::Absent, .. }) => {
+            format!("delete key {key}")
+        }
+        Action::Registry(r) if !r.state.is_present() => {
+            format!("delete {}\\{}", r.key, r.name.as_deref().unwrap_or("(default)"))
+        }
         Action::Registry(r) => format!("set {}\\{}", r.key, r.name.as_deref().unwrap_or("(default)")),
+        Action::Certificate(c) => {
+            let what = c
+                .from
+                .as_ref()
+                .map(file_name)
+                .or_else(|| c.thumbprint.as_ref().map(|t| format!("certificate {}", &t[..8])))
+                .unwrap_or_default();
+            let scope = if c.scope == CertScope::Machine { "machine" } else { "user" };
+            let store = c.store.system_name();
+            if c.state.is_present() {
+                format!("add {what} to {scope} {store} certificates")
+            } else {
+                format!("remove {what} from {scope} {store} certificates")
+            }
+        }
+        Action::Service(s) => {
+            let mut parts = Vec::new();
+            if let Some(t) = s.startup {
+                parts.push(format!("{t:?}").to_ascii_lowercase());
+            }
+            if let Some(st) = s.status {
+                parts.push(format!("{st:?}").to_ascii_lowercase());
+            }
+            format!("service {}: {}", s.name, parts.join(", "))
+        }
+        Action::Firewall(r) if r.state.is_present() => format!("firewall rule {}", r.name),
+        Action::Firewall(r) => format!("remove firewall rule {}", r.name),
+        Action::Defender(e) => {
+            let kind = format!("{:?}", e.kind).to_ascii_lowercase();
+            if e.state.is_present() {
+                format!("exclude {kind} {} from Defender", e.value)
+            } else {
+                format!("stop excluding {kind} {} from Defender", e.value)
+            }
+        }
+        Action::RemoveApp { name } => format!("remove built-in app {name}"),
         Action::Run(RunAction::Command { command, .. }) => format!("run: {}", command_title(command)),
         Action::Run(RunAction::Script { script, .. }) => format!("run script {}", file_name(script)),
         Action::Run(RunAction::Plugin { plugin, .. }) => format!("run plugin {}", file_name(plugin)),
@@ -97,6 +161,7 @@ fn title(action: &Action) -> String {
         Action::Feature(f) => format!("disable feature {}", f.name),
         Action::Capability(c) if c.present => format!("add capability {}", c.name),
         Action::Capability(c) => format!("remove capability {}", c.name),
+        Action::User(u) if !u.state.is_present() => format!("delete user {}", u.name),
         Action::User(u) if u.groups.is_empty() => format!("user {}", u.name),
         Action::User(u) => format!("user {} ({})", u.name, u.groups.join(", ")),
     };
@@ -113,6 +178,7 @@ fn build_label(action: &Action) -> Option<String> {
         Action::App(App::Url { release, resolved, .. }) | Action::File(FileCopy { release, resolved, .. }) => {
             (release.as_deref(), resolved.as_deref())
         }
+        Action::Certificate(Certificate { resolved, .. }) => (None, resolved.as_deref()),
         Action::Run(RunAction::Script { resolved, .. } | RunAction::Plugin { resolved, .. }) => {
             (None, resolved.as_deref())
         }
@@ -171,10 +237,15 @@ pub fn plan(file: &Groundhogfile) -> Vec<Step> {
 pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Option<String>) -> Vec<Step> {
     // Accounts first: they depend on nothing, and later steps may assume they exist.
     let mut actions: Vec<Action> = file.users.iter().cloned().map(Action::User).collect();
+    // Certificates early: installers and downloads may need an internal CA.
+    actions.extend(file.certificates.iter().cloned().map(Action::Certificate));
+    // Defender exclusions before the big installs and unpacks they speed up.
+    actions.extend(file.defender_exclusions.iter().cloned().map(Action::Defender));
     // Windows features next: apps often need them (WSL for Docker, .NET 3.5 for old
     // installers), and their restarts are best taken before long installs, not in the middle.
     actions.extend(file.features.iter().cloned().map(Action::Feature));
     actions.extend(file.capabilities.iter().cloned().map(Action::Capability));
+    actions.extend(file.remove_apps.iter().map(|name| Action::RemoveApp { name: name.clone() }));
     if file.apps.iter().any(|a| matches!(a, App::Winget { .. })) {
         actions.push(Action::EnsureWinget);
     }
@@ -184,9 +255,13 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
         name: name.clone(),
         value: v.value.clone(),
         scope: v.scope,
+        state: v.state,
     }));
-    actions.extend(file.path.iter().map(|p| Action::Path { dir: p.dir.clone(), scope: p.scope }));
+    actions.extend(file.path.iter().map(|p| Action::Path { dir: p.dir.clone(), scope: p.scope, state: p.state }));
     actions.extend(file.registry.iter().cloned().map(Action::Registry));
+    // Services and firewall rules after apps, which often install what they refer to.
+    actions.extend(file.services.iter().cloned().map(Action::Service));
+    actions.extend(file.firewall.iter().cloned().map(Action::Firewall));
     actions.extend(file.run.iter().cloned().map(Action::Run));
     actions.extend(file.verify.iter().cloned().map(Action::Verify));
 
@@ -253,7 +328,11 @@ fn section(action: &Action) -> &'static str {
     match action {
         Action::Feature(_) | Action::Capability(_) => "windows features",
         Action::User(_) => "users",
-        Action::EnsureWinget | Action::App(_) => "apps",
+        Action::EnsureWinget | Action::App(_) | Action::RemoveApp { .. } => "apps",
+        Action::Certificate(_) => "certificates",
+        Action::Defender(_) => "defender",
+        Action::Service(_) => "services",
+        Action::Firewall(_) => "firewall",
         Action::File(_) => "files",
         Action::Env { .. } | Action::Path { .. } => "environment",
         Action::Registry(_) => "registry",
@@ -265,6 +344,55 @@ fn section(action: &Action) -> &'static str {
 /// Carries out steps on the actual machine. The agent implements this; tests fake it.
 pub trait Executor {
     fn execute(&mut self, step: &Step, reporter: &dyn Reporter) -> Result<Outcome>;
+
+    /// Whether the machine already matches the step, found without changing anything.
+    fn check(&mut self, _step: &Step) -> Result<Probe> {
+        Ok(Probe::Unknown)
+    }
+}
+
+/// What a step would do now, for `plan --check`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// The machine already matches; applying would change nothing.
+    Satisfied,
+    /// Applying would change the machine.
+    WouldChange,
+    /// An imperative step (`run`) or a check: it runs, whatever the machine looks like.
+    WillRun,
+    /// Can't tell without doing it (an installer, an archive to unpack).
+    Unknown,
+}
+
+/// A step's line in a preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Preview {
+    /// Recorded as applied by an earlier run, so `apply` skips it.
+    Applied,
+    Probe(Probe),
+    /// The check itself failed (say, a service that doesn't exist).
+    Error(String),
+}
+
+/// What `apply` would do with each step: skip what's recorded as applied, and ask the
+/// executor about the rest.
+pub fn preview(steps: &[Step], exec: &mut dyn Executor, state_path: &Path) -> Vec<Preview> {
+    let done: HashSet<String> = read_state(state_path)
+        .iter()
+        .flat_map(|p| p.steps.iter().filter(|s| s.status == StepStatus::Done).map(|s| s.id.clone()))
+        .collect();
+    steps
+        .iter()
+        .map(|step| {
+            if done.contains(&step.id) && !step.action.always_runs() {
+                return Preview::Applied;
+            }
+            match exec.check(step) {
+                Ok(p) => Preview::Probe(p),
+                Err(e) => Preview::Error(format!("{e:#}")),
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,14 +698,99 @@ mod tests {
     }
 
     #[test]
+    fn new_sections_take_their_place_in_the_order() {
+        use crate::model::{CertStore, ExclusionKind, FirewallAction, FirewallDirection, FirewallProtocol};
+        let mut g = file(&["late"]);
+        g.services.push(Service { name: "Spooler".into(), startup: None, status: Some(ServiceState::Stopped) });
+        g.firewall.push(FirewallRule {
+            name: "web".into(),
+            ports: Some("80".into()),
+            protocol: FirewallProtocol::Tcp,
+            direction: FirewallDirection::In,
+            action: FirewallAction::Allow,
+            program: None,
+            profile: "any".into(),
+            remote: None,
+            state: Presence::Present,
+        });
+        g.remove_apps.push("Microsoft.BingNews".into());
+        g.defender_exclusions.push(DefenderExclusion {
+            kind: ExclusionKind::Path,
+            value: "C:\\src".into(),
+            state: Presence::Present,
+        });
+        g.certificates.push(Certificate {
+            from: Some(Url::parse("https://pki.test/root.cer").unwrap()),
+            sha256: None,
+            resolved: None,
+            thumbprint: None,
+            store: CertStore::Root,
+            scope: CertScope::Machine,
+            state: Presence::Present,
+        });
+        g.apps.push(App::Winget {
+            id: "Git.Git".into(),
+            version: None,
+            args: None,
+            timeout_ms: None,
+            upgrade: true,
+            state: Presence::Present,
+        });
+        let steps = plan(&g);
+        let titles: Vec<&str> = steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "add root.cer to machine Root certificates",
+                "exclude path C:\\src from Defender",
+                "remove built-in app Microsoft.BingNews",
+                "ensure winget is available",
+                "install or upgrade Git.Git (winget)",
+                "service Spooler: stopped",
+                "firewall rule web",
+                "run: late",
+            ]
+        );
+        assert!(steps[4].action.always_runs(), "an upgrading app checks for a new version every apply");
+    }
+
+    #[test]
+    fn preview_skips_what_was_applied_and_asks_about_the_rest() {
+        struct Prober;
+        impl Executor for Prober {
+            fn execute(&mut self, _: &Step, _: &dyn Reporter) -> Result<Outcome> {
+                Ok(Outcome::Done { changed: true })
+            }
+            fn check(&mut self, step: &Step) -> Result<Probe> {
+                match &step.action {
+                    Action::Run(RunAction::Command { command, .. }) if command == "broken" => anyhow::bail!("nope"),
+                    _ => Ok(Probe::WillRun),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let url = Url::parse("https://cfg.test/g.yaml").unwrap();
+        let first = plan(&file(&["a"]));
+        let opts =
+            RunOptions { source: &url, sources: vec![], state_path: &path, fresh: false, redact: Redactor::default() };
+        run(&first, &mut Prober, &NullReporter, opts).unwrap();
+
+        let steps = plan(&file(&["a", "broken"]));
+        let previews = preview(&steps, &mut Prober, &path);
+        assert_eq!(previews[0], Preview::Applied);
+        assert!(matches!(&previews[1], Preview::Error(e) if e == "nope"));
+    }
+
+    #[test]
     fn user_scope_keeps_the_step_ids_from_before_scopes() {
         // Ids are hashes of the serialized action: these must stay exactly what 0.10 wrote, or
         // every machine would rerun its env and PATH steps after updating.
-        let env = Action::Env { name: "A".into(), value: "1".into(), scope: EnvScope::User };
-        let path = Action::Path { dir: r"C:\bin".into(), scope: EnvScope::User };
+        let env = Action::Env { name: "A".into(), value: "1".into(), scope: EnvScope::User, state: Presence::Present };
+        let path = Action::Path { dir: r"C:\bin".into(), scope: EnvScope::User, state: Presence::Present };
         assert_eq!(serde_json::to_string(&env).unwrap(), r#"{"action":"env","name":"A","value":"1"}"#);
         assert_eq!(serde_json::to_string(&path).unwrap(), r#"{"action":"path","dir":"C:\\bin"}"#);
-        let machine = Action::Path { dir: r"C:\bin".into(), scope: EnvScope::Machine };
+        let machine = Action::Path { dir: r"C:\bin".into(), scope: EnvScope::Machine, state: Presence::Present };
         assert_eq!(serde_json::to_string(&machine).unwrap(), r#"{"action":"path","dir":"C:\\bin","scope":"machine"}"#);
         assert_eq!(title(&machine), r"add C:\bin to machine PATH");
     }
@@ -585,8 +798,14 @@ mod tests {
     #[test]
     fn a_step_using_a_secret_reruns_when_its_fingerprint_changes() {
         let mut g = file(&[]);
-        g.env.insert("TOKEN".into(), crate::model::EnvVar { value: "${secret:T}".into(), scope: EnvScope::User });
-        g.env.insert("PLAIN".into(), crate::model::EnvVar { value: "x".into(), scope: EnvScope::User });
+        g.env.insert(
+            "TOKEN".into(),
+            crate::model::EnvVar { value: "${secret:T}".into(), scope: EnvScope::User, state: Presence::Present },
+        );
+        g.env.insert(
+            "PLAIN".into(),
+            crate::model::EnvVar { value: "x".into(), scope: EnvScope::User, state: Presence::Present },
+        );
         let id = |fp: Option<&str>, name: &str| {
             plan_with_secrets(&g, &|_| fp.map(str::to_owned))
                 .into_iter()
@@ -643,7 +862,10 @@ mod tests {
     fn declarative_steps_are_independent_and_run_steps_follow_them() {
         let with_file = |content: &str| {
             let mut g = file(&["unzip"]);
-            g.env.insert("A".into(), crate::model::EnvVar { value: "1".into(), scope: EnvScope::User });
+            g.env.insert(
+                "A".into(),
+                crate::model::EnvVar { value: "1".into(), scope: EnvScope::User, state: Presence::Present },
+            );
             g.files.push(FileCopy {
                 from: Some(Url::parse("https://dl.test/latest/app.zip").unwrap()),
                 content: None,
@@ -653,6 +875,7 @@ mod tests {
                 extract: false,
                 strip: 0,
                 release: None,
+                state: Presence::Present,
             });
             plan(&g)
         };
@@ -719,6 +942,7 @@ mod tests {
             extract: true,
             strip: 0,
             release: Some("1.0.268".into()),
+            state: Presence::Present,
         });
         assert_eq!(title(&file_from_release), r"copy release.zip -> C:\app @1.0.268");
     }
@@ -734,7 +958,14 @@ mod tests {
     fn winget_is_ensured_only_when_needed() {
         let mut g = file(&[]);
         assert!(plan(&g).is_empty());
-        g.apps.push(App::Winget { id: "git.git".into(), version: None, args: None, timeout_ms: None });
+        g.apps.push(App::Winget {
+            id: "git.git".into(),
+            version: None,
+            args: None,
+            timeout_ms: None,
+            upgrade: false,
+            state: Presence::Present,
+        });
         assert_eq!(plan(&g)[0].action, Action::EnsureWinget);
     }
 

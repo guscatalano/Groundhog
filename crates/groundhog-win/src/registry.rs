@@ -76,6 +76,47 @@ pub fn get_string(root: &RegKey, subkey: &str, name: &str) -> Option<String> {
     root.open_subkey_with_flags(subkey, KEY_READ).ok()?.get_value(name).ok()
 }
 
+/// Whether `root\subkey` already holds exactly this value (type and data).
+pub fn value_matches(root: &RegKey, subkey: &str, name: Option<&str>, data: &Data) -> bool {
+    let wanted = data.to_reg_value();
+    root.open_subkey_with_flags(subkey, KEY_READ)
+        .and_then(|k| k.get_raw_value(name.unwrap_or("")))
+        .is_ok_and(|current| current.vtype == wanted.vtype && current.bytes == wanted.bytes)
+}
+
+pub fn value_exists(root: &RegKey, subkey: &str, name: Option<&str>) -> bool {
+    root.open_subkey_with_flags(subkey, KEY_READ).and_then(|k| k.get_raw_value(name.unwrap_or(""))).is_ok()
+}
+
+pub fn key_exists(root: &RegKey, subkey: &str) -> bool {
+    root.open_subkey_with_flags(subkey, KEY_READ).is_ok()
+}
+
+/// Deletes one value. Returns whether it was there.
+pub fn delete_value(root: &RegKey, subkey: &str, name: Option<&str>) -> Result<bool> {
+    if !value_exists(root, subkey, name) {
+        return Ok(false);
+    }
+    let name = name.unwrap_or("");
+    let key = root
+        .open_subkey_with_flags(subkey, winreg::enums::KEY_SET_VALUE)
+        .with_context(|| format!("opening {subkey}"))?;
+    key.delete_value(name).with_context(|| format!("deleting {subkey}\\{name}"))?;
+    Ok(true)
+}
+
+/// Deletes a key and everything under it. Returns whether it was there.
+pub fn delete_key(root: &RegKey, subkey: &str) -> Result<bool> {
+    if subkey.trim_matches('\\').is_empty() {
+        bail!("refusing to delete the root of a hive");
+    }
+    if !key_exists(root, subkey) {
+        return Ok(false);
+    }
+    root.delete_subkey_all(subkey).with_context(|| format!("deleting key {subkey}"))?;
+    Ok(true)
+}
+
 const DEFAULT_USER_MOUNT: &str = "groundhog-default-user";
 
 /// The Default User hive (`C:\Users\Default\NTUSER.DAT`), loaded under `HKEY_USERS` for as

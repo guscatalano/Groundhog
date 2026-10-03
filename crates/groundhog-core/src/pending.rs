@@ -39,6 +39,10 @@ pub struct Pending {
     /// removes them from this file as soon as it reads it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub secrets: std::collections::BTreeMap<String, String>,
+    /// Values for `${var:NAME}`, overriding the Groundhogfile's own (per-machine values such
+    /// as a name or a port).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub vars: std::collections::BTreeMap<String, String>,
 }
 
 fn yes() -> bool {

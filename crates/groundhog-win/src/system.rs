@@ -21,6 +21,18 @@ use crate::wide;
 
 /// PIDs of running processes whose image name matches `name` (case-insensitive; the `.exe`
 /// suffix is optional), in snapshot order.
+/// The Windows build number and whether this is a Server edition, from the registry (which,
+/// unlike `GetVersionEx`, doesn't lie to programs without a compatibility manifest). A build
+/// of 0 means it couldn't be read.
+pub fn windows_version() -> (u32, bool) {
+    let key = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+    let Ok(key) = key else { return (0, false) };
+    let build = key.get_value::<String, _>("CurrentBuildNumber").ok().and_then(|b| b.parse().ok()).unwrap_or(0);
+    let server = key.get_value::<String, _>("InstallationType").is_ok_and(|t| t.eq_ignore_ascii_case("Server"));
+    (build, server)
+}
+
 pub fn find_processes(name: &str) -> Result<Vec<u32>> {
     let want = name.to_ascii_lowercase();
     let want = want.strip_suffix(".exe").unwrap_or(&want).to_owned();

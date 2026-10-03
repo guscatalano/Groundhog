@@ -1,7 +1,9 @@
 //! Loading a Groundhogfile from a path, URL or zip bundle, following `extends`.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -13,11 +15,13 @@ use crate::fetch::{self, file_url_to_path};
 use crate::github;
 use crate::library;
 use crate::model::{
-    App, CURRENT_VERSION, Capability, Check, EnvScope, EnvVar, Feature, FileCopy, Groundhogfile, HiveScope, Password,
-    PathEntry, RegistryData, RegistryType, RegistryValue, RunAction, ServiceState, Shell, SourceRef, User, raw,
+    App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, EnvScope, EnvVar,
+    ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, Password, PathEntry,
+    Presence, RegistryData, RegistryType, RegistryValue, RunAction, Service, ServiceState, Shell, SourceRef, User, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
+use crate::vars::{self, Facts};
 
 /// File names looked for when a source is a directory or a zip bundle, in order.
 pub const ROOT_FILE_NAMES: &[&str] = &["groundhog.yaml", "groundhog.yml", "groundhog.json", "Groundhogfile"];
@@ -39,18 +43,138 @@ pub struct Loaded {
     pub sources: Vec<LoadedSource>,
 }
 
+/// A fetched document: its bytes and their SHA-256.
+type Doc = Rc<(Vec<u8>, String)>;
+
 pub struct Loader<'a> {
     pub content: &'a ContentStore<'a>,
     /// Where zip bundles are extracted.
     pub bundle_dir: PathBuf,
+    /// The machine `when:` conditions and built-in variables describe.
+    pub facts: Facts,
+    /// Variables from the caller (`--var`, `pending.json`); they win over a file's own.
+    pub vars: BTreeMap<String, String>,
+    /// Documents already fetched, so the variables pass and the real load fetch each once.
+    docs: RefCell<HashMap<Url, Doc>>,
 }
 
-impl Loader<'_> {
+impl<'a> Loader<'a> {
+    pub fn new(content: &'a ContentStore<'a>, bundle_dir: PathBuf) -> Self {
+        Self { content, bundle_dir, facts: Facts::default(), vars: BTreeMap::new(), docs: RefCell::default() }
+    }
+
+    pub fn with_facts(self, facts: Facts) -> Self {
+        Self { facts, ..self }
+    }
+
+    pub fn with_vars(self, vars: BTreeMap<String, String>) -> Self {
+        Self { vars, ..self }
+    }
+
     pub fn load(&self, root: &SourceRef) -> Result<Loaded> {
+        let vars = self.variables(root)?;
         let mut sources = Vec::new();
-        let mut file = self.load_ref(root, &mut Vec::new(), &mut sources)?;
+        let mut file = self.load_ref(root, &mut Vec::new(), &mut sources, &vars)?;
         self.resolve_unpinned(&mut file, &mut sources)?;
         Ok(Loaded { file, sources })
+    }
+
+    /// Every variable a load sees: the files' own `vars` (a file's own win over its bases',
+    /// so a file can override a library's default), then the caller's, then the built-ins.
+    fn variables(&self, root: &SourceRef) -> Result<BTreeMap<String, String>> {
+        let mut vars = self.collect_vars(root, &mut Vec::new())?;
+        for (name, value) in &self.vars {
+            if !vars::valid_name(name) {
+                bail!("variable name '{name}' should be letters, digits, '_' and '-'");
+            }
+            vars.insert(name.clone(), value.clone());
+        }
+        if let Some(name) = vars.keys().find(|n| vars::RESERVED.contains(&n.as_str())) {
+            bail!("'{name}' is a built-in variable and can't be redefined");
+        }
+        vars.extend(self.facts.builtin_vars());
+        Ok(vars)
+    }
+
+    /// First pass: `vars` across the `extends` tree, bases first. A document that doesn't
+    /// parse is skipped here; the real load reports its error with line numbers.
+    fn collect_vars(&self, r: &SourceRef, stack: &mut Vec<Url>) -> Result<BTreeMap<String, String>> {
+        let (url, sha256) = self.locate(r, None)?;
+        if stack.contains(&url) || stack.len() >= MAX_EXTENDS_DEPTH {
+            return Ok(BTreeMap::new()); // the real load explains
+        }
+        let doc = self.document(&url, sha256.as_deref())?;
+        let Some(value) = parse_value(&doc.0, &url) else { return Ok(BTreeMap::new()) };
+        let mut vars = BTreeMap::new();
+        if let Some(extends) = value.get("extends")
+            && let Ok(bases) = serde_json::from_value::<raw::OneOrMany<raw::SourceRef>>(extends.clone())
+        {
+            stack.push(url.clone());
+            for base in bases.into_vec() {
+                let base = resolve_source_ref(&url, base)?;
+                vars.extend(self.collect_vars(&base, stack)?);
+            }
+            stack.pop();
+        }
+        if let Some(own) = value.get("vars") {
+            let serde_json::Value::Object(own) = own else { bail!("{url}: 'vars' is a map of names to values") };
+            for (name, v) in own {
+                if !vars::valid_name(name) {
+                    bail!("{url}: variable name '{name}' should be letters, digits, '_' and '-'");
+                }
+                let text = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    _ => bail!("{url}: variable '{name}' should be a string or a number"),
+                };
+                vars.insert(name.clone(), text);
+            }
+        }
+        Ok(vars)
+    }
+
+    /// Where a reference's document is: library names expanded, zip bundles unpacked, and a
+    /// folder's root file found. Returns the document URL and the pin that applies to it.
+    fn locate(&self, r: &SourceRef, sources: Option<&mut Vec<LoadedSource>>) -> Result<(Url, Option<String>)> {
+        let mut url = r.url.clone();
+        let mut sha256 = r.sha256.clone();
+        if library::is_library(&url) {
+            url = library::expand(&url)?;
+        }
+        if url.path().to_ascii_lowercase().ends_with(".zip") {
+            let zip = self.document(&url, sha256.as_deref())?;
+            if let Some(sources) = sources {
+                sources.push(LoadedSource { url: url.clone(), sha256: zip.1.clone() });
+            }
+            let dir = self.bundle_dir.join(&zip.1[..16]);
+            extract_zip(&zip.0, &dir).with_context(|| format!("extracting {url}"))?;
+            url = find_root_file(&dir)?;
+            sha256 = None; // the pin applied to the zip
+        } else if url.scheme() == "file" {
+            let path = file_url_to_path(&url)?;
+            if path.is_dir() {
+                url = find_root_file(&path)?;
+            }
+        }
+        Ok((url, sha256))
+    }
+
+    fn document(&self, url: &Url, sha256: Option<&str>) -> Result<Doc> {
+        if let Some(doc) = self.docs.borrow().get(url) {
+            // Remembered from earlier in this load, but a pin still has to match.
+            if let Some(pin) = sha256 {
+                let pin = fetch::normalize_sha256(pin)?;
+                if pin != doc.1 {
+                    bail!("hash mismatch for {url}: expected {pin}, got {}", doc.1);
+                }
+            }
+            return Ok(doc.clone());
+        }
+        let fetched = self.content.get(url, sha256)?;
+        let doc = Rc::new((fetched.bytes, fetched.sha256));
+        self.docs.borrow_mut().insert(url.clone(), doc.clone());
+        Ok(doc)
     }
 
     /// Fills in `resolved` for every reference without a `sha256` pin by fetching it now.
@@ -81,6 +205,11 @@ impl Loader<'_> {
                 from_github(from, &mut f.sha256, &mut f.release)?;
             }
         }
+        for c in &mut file.certificates {
+            if let Some(from) = &mut c.from {
+                from_github(from, &mut c.sha256, &mut None)?;
+            }
+        }
 
         let mut seen: HashMap<Url, String> = HashMap::new();
         let mut resolve = |url: &Url, pinned: &Option<String>, slot: &mut Option<String>| -> Result<()> {
@@ -93,7 +222,7 @@ impl Loader<'_> {
                     let hash = if url.scheme() == "file" && file_url_to_path(url)?.is_dir() {
                         tree_hash(&file_url_to_path(url)?)?
                     } else {
-                        self.content.get(url, None).with_context(|| format!("resolving {url}"))?.sha256
+                        self.content.get_file(url, None).with_context(|| format!("resolving {url}"))?.sha256
                     };
                     sources.push(LoadedSource { url: url.clone(), sha256: hash.clone() });
                     seen.insert(url.clone(), hash.clone());
@@ -113,6 +242,11 @@ impl Loader<'_> {
                 resolve(from, &f.sha256, &mut f.resolved)?;
             }
         }
+        for c in &mut file.certificates {
+            if let Some(from) = &c.from {
+                resolve(from, &c.sha256, &mut c.resolved)?;
+            }
+        }
         for r in &mut file.run {
             match r {
                 RunAction::Script { script: url, sha256, resolved, .. }
@@ -123,27 +257,14 @@ impl Loader<'_> {
         Ok(())
     }
 
-    fn load_ref(&self, r: &SourceRef, stack: &mut Vec<Url>, sources: &mut Vec<LoadedSource>) -> Result<Groundhogfile> {
-        let mut url = r.url.clone();
-        let mut sha256 = r.sha256.clone();
-
-        if library::is_library(&url) {
-            url = library::expand(&url)?;
-        }
-
-        if url.path().to_ascii_lowercase().ends_with(".zip") {
-            let zip = self.content.get(&url, sha256.as_deref())?;
-            sources.push(LoadedSource { url: url.clone(), sha256: zip.sha256.clone() });
-            let dir = self.bundle_dir.join(&zip.sha256[..16]);
-            extract_zip(&zip.bytes, &dir).with_context(|| format!("extracting {url}"))?;
-            url = find_root_file(&dir)?;
-            sha256 = None; // the pin applied to the zip
-        } else if url.scheme() == "file" {
-            let path = file_url_to_path(&url)?;
-            if path.is_dir() {
-                url = find_root_file(&path)?;
-            }
-        }
+    fn load_ref(
+        &self,
+        r: &SourceRef,
+        stack: &mut Vec<Url>,
+        sources: &mut Vec<LoadedSource>,
+        vars: &BTreeMap<String, String>,
+    ) -> Result<Groundhogfile> {
+        let (url, sha256) = self.locate(r, Some(sources))?;
 
         if stack.contains(&url) {
             let chain: Vec<_> = stack.iter().chain([&url]).map(Url::as_str).collect();
@@ -153,9 +274,9 @@ impl Loader<'_> {
             bail!("extends nested deeper than {MAX_EXTENDS_DEPTH} levels at {url}");
         }
 
-        let doc = self.content.get(&url, sha256.as_deref())?;
-        sources.push(LoadedSource { url: url.clone(), sha256: doc.sha256.clone() });
-        let mut raw = parse(&doc.bytes, &url)?;
+        let doc = self.document(&url, sha256.as_deref())?;
+        sources.push(LoadedSource { url: url.clone(), sha256: doc.1.clone() });
+        let mut raw = parse(&doc.0, &url, vars, &self.facts)?;
 
         if let Some(v) = raw.version
             && v > CURRENT_VERSION
@@ -167,7 +288,7 @@ impl Loader<'_> {
         let mut merged = Groundhogfile::default();
         for base in std::mem::take(&mut raw.extends).into_vec() {
             let base = resolve_source_ref(&url, base)?;
-            let base = self.load_ref(&base, stack, sources).with_context(|| format!("loading base of {url}"))?;
+            let base = self.load_ref(&base, stack, sources, vars).with_context(|| format!("loading base of {url}"))?;
             merged = merge(merged, base);
         }
         stack.pop();
@@ -219,11 +340,23 @@ impl std::fmt::Display for NeedsAgent {
 
 impl std::error::Error for NeedsAgent {}
 
-fn parse(bytes: &[u8], url: &Url) -> Result<raw::File> {
+fn parse(bytes: &[u8], url: &Url, vars: &BTreeMap<String, String>, facts: &Facts) -> Result<raw::File> {
     let text = std::str::from_utf8(bytes).with_context(|| format!("{url} is not UTF-8"))?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let is_json = url.path().to_ascii_lowercase().ends_with(".json");
-    let strict = if is_json {
+    let strict = if vars::needed(text) {
+        // Conditions and variables are applied to the document tree, then it's read as usual.
+        // (Errors from this path can't point at a line, which is why only these files use it.)
+        let value: Result<serde_json::Value> = if is_json {
+            serde_json::from_str(text).map_err(anyhow::Error::from)
+        } else {
+            serde_norway::from_str(text).map_err(anyhow::Error::from)
+        };
+        value.and_then(|mut v| {
+            vars::preprocess(&mut v, vars, facts)?;
+            serde_json::from_value(v).map_err(anyhow::Error::from)
+        })
+    } else if is_json {
         serde_json::from_str(text).map_err(anyhow::Error::from)
     } else if text.trim().is_empty() {
         Ok(raw::File::default())
@@ -239,6 +372,20 @@ fn parse(bytes: &[u8], url: &Url) -> Result<raw::File> {
             _ => e,
         }
     })
+}
+
+/// The document as a JSON-like tree, or `None` when it doesn't parse.
+fn parse_value(bytes: &[u8], url: &Url) -> Option<serde_json::Value> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if text.trim().is_empty() {
+        return Some(serde_json::Value::Object(Default::default()));
+    }
+    if url.path().to_ascii_lowercase().ends_with(".json") {
+        serde_json::from_str(text).ok()
+    } else {
+        serde_norway::from_str(text).ok()
+    }
 }
 
 /// Reads just the top-level `agent:` value, ignoring everything this version doesn't know.
@@ -311,106 +458,28 @@ fn pin(sha256: Option<String>) -> Result<Option<String>> {
 }
 
 fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
-    let raw::File { apps, files, env, path, registry, run, verify, agent, users, features, capabilities, .. } = raw;
+    let raw::File {
+        apps,
+        files,
+        env,
+        path,
+        registry,
+        run,
+        verify,
+        agent,
+        users,
+        features,
+        capabilities,
+        certificates,
+        services,
+        firewall,
+        defender_exclusions,
+        remove_apps,
+        ..
+    } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
-    let apps = apps
-        .into_iter()
-        .map(|a| {
-            Ok(match a {
-                raw::App::Short(id) => App::Winget { id, version: None, args: None, timeout_ms: None },
-                raw::App::Full(f) => {
-                    let timeout_ms = f.timeout.map(duration_ms).transpose()?;
-                    match f.url {
-                        Some(u) => {
-                            if f.version.is_some() {
-                                bail!("app '{}': 'version' only applies to winget apps", f.id);
-                            }
-                            let mut url = resolve_ref(base, &u)?;
-                            if f.prerelease {
-                                if !github::is_github(&url) {
-                                    bail!("app '{}': 'prerelease' only applies to github: sources", f.id);
-                                }
-                                github::allow_prerelease(&mut url);
-                            }
-                            App::Url {
-                                id: f.id,
-                                url,
-                                sha256: pin(f.sha256)?,
-                                resolved: None,
-                                release: None,
-                                args: f.args,
-                                timeout_ms,
-                            }
-                        }
-                        None => {
-                            if f.sha256.is_some() || f.prerelease {
-                                bail!("app '{}': 'sha256' and 'prerelease' only apply to apps with a 'url'", f.id);
-                            }
-                            App::Winget { id: f.id, version: f.version, args: f.args, timeout_ms }
-                        }
-                    }
-                }
-            })
-        })
-        .collect::<Result<_>>()?;
-
-    let files = files
-        .into_iter()
-        .map(|f| {
-            let from_text = match (f.from, &f.content) {
-                (Some(from), None) => from,
-                (None, Some(content)) => {
-                    let download_only = [
-                        ("sha256", f.sha256.is_some()),
-                        ("extract", f.extract),
-                        ("strip", f.strip.is_some()),
-                        ("prerelease", f.prerelease),
-                    ];
-                    if let Some((opt, _)) = download_only.iter().find(|(_, set)| *set) {
-                        bail!("file {}: '{opt}' only applies to files with 'from'", f.to);
-                    }
-                    secret::parse(content).with_context(|| format!("file {}", f.to))?;
-                    return Ok(FileCopy {
-                        from: None,
-                        content: f.content,
-                        to: f.to,
-                        sha256: None,
-                        resolved: None,
-                        extract: false,
-                        strip: 0,
-                        release: None,
-                    });
-                }
-                (Some(_), Some(_)) => bail!("file {}: give 'from' or 'content', not both", f.to),
-                (None, None) => bail!("file {}: needs 'from' (a path or URL) or 'content' (the text)", f.to),
-            };
-            let mut from = resolve_ref(base, &from_text)?;
-            if f.prerelease {
-                if !github::is_github(&from) {
-                    bail!("'{from_text}': 'prerelease' only applies to github: sources");
-                }
-                github::allow_prerelease(&mut from);
-            }
-            let path = from.path().to_ascii_lowercase();
-            let is_zip = path.ends_with(".zip") || (github::is_github(&from) && path.ends_with("/source"));
-            if f.extract && !is_zip {
-                bail!("'{from_text}': 'extract' needs a .zip file");
-            }
-            if f.strip.is_some() && !f.extract {
-                bail!("'{from_text}': 'strip' only applies with 'extract: true'");
-            }
-            Ok(FileCopy {
-                from: Some(from),
-                content: None,
-                to: f.to,
-                sha256: pin(f.sha256)?,
-                resolved: None,
-                extract: f.extract,
-                strip: f.strip.unwrap_or(0),
-                release: None,
-            })
-        })
-        .collect::<Result<_>>()?;
+    let apps = apps.into_iter().map(|a| resolve_app(base, a)).collect::<Result<_>>()?;
+    let files = files.into_iter().map(|f| resolve_file(base, f)).collect::<Result<_>>()?;
 
     if let Some(bad) = env.keys().find(|k| k.is_empty() || k.contains('=')) {
         bail!("invalid environment variable name '{bad}'");
@@ -419,10 +488,19 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         .into_iter()
         .map(|(name, v)| {
             let var = match v {
-                raw::StringOr::Short(value) => EnvVar { value, scope: EnvScope::User },
-                raw::StringOr::Full(f) => EnvVar { value: f.value, scope: f.scope },
+                raw::StringOr::Short(value) => EnvVar { value, scope: EnvScope::User, state: Presence::Present },
+                raw::StringOr::Full(f) => {
+                    let state = f.state.unwrap_or_default();
+                    let value = match (state, f.value) {
+                        (Presence::Present, Some(v)) => v,
+                        (Presence::Present, None) => bail!("env {name}: needs a 'value'"),
+                        (Presence::Absent, None) => String::new(),
+                        (Presence::Absent, Some(_)) => bail!("env {name}: 'value' doesn't go with 'state: absent'"),
+                    };
+                    EnvVar { value, scope: f.scope, state }
+                }
             };
-            if var.scope == EnvScope::Machine && name.eq_ignore_ascii_case("path") {
+            if var.scope == EnvScope::Machine && var.state.is_present() && name.eq_ignore_ascii_case("path") {
                 bail!("env: add to the machine PATH with `path:` entries (scope: machine); this would replace it");
             }
             Ok((name, var))
@@ -431,8 +509,8 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     let path = path
         .into_iter()
         .map(|p| match p {
-            raw::StringOr::Short(dir) => PathEntry { dir, scope: EnvScope::User },
-            raw::StringOr::Full(f) => PathEntry { dir: f.dir, scope: f.scope },
+            raw::StringOr::Short(dir) => PathEntry { dir, scope: EnvScope::User, state: Presence::Present },
+            raw::StringOr::Full(f) => PathEntry { dir: f.dir, scope: f.scope, state: f.state.unwrap_or_default() },
         })
         .collect();
 
@@ -472,10 +550,294 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         .map(|(i, c)| resolve_capability(base, c).with_context(|| format!("capabilities[{i}]")))
         .collect::<Result<_>>()?;
 
-    let file =
-        Groundhogfile { users, features, capabilities, apps, files, env, path, registry, run, verify, requires_agent };
+    let certificates = certificates
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| resolve_certificate(base, c).with_context(|| format!("certificates[{i}]")))
+        .collect::<Result<_>>()?;
+    let services = services.into_iter().map(resolve_service).collect::<Result<_>>()?;
+    let firewall = firewall.into_iter().map(resolve_firewall).collect::<Result<_>>()?;
+    let defender_exclusions = defender_exclusions.into_iter().map(resolve_exclusion).collect::<Result<_>>()?;
+    if remove_apps.iter().any(|a| a.trim().is_empty()) {
+        bail!("remove-apps: an entry is empty");
+    }
+
+    let file = Groundhogfile {
+        users,
+        certificates,
+        defender_exclusions,
+        features,
+        capabilities,
+        remove_apps,
+        apps,
+        files,
+        env,
+        path,
+        registry,
+        services,
+        firewall,
+        run,
+        verify,
+        requires_agent,
+    };
     check_secret_references(&file)?;
     Ok(file)
+}
+
+fn resolve_app(base: &Url, a: raw::App) -> Result<App> {
+    let f = match a {
+        raw::App::Short(id) => {
+            return Ok(App::Winget {
+                id,
+                version: None,
+                args: None,
+                timeout_ms: None,
+                upgrade: false,
+                state: Presence::Present,
+            });
+        }
+        raw::App::Full(f) => f,
+    };
+    let timeout_ms = f.timeout.map(duration_ms).transpose()?;
+    let state = f.state.unwrap_or_default();
+    match f.url {
+        Some(u) => {
+            if f.version.is_some() || f.upgrade {
+                bail!("app '{}': 'version' and 'upgrade' only apply to winget apps", f.id);
+            }
+            if !state.is_present() {
+                bail!(
+                    "app '{}': 'state: absent' only applies to winget apps; a direct installer doesn't say how \
+                     to uninstall it (use a 'run' step with its uninstaller)",
+                    f.id
+                );
+            }
+            let mut url = resolve_ref(base, &u)?;
+            if f.prerelease {
+                if !github::is_github(&url) {
+                    bail!("app '{}': 'prerelease' only applies to github: sources", f.id);
+                }
+                github::allow_prerelease(&mut url);
+            }
+            Ok(App::Url {
+                id: f.id,
+                url,
+                sha256: pin(f.sha256)?,
+                resolved: None,
+                release: None,
+                args: f.args,
+                timeout_ms,
+            })
+        }
+        None => {
+            if f.sha256.is_some() || f.prerelease {
+                bail!("app '{}': 'sha256' and 'prerelease' only apply to apps with a 'url'", f.id);
+            }
+            if f.upgrade && f.version.is_some() {
+                bail!("app '{}': give 'version' (stay on it) or 'upgrade: true' (follow new releases), not both", f.id);
+            }
+            if !state.is_present() && (f.version.is_some() || f.upgrade) {
+                bail!("app '{}': 'version' and 'upgrade' don't go with 'state: absent'", f.id);
+            }
+            Ok(App::Winget { id: f.id, version: f.version, args: f.args, timeout_ms, upgrade: f.upgrade, state })
+        }
+    }
+}
+
+fn resolve_file(base: &Url, f: raw::FileCopy) -> Result<FileCopy> {
+    let state = f.state.unwrap_or_default();
+    let options = [
+        ("from", f.from.is_some()),
+        ("content", f.content.is_some()),
+        ("sha256", f.sha256.is_some()),
+        ("extract", f.extract),
+        ("strip", f.strip.is_some()),
+        ("prerelease", f.prerelease),
+    ];
+    let removal = |to: String| FileCopy {
+        from: None,
+        content: None,
+        to,
+        sha256: None,
+        resolved: None,
+        extract: false,
+        strip: 0,
+        release: None,
+        state: Presence::Absent,
+    };
+    if !state.is_present() {
+        if let Some((opt, _)) = options.iter().find(|(_, set)| *set) {
+            bail!("file {}: '{opt}' doesn't go with 'state: absent', which only needs 'to'", f.to);
+        }
+        return Ok(removal(f.to));
+    }
+    let from_text = match (f.from, &f.content) {
+        (Some(from), None) => from,
+        (None, Some(content)) => {
+            if let Some((opt, _)) = options[2..].iter().find(|(_, set)| *set) {
+                bail!("file {}: '{opt}' only applies to files with 'from'", f.to);
+            }
+            secret::parse(content).with_context(|| format!("file {}", f.to))?;
+            return Ok(FileCopy { content: f.content, state: Presence::Present, ..removal(f.to) });
+        }
+        (Some(_), Some(_)) => bail!("file {}: give 'from' or 'content', not both", f.to),
+        (None, None) => bail!("file {}: needs 'from' (a path or URL) or 'content' (the text)", f.to),
+    };
+    let mut from = resolve_ref(base, &from_text)?;
+    if f.prerelease {
+        if !github::is_github(&from) {
+            bail!("'{from_text}': 'prerelease' only applies to github: sources");
+        }
+        github::allow_prerelease(&mut from);
+    }
+    let path = from.path().to_ascii_lowercase();
+    let is_zip = path.ends_with(".zip") || (github::is_github(&from) && path.ends_with("/source"));
+    if f.extract && !is_zip {
+        bail!("'{from_text}': 'extract' needs a .zip file");
+    }
+    if f.strip.is_some() && !f.extract {
+        bail!("'{from_text}': 'strip' only applies with 'extract: true'");
+    }
+    Ok(FileCopy {
+        from: Some(from),
+        content: None,
+        to: f.to,
+        sha256: pin(f.sha256)?,
+        resolved: None,
+        extract: f.extract,
+        strip: f.strip.unwrap_or(0),
+        release: None,
+        state: Presence::Present,
+    })
+}
+
+fn resolve_certificate(base: &Url, c: raw::Certificate) -> Result<Certificate> {
+    let state = c.state.unwrap_or_default();
+    let store = c.store.unwrap_or(CertStore::Root);
+    let scope = c.scope.unwrap_or_default();
+    if scope == CertScope::User && store == CertStore::Root && state.is_present() {
+        bail!(
+            "adding to the user's Root store makes Windows ask someone to confirm on screen, so it can't be \
+             done unattended; use scope: machine"
+        );
+    }
+    let (from, thumbprint) = match (c.from, c.thumbprint) {
+        (Some(from), None) => (Some(resolve_ref(base, &from)?), None),
+        (None, Some(t)) => {
+            if state.is_present() {
+                bail!("certificate {t}: adding one needs 'from' (the file); a thumbprint alone can only remove one");
+            }
+            let t: String = t.chars().filter(|c| !matches!(c, ' ' | ':')).collect::<String>().to_ascii_uppercase();
+            if t.len() != 40 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                bail!("certificate thumbprint '{t}' should be 40 hex characters (the SHA-1 thumbprint)");
+            }
+            (None, Some(t))
+        }
+        (Some(_), Some(_)) => bail!("a certificate takes 'from' or 'thumbprint', not both"),
+        (None, None) => bail!("a certificate needs 'from' (the file) or, to remove one, 'thumbprint'"),
+    };
+    if from.is_none() && c.sha256.is_some() {
+        bail!("'sha256' only applies to a certificate with 'from'");
+    }
+    Ok(Certificate { from, sha256: pin(c.sha256)?, resolved: None, thumbprint, store, scope, state })
+}
+
+fn resolve_service(s: raw::Service) -> Result<Service> {
+    if s.name.trim().is_empty() {
+        bail!("services: an entry has no name");
+    }
+    if s.startup.is_none() && s.status.is_none() {
+        bail!("service {}: give 'startup', 'status' or both", s.name);
+    }
+    Ok(Service { name: s.name, startup: s.startup, status: s.status })
+}
+
+fn resolve_firewall(r: raw::FirewallRule) -> Result<FirewallRule> {
+    let state = r.state.unwrap_or_default();
+    let name = r.name;
+    if name.trim().is_empty() {
+        bail!("firewall: a rule has no name");
+    }
+    if !state.is_present() {
+        let given = [
+            ("port", r.port.is_some()),
+            ("protocol", r.protocol.is_some()),
+            ("direction", r.direction.is_some()),
+            ("action", r.action.is_some()),
+            ("program", r.program.is_some()),
+            ("profile", r.profile.is_some()),
+            ("remote", r.remote.is_some()),
+        ];
+        if let Some((opt, _)) = given.iter().find(|(_, set)| *set) {
+            bail!("firewall rule {name}: '{opt}' doesn't go with 'state: absent', which only needs 'name'");
+        }
+    }
+    let ports = match r.port {
+        None => None,
+        Some(raw::Ports::One(n)) => Some(n.to_string()),
+        Some(raw::Ports::Text(t)) => Some(t),
+        Some(raw::Ports::List(items)) => Some(
+            items
+                .into_iter()
+                .map(|i| match i {
+                    raw::Scalar::Int(n) => Ok(n.to_string()),
+                    raw::Scalar::Str(s) => Ok(s),
+                    raw::Scalar::List(_) => bail!("firewall rule {name}: a port list can't nest"),
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join(","),
+        ),
+    };
+    if let Some(p) = &ports
+        && (p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit() || b == b',' || b == b'-'))
+    {
+        bail!("firewall rule {name}: ports look like 8791, 80,443 or 8000-8100, not '{p}'");
+    }
+    let protocol = r.protocol.unwrap_or_default();
+    if ports.is_some() && protocol == FirewallProtocol::Any {
+        bail!("firewall rule {name}: ports need protocol tcp or udp");
+    }
+    let profile = match r.profile.map(raw::OneOrMany::into_vec) {
+        None => "any".to_owned(),
+        Some(list) => {
+            let list: Vec<String> = list.iter().map(|p| p.trim().to_ascii_lowercase()).collect();
+            if let Some(bad) = list.iter().find(|p| !matches!(p.as_str(), "any" | "domain" | "private" | "public")) {
+                bail!("firewall rule {name}: profile '{bad}' isn't any, domain, private or public");
+            }
+            list.join(",")
+        }
+    };
+    Ok(FirewallRule {
+        name,
+        ports,
+        protocol,
+        direction: r.direction.unwrap_or_default(),
+        action: r.action.unwrap_or_default(),
+        program: r.program,
+        profile,
+        remote: r.remote.map(|r| r.into_vec().join(",")),
+        state,
+    })
+}
+
+fn resolve_exclusion(e: raw::StringOr<raw::DefenderExclusion>) -> Result<DefenderExclusion> {
+    let e = match e {
+        raw::StringOr::Short(path) => {
+            return Ok(DefenderExclusion { kind: ExclusionKind::Path, value: path, state: Presence::Present });
+        }
+        raw::StringOr::Full(e) => e,
+    };
+    let state = e.state.unwrap_or_default();
+    let (kind, value) = match (e.path, e.process, e.extension) {
+        (Some(v), None, None) => (ExclusionKind::Path, v),
+        (None, Some(v), None) => (ExclusionKind::Process, v),
+        (None, None, Some(v)) => (ExclusionKind::Extension, v),
+        _ => bail!("a defender exclusion is one of 'path', 'process' or 'extension'"),
+    };
+    if value.trim().is_empty() {
+        bail!("a defender exclusion is empty");
+    }
+    Ok(DefenderExclusion { kind, value, state })
 }
 
 /// `${secret:NAME}` may appear in inline file `content`, `env` values, registry string values,
@@ -544,9 +906,11 @@ fn servicing_source(base: &Url, s: &str) -> Result<String> {
         return Ok(s.to_owned());
     }
     if s.contains("://") {
-        bail!(
-            "'{s}': feature and capability sources must be folders or shares (zip and web sources aren't supported yet)"
-        );
+        // A .zip or .iso at a URL is fetched (streamed) and unpacked or mounted by the agent.
+        if !(s.starts_with("https://") || s.starts_with("http://")) {
+            bail!("'{s}': a source URL must be http(s)");
+        }
+        return Ok(s.to_owned());
     }
     if base.scheme() != "file" {
         bail!("'{s}': a relative source only works when the Groundhogfile is a local file; give a full path or share");
@@ -628,6 +992,11 @@ fn resolve_user(u: raw::User) -> Result<User> {
             u.name
         );
     }
+    let state = u.state.unwrap_or_default();
+    if !state.is_present() && (u.password.is_some() || u.groups.is_some() || u.full_name.is_some() || u.reset_password)
+    {
+        bail!("user '{}': 'state: absent' deletes the account and only needs 'name'", u.name);
+    }
     let password = match u.password {
         None => Password::Generate,
         Some(raw::StringOr::Short(s)) if s == "generate" => Password::Generate,
@@ -655,6 +1024,7 @@ fn resolve_user(u: raw::User) -> Result<User> {
         groups: u.groups.map(raw::OneOrMany::into_vec).unwrap_or_default(),
         password_never_expires: u.password_never_expires.unwrap_or(true),
         reset_password: u.reset_password,
+        state,
     })
 }
 
@@ -846,8 +1216,23 @@ fn resolve_registry(r: raw::RegistryValue) -> Result<RegistryValue> {
         bail!("registry key '{key}': scope 'default-user' only applies to HKCU keys");
     }
 
-    let bad = |what: &str| anyhow!("registry value {key}\\{}: {what}", r.name.as_deref().unwrap_or("(default)"));
-    let data = match (r.kind, r.value) {
+    let state = r.state.unwrap_or_default();
+    let name = r.name.filter(|n| !n.is_empty());
+    let shown = name.clone().unwrap_or_else(|| "(default)".to_owned());
+    let bad = |what: &str| anyhow!("registry value {key}\\{shown}: {what}");
+    if !state.is_present() {
+        if r.value.is_some() {
+            bail!("registry value {key}: 'value' doesn't go with 'state: absent'");
+        }
+        // Without a name, absent deletes the whole key: refuse the top of a hive, where one
+        // typo would take out half the machine.
+        if name.is_none() && key.split('\\').filter(|p| !p.is_empty()).count() < 3 {
+            bail!("registry key {key}: refusing to delete a key this close to the root of the hive");
+        }
+        return Ok(RegistryValue { key, name, kind: r.kind, data: RegistryData::String(String::new()), scope, state });
+    }
+    let value = r.value.ok_or_else(|| anyhow!("registry value {key}: needs a 'value' (or 'state: absent')"))?;
+    let data = match (r.kind, value) {
         (RegistryType::String | RegistryType::ExpandString, raw::Scalar::Str(s)) => RegistryData::String(s),
         (RegistryType::String | RegistryType::ExpandString, raw::Scalar::Int(n)) => RegistryData::String(n.to_string()),
         (RegistryType::MultiString, raw::Scalar::List(v)) => RegistryData::MultiString(v),
@@ -860,7 +1245,7 @@ fn resolve_registry(r: raw::RegistryValue) -> Result<RegistryValue> {
         (kind, _) => return Err(bad(&format!("value does not match type {kind:?}"))),
     };
 
-    Ok(RegistryValue { key, name: r.name.filter(|n| !n.is_empty()), kind: r.kind, data, scope })
+    Ok(RegistryValue { key, name, kind: r.kind, data, scope, state })
 }
 
 fn scalar_to_u64(v: raw::Scalar) -> Option<u64> {
@@ -892,10 +1277,16 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
     let mut env = base.env;
     env.extend(top.env);
 
+    // An entry already there stays as the base wrote it; `state: absent` on top takes it back.
+    let same_dir = |a: &PathEntry, b: &PathEntry| {
+        a.scope == b.scope && eq(a.dir.trim_end_matches('\\'), b.dir.trim_end_matches('\\'))
+    };
     let mut path = base.path;
     for p in top.path {
-        if !path.iter().any(|x| x.scope == p.scope && eq(x.dir.trim_end_matches('\\'), p.dir.trim_end_matches('\\'))) {
-            path.push(p);
+        match path.iter_mut().find(|x| same_dir(x, &p)) {
+            Some(existing) if existing.state != p.state => *existing = p,
+            Some(_) => {}
+            None => path.push(p),
         }
     }
 
@@ -924,10 +1315,57 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
         base.capabilities.into_iter().filter(|b| !top.capabilities.iter().any(|t| eq(&t.name, &b.name))).collect();
     capabilities.extend(top.capabilities);
 
+    let same_cert = |a: &Certificate, b: &Certificate| {
+        a.store == b.store && a.scope == b.scope && a.from == b.from && a.thumbprint == b.thumbprint
+    };
+    let mut certificates: Vec<Certificate> =
+        base.certificates.into_iter().filter(|b| !top.certificates.iter().any(|t| same_cert(t, b))).collect();
+    certificates.extend(top.certificates);
+
+    let mut services: Vec<Service> =
+        base.services.into_iter().filter(|b| !top.services.iter().any(|t| eq(&t.name, &b.name))).collect();
+    services.extend(top.services);
+
+    let mut firewall: Vec<FirewallRule> =
+        base.firewall.into_iter().filter(|b| !top.firewall.iter().any(|t| eq(&t.name, &b.name))).collect();
+    firewall.extend(top.firewall);
+
+    let same_exclusion = |a: &DefenderExclusion, b: &DefenderExclusion| a.kind == b.kind && eq(&a.value, &b.value);
+    let mut defender_exclusions: Vec<DefenderExclusion> = base
+        .defender_exclusions
+        .into_iter()
+        .filter(|b| !top.defender_exclusions.iter().any(|t| same_exclusion(t, b)))
+        .collect();
+    defender_exclusions.extend(top.defender_exclusions);
+
+    let mut remove_apps = base.remove_apps;
+    for a in top.remove_apps {
+        if !remove_apps.iter().any(|x| eq(x, &a)) {
+            remove_apps.push(a);
+        }
+    }
+
     // The strictest requirement wins: a base that needs a newer agent still needs it.
     let requires_agent = base.requires_agent.max(top.requires_agent);
 
-    Groundhogfile { users, features, capabilities, apps, files, env, path, registry, run, verify, requires_agent }
+    Groundhogfile {
+        users,
+        certificates,
+        defender_exclusions,
+        features,
+        capabilities,
+        remove_apps,
+        apps,
+        files,
+        env,
+        path,
+        registry,
+        services,
+        firewall,
+        run,
+        verify,
+        requires_agent,
+    }
 }
 
 /// Convenience for callers: turns user input plus an optional pin into a [`SourceRef`].
@@ -947,7 +1385,7 @@ mod tests {
     fn load_with(fetcher: &MapFetcher, root: &str, bundle_dir: &Path) -> Result<Loaded> {
         let cache = Cache::default();
         let content = ContentStore { fetcher, cache: &cache };
-        let loader = Loader { content: &content, bundle_dir: bundle_dir.to_path_buf() };
+        let loader = Loader::new(&content, bundle_dir.to_path_buf());
         loader.load(&source_ref(root, None, bundle_dir)?)
     }
 
@@ -985,7 +1423,17 @@ run:
         let loaded = load_with(&f, "https://cfg.test/dev/groundhog.yaml", dir.path()).unwrap();
         let g = loaded.file;
 
-        assert_eq!(g.apps[0], App::Winget { id: "git.git".into(), version: None, args: None, timeout_ms: None });
+        assert_eq!(
+            g.apps[0],
+            App::Winget {
+                id: "git.git".into(),
+                version: None,
+                args: None,
+                timeout_ms: None,
+                upgrade: false,
+                state: Presence::Present
+            }
+        );
         let App::Url { url, .. } = &g.apps[1] else { panic!() };
         assert_eq!(url.as_str(), "https://cfg.test/dl/tool.msi");
         assert_eq!(g.files[0].from.as_ref().unwrap().as_str(), "https://cfg.test/dev/config/.gitconfig");
@@ -1303,7 +1751,7 @@ capabilities:
         let bad = [
             ("features: [{ name: X, remove-payload: true }]", "only applies with 'state: disabled'"),
             ("features: [{ name: X, state: disabled, source: C:/x }]", "only apply when enabling"),
-            ("features: [{ name: X, source: 'https://x.test/fod.zip' }]", "folders or shares"),
+            ("features: [{ name: X, source: 'ftp://x.test/fod.zip' }]", "must be http(s)"),
             ("features: [{ name: X, source: relative\\sxs }]", "only works when the Groundhogfile is a local file"),
             ("capabilities: [{ name: X, state: removed, limit-access: true }]", "only apply when adding"),
             ("features: [{ name: X, stat: enabled }]", "unknown field `stat`"),
@@ -1313,6 +1761,134 @@ capabilities:
             let err = format!("{:#}", load_with(&f, "https://cfg.test/b.yaml", dir.path()).unwrap_err());
             assert!(err.contains(want), "{yaml}: expected '{want}' in: {err}");
         }
+    }
+
+    #[test]
+    fn new_sections_and_removal_parse() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/g.yaml",
+                r#"
+users:
+  - { name: old-account, state: absent }
+certificates:
+  - from: corp-root.cer
+  - { thumbprint: "aa bb cc dd ee ff 00 11 22 33 44 55 66 77 88 99 aa bb cc dd", store: ca, state: absent }
+defender-exclusions:
+  - C:\src
+  - process: devenv.exe
+  - { extension: .obj, state: absent }
+remove-apps: [Microsoft.BingNews, Clipchamp.*]
+apps:
+  - { id: Old.App, state: absent }
+  - { id: Git.Git, upgrade: true }
+files:
+  - { to: C:\old\thing, state: absent }
+env:
+  OLD: { state: absent }
+path:
+  - { dir: C:\old\bin, state: absent }
+registry:
+  - { key: HKCU\Software\Old\Sub, state: absent }
+  - { key: HKCU\Software\X, name: Gone, state: absent }
+services:
+  - { name: Spooler, startup: disabled, status: stopped }
+firewall:
+  - { name: Deskhand, port: 8791 }
+  - { name: Web, port: [80, 443], profile: [domain, private], remote: LocalSubnet }
+  - { name: Old rule, state: absent }
+"#,
+            )
+            .with("https://cfg.test/corp-root.cer", "certificate bytes");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap().file;
+        assert_eq!(g.users[0].state, Presence::Absent);
+        assert_eq!(g.certificates[0].store, CertStore::Root);
+        assert!(g.certificates[0].resolved.is_some(), "an unpinned certificate is hashed at load");
+        assert_eq!(g.certificates[1].thumbprint.as_deref(), Some("AABBCCDDEEFF00112233445566778899AABBCCDD"));
+        let kinds: Vec<ExclusionKind> = g.defender_exclusions.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [ExclusionKind::Path, ExclusionKind::Process, ExclusionKind::Extension]);
+        assert_eq!(g.remove_apps, ["Microsoft.BingNews", "Clipchamp.*"]);
+        assert!(matches!(&g.apps[0], App::Winget { state: Presence::Absent, .. }));
+        assert!(matches!(&g.apps[1], App::Winget { upgrade: true, .. }));
+        assert_eq!(g.files[0].state, Presence::Absent);
+        assert_eq!(g.env["OLD"].state, Presence::Absent);
+        assert_eq!(g.path[0].state, Presence::Absent);
+        assert!(g.registry.iter().all(|r| r.state == Presence::Absent));
+        assert_eq!(g.firewall[0].ports.as_deref(), Some("8791"));
+        assert_eq!(
+            (g.firewall[1].ports.as_deref(), g.firewall[1].profile.as_str()),
+            (Some("80,443"), "domain,private")
+        );
+        assert_eq!(g.firewall[2].state, Presence::Absent);
+        assert_eq!(g.services[0].startup, Some(crate::model::StartupType::Disabled));
+
+        let dir = tempfile::tempdir().unwrap();
+        for (bad, why) in [
+            ("apps: [{ id: x, url: 'https://x.test/a.msi', state: absent }]", "only applies to winget apps"),
+            ("apps: [{ id: x, version: '1.0', upgrade: true }]", "not both"),
+            ("files: [{ to: C:\\x, content: y, state: absent }]", "only needs 'to'"),
+            ("env: { A: { value: x, state: absent } }", "doesn't go with"),
+            ("registry: [{ key: HKLM\\SOFTWARE, state: absent }]", "close to the root"),
+            ("registry: [{ key: HKCU\\Software\\X, name: N }]", "needs a 'value'"),
+            ("users: [{ name: a, groups: [Users], state: absent }]", "only needs 'name'"),
+            ("certificates: [{ from: a.cer, scope: user }]", "use scope: machine"),
+            ("certificates: [{ thumbprint: 'AABB' , state: absent }]", "40 hex"),
+            ("certificates: [{ thumbprint: 'AABBCCDDEEFF00112233445566778899AABBCCDD' }]", "needs 'from'"),
+            ("services: [{ name: X }]", "'startup', 'status' or both"),
+            ("firewall: [{ name: X, port: 'eighty' }]", "ports look like"),
+            ("firewall: [{ name: X, port: 80, protocol: any }]", "need protocol tcp or udp"),
+            ("firewall: [{ name: X, port: 80, state: absent }]", "only needs 'name'"),
+            ("firewall: [{ name: X, profile: work }]", "isn't any, domain"),
+            ("defender-exclusions: [{ path: a, process: b }]", "one of 'path'"),
+        ] {
+            let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
+            let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn conditions_and_variables_apply_across_extends() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/lib.yaml",
+                "vars: { port: '8791', name: lib }\nfirewall: [{ name: '${var:name}', port: '${var:port}' }]\npath: ['C:\\Kits\\${var:arch}']",
+            )
+            .with(
+                "https://cfg.test/top.yaml",
+                "extends: lib.yaml\nvars: { port: '9000' }\napps:\n  - always\n  - { id: arm-tool, when: { arch: arm64 } }\n  - { id: new-tool, when: { build: '>=26100' } }",
+            );
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::default();
+        let content = ContentStore { fetcher: &f, cache: &cache };
+        let facts = Facts { arch: "x64".into(), build: 26100, os: "client".into() };
+        let load = |vars: &[(&str, &str)]| {
+            let loader = Loader::new(&content, dir.path().join("b"))
+                .with_facts(facts.clone())
+                .with_vars(vars.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect());
+            loader.load(&source_ref("https://cfg.test/top.yaml", None, dir.path()).unwrap())
+        };
+        let g = load(&[]).unwrap().file;
+        assert_eq!(g.firewall[0].ports.as_deref(), Some("9000"), "the top file overrides the library's default");
+        assert_eq!(g.firewall[0].name, "lib");
+        assert_eq!(g.path[0].dir, "C:\\Kits\\x64", "built-in arch");
+        let ids: Vec<&str> = g.apps.iter().map(App::id).collect();
+        assert_eq!(ids, ["always", "new-tool"], "the arm64-only app is dropped on x64");
+
+        let g = load(&[("port", "1234")]).unwrap().file;
+        assert_eq!(g.firewall[0].ports.as_deref(), Some("1234"), "--var wins over every file");
+        let err = format!("{:#}", load(&[("arch", "arm64")]).unwrap_err());
+        assert!(err.contains("built-in variable"), "{err}");
+
+        let f = MapFetcher::default().with("https://cfg.test/u.yaml", "path: ['${var:nope}']");
+        let content = ContentStore { fetcher: &f, cache: &cache };
+        let loader = Loader::new(&content, dir.path().join("c"));
+        let err = format!(
+            "{:#}",
+            loader.load(&source_ref("https://cfg.test/u.yaml", None, dir.path()).unwrap()).unwrap_err()
+        );
+        assert!(err.contains("unknown variable 'nope'"), "{err}");
     }
 
     #[test]
@@ -1386,8 +1962,11 @@ path:
         );
         let dir = tempfile::tempdir().unwrap();
         let g = load_with(&f, "https://cfg.test/g.yaml", dir.path()).unwrap().file;
-        assert_eq!(g.env["A"], EnvVar { value: "user-value".into(), scope: EnvScope::User });
-        assert_eq!(g.env["B"], EnvVar { value: "machine-value".into(), scope: EnvScope::Machine });
+        assert_eq!(g.env["A"], EnvVar { value: "user-value".into(), scope: EnvScope::User, state: Presence::Present });
+        assert_eq!(
+            g.env["B"],
+            EnvVar { value: "machine-value".into(), scope: EnvScope::Machine, state: Presence::Present }
+        );
         let scopes: Vec<_> = g.path.iter().map(|p| (p.dir.as_str(), p.scope)).collect();
         assert_eq!(
             scopes,
@@ -1423,7 +2002,8 @@ path:
                 &Url::parse(&format!("groundhog:{}", name.trim_end_matches(".groundhog.yaml"))).unwrap(),
             )
             .unwrap_or_else(|e| panic!("{name}: {e:#}"));
-            let mut raw = parse(&std::fs::read(&path).unwrap(), &url).unwrap_or_else(|e| panic!("{e:#}"));
+            let mut raw = parse(&std::fs::read(&path).unwrap(), &url, &BTreeMap::new(), &Facts::default())
+                .unwrap_or_else(|e| panic!("{e:#}"));
             for base in std::mem::take(&mut raw.extends).into_vec() {
                 let base = resolve_source_ref(&url, base).unwrap();
                 let file = base.url.path_segments().unwrap().next_back().unwrap().to_owned();
@@ -1511,7 +2091,7 @@ apps: [c]",
         let f = MapFetcher::default().with("https://github.test/devbox/main.zip", zip_bytes);
         let cache = Cache::default();
         let content = ContentStore { fetcher: &f, cache: &cache };
-        let loader = Loader { content: &content, bundle_dir: dir.path().join("bundles") };
+        let loader = Loader::new(&content, dir.path().join("bundles"));
         let r = SourceRef { url: Url::parse("https://github.test/devbox/main.zip").unwrap(), sha256: Some(sha) };
         let loaded = loader.load(&r).unwrap();
         assert_eq!(loaded.file.apps[0].id(), "git.git");

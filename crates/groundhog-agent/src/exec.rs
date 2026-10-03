@@ -7,11 +7,11 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use groundhog_core::archive;
 use groundhog_core::content::ContentStore;
-use groundhog_core::engine::{Action, Executor, Outcome, Step};
+use groundhog_core::engine::{Action, Executor, Outcome, Probe, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
-    App, Capability, EnvScope, Feature, FileCopy, HiveScope, Password, RegistryData, RegistryType, RegistryValue,
-    RunAction, Shell, User,
+    App, Capability, Certificate, EnvScope, Feature, FileCopy, HiveScope, Password, RegistryData, RegistryType,
+    RegistryValue, RunAction, Shell, User,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
@@ -74,30 +74,55 @@ impl Executor for WinExecutor<'_> {
         let log = &mut |line: &str| reporter.log(&format!("    {line}"));
         match &step.action {
             Action::EnsureWinget => self.ensure_winget(log),
-            Action::App(App::Winget { id, version, args, timeout_ms }) => {
-                self.winget_install(id, version.as_deref(), args.as_deref(), *timeout_ms, log)
+            Action::App(App::Winget { id, version, args, timeout_ms, upgrade, state }) => {
+                let want = WingetWant { version: version.as_deref(), upgrade: *upgrade, present: state.is_present() };
+                self.winget_app(id, want, args.as_deref(), *timeout_ms, log)
             }
             Action::App(App::Url { url, sha256, resolved, args, timeout_ms, .. }) => {
                 self.url_install(url, sha256.as_deref().or(resolved.as_deref()), args.as_deref(), *timeout_ms, log)
             }
             Action::File(f) => self.copy(f, log),
-            Action::Env { name, value, scope } => {
-                let changed = env::set_var(env_scope(*scope), name, &fill(&self.secrets, value)?)?;
+            Action::Env { name, value, scope, state } => {
+                let changed = if state.is_present() {
+                    env::set_var(env_scope(*scope), name, &fill(&self.secrets, value)?)?
+                } else {
+                    env::remove_var(env_scope(*scope), name)?
+                };
                 if changed {
                     env::broadcast_change();
                 }
                 Ok(Outcome::Done { changed })
             }
-            Action::Path { dir, scope } => {
-                let changed = env::add_path(env_scope(*scope), dir)?;
+            Action::Path { dir, scope, state } => {
+                let changed = if state.is_present() {
+                    env::add_path(env_scope(*scope), dir)?
+                } else {
+                    env::remove_path(env_scope(*scope), dir)?
+                };
                 if changed {
                     env::broadcast_change();
                 }
                 Ok(Outcome::Done { changed })
             }
+            Action::Registry(r) if !r.state.is_present() => delete_registry(r),
             Action::Registry(r) => set_registry(&fill_registry(&self.secrets, r)?),
             Action::Run(r) => self.run_action(r, log),
+            Action::User(u) if !u.state.is_present() => {
+                if !accounts::user_exists(&u.name)? {
+                    return Ok(Outcome::Done { changed: false });
+                }
+                accounts::delete_user(&u.name)?;
+                log(&format!("deleted {}", u.name));
+                Ok(Outcome::Done { changed: true })
+            }
             Action::User(u) => self.ensure_user(u, log),
+            Action::Certificate(c) => self.certificate(c, false, log).map(|changed| Outcome::Done { changed }),
+            Action::Service(s) => crate::ensure::service(s, false, log).map(|changed| Outcome::Done { changed }),
+            Action::Firewall(r) => crate::ensure::firewall(r, false, log).map(|changed| Outcome::Done { changed }),
+            Action::Defender(e) => crate::ensure::defender(e, false, log).map(|changed| Outcome::Done { changed }),
+            Action::RemoveApp { name } => {
+                crate::ensure::remove_app(name, false, log).map(|changed| Outcome::Done { changed })
+            }
             Action::Feature(f) => self.ensure_feature(f, log),
             Action::Capability(c) => self.ensure_capability(c, log),
             Action::Verify(c) => {
@@ -106,6 +131,115 @@ impl Executor for WinExecutor<'_> {
             }
         }
     }
+
+    fn check(&mut self, step: &Step) -> Result<Probe> {
+        let quiet = &mut |_: &str| {};
+        let would = |changes: bool| if changes { Probe::WouldChange } else { Probe::Satisfied };
+        Ok(match &step.action {
+            Action::EnsureWinget => would(winget::locate().is_none()),
+            Action::App(App::Winget { id, version, upgrade, state, .. }) => {
+                let Some(winget) = winget::locate() else { return Ok(Probe::WouldChange) };
+                match (installed_version(&winget, id)?, state.is_present()) {
+                    (None, present) => would(present),
+                    (Some(_), false) => Probe::WouldChange,
+                    (Some(have), true) => match version {
+                        Some(pin) => would(&have != pin),
+                        None if *upgrade => would(upgrade_available(&winget, id)?),
+                        None => Probe::Satisfied,
+                    },
+                }
+            }
+            Action::App(App::Url { .. }) => Probe::Unknown,
+            Action::File(f) => self.check_file(f)?,
+            Action::Env { name, value, scope, state } => {
+                let scope = env_scope(*scope);
+                if state.is_present() {
+                    match fill(&self.secrets, value) {
+                        Ok(value) => would(!env::var_matches(scope, name, &value)),
+                        Err(_) => Probe::Unknown, // a secret this preview wasn't given
+                    }
+                } else {
+                    would(env::var_exists(scope, name))
+                }
+            }
+            Action::Path { dir, scope, state } => {
+                would(env::path_contains(env_scope(*scope), dir)? != state.is_present())
+            }
+            Action::Registry(r) => check_registry(r, &self.secrets)?,
+            Action::Run(_) | Action::Verify(_) => Probe::WillRun,
+            Action::User(u) => would(accounts::user_exists(&u.name)? != u.state.is_present()),
+            Action::Feature(f) => {
+                self.dism()?;
+                let state = self.dism.as_ref().expect("opened").feature_state(&f.name)?;
+                would(state.is_on() != f.enabled)
+            }
+            Action::Capability(c) => {
+                self.dism()?;
+                let state = self.dism.as_ref().expect("opened").capability_state(&c.name)?;
+                would(state.is_on() != c.present)
+            }
+            Action::Certificate(c) => would(self.certificate(c, true, quiet)?),
+            Action::Service(s) => would(crate::ensure::service(s, true, quiet)?),
+            Action::Firewall(r) => would(crate::ensure::firewall(r, true, quiet)?),
+            Action::Defender(e) => would(crate::ensure::defender(e, true, quiet)?),
+            Action::RemoveApp { name } => would(crate::ensure::remove_app(name, true, quiet)?),
+        })
+    }
+}
+
+impl WinExecutor<'_> {
+    fn check_file(&self, f: &FileCopy) -> Result<Probe> {
+        let dest = PathBuf::from(env::expand_path(&f.to)?);
+        if !f.state.is_present() {
+            return Ok(if dest.exists() { Probe::WouldChange } else { Probe::Satisfied });
+        }
+        if let Some(content) = &f.content {
+            let Ok(text) = fill(&self.secrets, content) else { return Ok(Probe::Unknown) };
+            let same = std::fs::read(&dest).is_ok_and(|current| current == text.as_bytes());
+            return Ok(if same { Probe::Satisfied } else { Probe::WouldChange });
+        }
+        // A file compares by hash, known without downloading anything. An archive to unpack
+        // or a folder to copy can't be compared that cheaply.
+        match (f.extract, f.sha256.as_deref().or(f.resolved.as_deref())) {
+            (false, Some(hash)) if !dest.is_dir() => {
+                let same = dest.is_file() && groundhog_core::fetch::sha256_file(&dest).is_ok_and(|h| h == hash);
+                Ok(if same { Probe::Satisfied } else { Probe::WouldChange })
+            }
+            _ => Ok(if dest.exists() { Probe::Unknown } else { Probe::WouldChange }),
+        }
+    }
+}
+
+fn check_registry(r: &RegistryValue, secrets: &Secrets) -> Result<Probe> {
+    let (root, sub) = registry::split_key(&r.key)?;
+    let filled = match fill_registry(secrets, r) {
+        Ok(f) => f,
+        Err(_) => return Ok(Probe::Unknown),
+    };
+    let mut changes = false;
+    for scope in &r.scope {
+        let hive = match scope {
+            HiveScope::CurrentUser => None,
+            HiveScope::DefaultUser => Some(DefaultUserHive::load()?),
+        };
+        let root = hive.as_ref().map_or(&root, |h| h.root());
+        changes |= if !r.state.is_present() {
+            match &r.name {
+                Some(name) => registry::value_exists(root, &sub, Some(name)),
+                None => registry::key_exists(root, &sub),
+            }
+        } else {
+            !registry::value_matches(root, &sub, r.name.as_deref(), &registry_data(&filled))
+        };
+    }
+    Ok(if changes { Probe::WouldChange } else { Probe::Satisfied })
+}
+
+/// Whether winget knows a newer version of an installed package.
+fn upgrade_available(winget: &Path, id: &str) -> Result<bool> {
+    let args =
+        ["list", "--id", id, "--exact", "--upgrade-available", "--accept-source-agreements", "--disable-interactivity"];
+    Ok(Proc { capture_stdout: true, ..Proc::new(winget).args(args) }.run(&mut |_| {})?.code == 0)
 }
 
 impl WinExecutor<'_> {
@@ -113,15 +247,19 @@ impl WinExecutor<'_> {
     /// unpinned references, the hash resolved at load time. Either way the bytes must match,
     /// so a "latest" URL that moves on mid-run fails instead of installing a different build.
     fn download(&self, kind: &str, url: &Url, sha256: Option<&str>, log: &mut dyn FnMut(&str)) -> Result<PathBuf> {
-        let fetched = self.content.get(url, sha256)?;
+        let fetched = self.content.get_file(url, sha256)?;
         if fetched.from_cache {
             log("using cached copy");
         }
+        // Installers care about their own file name (and extension), so each gets a folder
+        // named for its content. A hard link costs nothing on the same volume.
         let dir = self.work_dir.join(kind).join(&fetched.sha256[..16]);
         let path = dir.join(file_name(url));
         if !path.is_file() {
             std::fs::create_dir_all(&dir)?;
-            std::fs::write(&path, &fetched.bytes).with_context(|| format!("writing {}", path.display()))?;
+            if std::fs::hard_link(&fetched.path, &path).is_err() {
+                std::fs::copy(&fetched.path, &path).with_context(|| format!("writing {}", path.display()))?;
+            }
         }
         Ok(path)
     }
@@ -141,39 +279,58 @@ impl WinExecutor<'_> {
         Ok(Outcome::Done { changed: true })
     }
 
-    fn winget_install(
+    /// Installs, upgrades, moves to a pinned version, or uninstalls a winget package,
+    /// depending on what's there now.
+    fn winget_app(
         &mut self,
         id: &str,
-        version: Option<&str>,
+        want: WingetWant,
         args: Option<&str>,
         timeout_ms: Option<u64>,
         log: &mut dyn FnMut(&str),
     ) -> Result<Outcome> {
         let winget = self.winget()?.to_path_buf();
         let common = ["--id", id, "--exact", "--accept-source-agreements", "--disable-interactivity"];
+        let installed = installed_version(&winget, id)?;
 
-        let listed = Proc::new(&winget).args(["list"]).args(common).run(&mut |_| {})?;
-        if listed.code == 0 {
-            log("already installed");
-            return Ok(Outcome::Done { changed: false });
-        }
-
-        let mut install =
-            Proc::new(&winget).args(["install"]).args(common).args(["--silent", "--accept-package-agreements"]);
-        if let Some(v) = version {
-            install = install.args(["--version", v]);
-        }
-        let code = install.raw(args).timeout_ms(timeout_ms).run(log)?.code;
-        match code {
-            0 => Ok(Outcome::Done { changed: true }),
-            codes::PACKAGE_ALREADY_INSTALLED | codes::INSTALL_ALREADY_INSTALLED | codes::UPDATE_NOT_APPLICABLE => {
-                Ok(Outcome::Done { changed: false })
+        if !want.present {
+            if installed.is_none() {
+                return Ok(Outcome::Done { changed: false });
             }
-            codes::INSTALL_REBOOT_REQUIRED_TO_FINISH | codes::INSTALL_REBOOT_INITIATED => Ok(Outcome::RebootRequired),
-            codes::INSTALL_REBOOT_REQUIRED_FOR_INSTALL => Ok(Outcome::RetryAfterReboot),
-            codes::NO_APPLICATIONS_FOUND => bail!("no winget package with id '{id}'"),
-            other => bail!("winget install failed with {other:#010X}"),
+            let code = Proc::new(&winget)
+                .args(["uninstall"])
+                .args(common)
+                .args(["--silent"])
+                .raw(args)
+                .timeout_ms(timeout_ms)
+                .run(log)?
+                .code;
+            return winget_outcome(code, id, "uninstall");
         }
+
+        let mut verb = "install";
+        let mut extra: Vec<&str> = vec!["--silent", "--accept-package-agreements"];
+        match (&installed, want.version, want.upgrade) {
+            (Some(have), Some(pin), _) if have == pin => return Ok(Outcome::Done { changed: false }),
+            (Some(have), Some(pin), _) => {
+                // A different version is installed: move to the pinned one, up or down.
+                log(&format!("installed {have}, pinned {pin}"));
+                extra.extend(["--version", pin, "--force"]);
+            }
+            (Some(_), None, true) => verb = "upgrade",
+            (Some(_), None, false) => {
+                log("already installed");
+                return Ok(Outcome::Done { changed: false });
+            }
+            (None, pin, _) => {
+                if let Some(pin) = pin {
+                    extra.extend(["--version", pin]);
+                }
+            }
+        }
+        let code =
+            Proc::new(&winget).args([verb]).args(common).args(extra).raw(args).timeout_ms(timeout_ms).run(log)?.code;
+        winget_outcome(code, id, verb)
     }
 
     fn url_install(
@@ -218,7 +375,8 @@ impl WinExecutor<'_> {
     fn ensure_feature(&mut self, f: &Feature, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
         let log_path = self.work_dir.join("dism.log");
         let deferred = self.deferred_restart;
-        let session = self.dism()?;
+        self.dism()?;
+        let session = self.dism.as_ref().expect("just opened");
         let state = session.feature_state(&f.name).map_err(|e| explain(e, "feature", &f.name, &log_path))?;
         if state.is_on() == f.enabled {
             self.deferred_restart |= state.is_pending();
@@ -228,7 +386,7 @@ impl WinExecutor<'_> {
             log("Windows servicing is waiting for a restart; retrying after one");
             return Ok(Outcome::RetryAfterReboot);
         }
-        let sources = expand_all(&f.sources)?;
+        let (sources, _mounted) = servicing_sources(self.content, &self.work_dir, &f.sources, log)?;
         let timeout = f.timeout_ms.map(std::time::Duration::from_millis);
         let mut progress = |pct: u32| log(&format!("{pct}%"));
         let result = if f.enabled {
@@ -247,7 +405,8 @@ impl WinExecutor<'_> {
     fn ensure_capability(&mut self, c: &Capability, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
         let log_path = self.work_dir.join("dism.log");
         let deferred = self.deferred_restart;
-        let session = self.dism()?;
+        self.dism()?;
+        let session = self.dism.as_ref().expect("just opened");
         let state = session.capability_state(&c.name).map_err(|e| explain(e, "capability", &c.name, &log_path))?;
         if state.is_on() == c.present {
             self.deferred_restart |= state.is_pending();
@@ -257,7 +416,7 @@ impl WinExecutor<'_> {
             log("Windows servicing is waiting for a restart; retrying after one");
             return Ok(Outcome::RetryAfterReboot);
         }
-        let sources = expand_all(&c.sources)?;
+        let (sources, _mounted) = servicing_sources(self.content, &self.work_dir, &c.sources, log)?;
         let timeout = c.timeout_ms.map(std::time::Duration::from_millis);
         let mut progress = |pct: u32| log(&format!("{pct}%"));
         let result = if c.present {
@@ -276,6 +435,16 @@ impl WinExecutor<'_> {
     /// DISM's return code, the item's state and CBS's own flag can each be the only one to show
     /// a restart is due, so any of them counts. The pre-check makes sure a restart that was
     /// already pending isn't mistaken for ours.
+    /// Adds, or removes, a certificate. A certificate file is fetched like any other download
+    /// (cache first, hash checked).
+    fn certificate(&mut self, c: &Certificate, check: bool, log: &mut dyn FnMut(&str)) -> Result<bool> {
+        let file = match &c.from {
+            Some(from) => Some(self.content.get_file(from, c.sha256.as_deref().or(c.resolved.as_deref()))?.path),
+            None => None,
+        };
+        crate::ensure::certificate(c, file.as_deref(), check, log)
+    }
+
     fn restart_later_if(&mut self, pending: bool) -> Outcome {
         if pending {
             self.deferred_restart = true;
@@ -323,6 +492,9 @@ impl WinExecutor<'_> {
 
     fn copy(&mut self, f: &FileCopy, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
         let dest = PathBuf::from(env::expand_path(&f.to)?);
+        if !f.state.is_present() {
+            return remove_file_or_folder(&dest, log);
+        }
         let Some(from) = &f.from else {
             // Inline content: secrets are filled in here and only here, on the way to `to`.
             let text = fill(&self.secrets, f.content.as_deref().unwrap_or_default())?;
@@ -338,13 +510,13 @@ impl WinExecutor<'_> {
                 return Ok(Outcome::Done { changed: copy_dir(&src, &dest)? });
             }
         }
-        let bytes = self.content.get(from, f.sha256.as_deref().or(f.resolved.as_deref()))?.bytes;
+        let fetched = self.content.get_file(from, f.sha256.as_deref().or(f.resolved.as_deref()))?;
         if f.extract {
-            replace_with_zip(&bytes, &dest, f.strip as usize)?;
+            replace_with_zip(&fetched.path, &dest, f.strip as usize)?;
             log(&format!("unpacked into {}", dest.display()));
             return Ok(Outcome::Done { changed: true });
         }
-        let changed = write_if_different(&dest, &bytes)?;
+        let changed = copy_if_different(&fetched.path, &dest)?;
         if changed {
             log(&format!("wrote {}", dest.display()));
         }
@@ -425,6 +597,132 @@ fn env_scope(scope: EnvScope) -> env::Scope {
     }
 }
 
+/// Deletes a file, or a folder and everything in it. A drive root or a folder Windows itself
+/// depends on is refused: one typo in `to` shouldn't be able to wipe a machine.
+fn remove_file_or_folder(dest: &Path, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
+    refuse_protected(dest)?;
+    let meta = match std::fs::symlink_metadata(dest) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Outcome::Done { changed: false }),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dest.display())),
+    };
+    if meta.is_dir() {
+        std::fs::remove_dir_all(dest).with_context(|| format!("removing {}", dest.display()))?;
+    } else {
+        std::fs::remove_file(dest).with_context(|| format!("removing {}", dest.display()))?;
+    }
+    log(&format!("removed {}", dest.display()));
+    Ok(Outcome::Done { changed: true })
+}
+
+fn refuse_protected(path: &Path) -> Result<()> {
+    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    let target = norm(path);
+    if path.components().count() <= 2 {
+        bail!("refusing to remove {}: too close to the root of the drive", path.display());
+    }
+    let protected = [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "ProgramData",
+        "USERPROFILE",
+        "PUBLIC",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ];
+    for var in protected {
+        if let Ok(dir) = std::env::var(var)
+            && norm(Path::new(&dir)) == target
+        {
+            bail!("refusing to remove {}: it's %{var}%", path.display());
+        }
+    }
+    let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    if target == norm(Path::new(&format!("{system_drive}\\Users"))) {
+        bail!("refusing to remove {}", path.display());
+    }
+    Ok(())
+}
+
+fn delete_registry(r: &RegistryValue) -> Result<Outcome> {
+    let (root, sub) = registry::split_key(&r.key)?;
+    let mut changed = false;
+    for scope in &r.scope {
+        let hive = match scope {
+            HiveScope::CurrentUser => None,
+            HiveScope::DefaultUser => Some(DefaultUserHive::load()?),
+        };
+        let root = hive.as_ref().map_or(&root, |h| h.root());
+        changed |= match &r.name {
+            Some(name) => registry::delete_value(root, &sub, Some(name))?,
+            None => registry::delete_key(root, &sub)?,
+        };
+    }
+    Ok(Outcome::Done { changed })
+}
+
+/// What a winget app entry asks for.
+#[derive(Clone, Copy)]
+struct WingetWant<'a> {
+    version: Option<&'a str>,
+    upgrade: bool,
+    present: bool,
+}
+
+fn winget_outcome(code: i32, id: &str, verb: &str) -> Result<Outcome> {
+    match code {
+        0 => Ok(Outcome::Done { changed: true }),
+        codes::PACKAGE_ALREADY_INSTALLED | codes::INSTALL_ALREADY_INSTALLED | codes::UPDATE_NOT_APPLICABLE => {
+            Ok(Outcome::Done { changed: false })
+        }
+        codes::INSTALL_REBOOT_REQUIRED_TO_FINISH | codes::INSTALL_REBOOT_INITIATED => Ok(Outcome::RebootRequired),
+        codes::INSTALL_REBOOT_REQUIRED_FOR_INSTALL => Ok(Outcome::RetryAfterReboot),
+        codes::NO_APPLICATIONS_FOUND if verb == "uninstall" => Ok(Outcome::Done { changed: false }),
+        codes::NO_APPLICATIONS_FOUND => bail!("no winget package with id '{id}'"),
+        other => bail!("winget {verb} failed with {other:#010X}"),
+    }
+}
+
+/// The installed version of a winget package, `None` when it isn't installed. The version is
+/// read from `winget list`: the token after the id on the package's row (`Unknown` and
+/// `< 1.2` are what winget prints when it can't tell exactly).
+fn installed_version(winget: &Path, id: &str) -> Result<Option<String>> {
+    let out = Proc {
+        capture_stdout: true,
+        ..Proc::new(winget).args([
+            "list",
+            "--id",
+            id,
+            "--exact",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ])
+    }
+    .run(&mut |_| {})?;
+    if out.code != 0 {
+        return Ok(None);
+    }
+    Ok(Some(version_from_list(&out.stdout, id).unwrap_or_default()))
+}
+
+fn version_from_list(stdout: &str, id: &str) -> Option<String> {
+    for line in stdout.lines() {
+        // winget redraws a progress spinner with carriage returns; the row is after the last.
+        let line = line.rsplit('\r').next().unwrap_or(line);
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if let Some(i) = tokens.iter().position(|t| t.eq_ignore_ascii_case(id)) {
+            let version = tokens.get(i + 1)?;
+            return Some(match *version {
+                "<" | ">" => format!("{version} {}", tokens.get(i + 2).unwrap_or(&"")),
+                v => v.to_owned(),
+            });
+        }
+    }
+    None
+}
+
 /// Puts secret values in place of `${secret:NAME}` (and undoes `$${secret:` escapes).
 fn fill(secrets: &Secrets, s: &str) -> Result<String> {
     if !secret::mentions(s) {
@@ -486,8 +784,101 @@ fn settled(state: dism::State, log: &mut dyn FnMut(&str)) -> Outcome {
     }
 }
 
-fn expand_all(paths: &[String]) -> Result<Vec<String>> {
-    paths.iter().map(|p| env::expand_path(p)).collect()
+/// Feature and capability sources as DISM wants them: folders. Folders and shares pass
+/// through; a `.zip` (local or at a URL) is fetched and unpacked once per content; an `.iso`
+/// is mounted for as long as the returned guards live, and its usual payload folders offered.
+fn servicing_sources(
+    content: &ContentStore,
+    work_dir: &Path,
+    sources: &[String],
+    log: &mut dyn FnMut(&str),
+) -> Result<(Vec<String>, Vec<MountedIso>)> {
+    let mut folders = Vec::new();
+    let mut mounted = Vec::new();
+    for source in sources {
+        let source = env::expand_path(source)?;
+        let lower = source.to_ascii_lowercase();
+        let is_url = lower.starts_with("http://") || lower.starts_with("https://");
+        let path_part = lower.split(['?', '#']).next().unwrap_or_default();
+        let (is_zip, is_iso) = (path_part.ends_with(".zip"), path_part.ends_with(".iso"));
+        if !(is_url || is_zip || is_iso) {
+            folders.push(source);
+            continue;
+        }
+        let url = if is_url {
+            Url::parse(&source).with_context(|| format!("source '{source}'"))?
+        } else {
+            Url::from_file_path(&source).map_err(|_| anyhow::anyhow!("source '{source}' isn't a full path"))?
+        };
+        if is_url {
+            log(&format!("fetching {source}"));
+        }
+        let fetched = content.get_file(&url, None)?;
+        let dir = work_dir.join("sources").join(&fetched.sha256[..16]);
+        if is_iso {
+            // Mount-DiskImage goes by the file's extension, which the object store doesn't keep.
+            std::fs::create_dir_all(&dir)?;
+            let iso = dir.join("source.iso");
+            if !iso.exists() && std::fs::hard_link(&fetched.path, &iso).is_err() {
+                std::fs::copy(&fetched.path, &iso).with_context(|| format!("copying {}", iso.display()))?;
+            }
+            let mount = MountedIso::mount(&iso)?;
+            log(&format!("mounted {source} as {}:", mount.letter));
+            for sub in ["", "sources\\sxs", "LanguagesAndOptionalFeatures"] {
+                let folder = format!("{}:\\{sub}", mount.letter);
+                if Path::new(&folder).is_dir() {
+                    folders.push(folder);
+                }
+            }
+            mounted.push(mount);
+        } else {
+            let marker = dir.join(".groundhog-unpacked");
+            if !marker.exists() {
+                if dir.exists() {
+                    std::fs::remove_dir_all(&dir)?;
+                }
+                std::fs::create_dir_all(&dir)?;
+                log(&format!("unpacking {source}"));
+                archive::unzip_file(&fetched.path, &dir, 0)?;
+                std::fs::write(&marker, b"")?;
+            }
+            folders.push(dir.to_string_lossy().into_owned());
+        }
+    }
+    Ok((folders, mounted))
+}
+
+/// An ISO mounted for one step; dismounted when dropped.
+struct MountedIso {
+    path: PathBuf,
+    letter: char,
+}
+
+impl MountedIso {
+    fn mount(iso: &Path) -> Result<Self> {
+        let script = "(Mount-DiskImage -ImagePath $env:GH_ISO -PassThru | Get-Volume).DriveLetter";
+        let proc = Proc {
+            env: vec![("GH_ISO".into(), iso.to_string_lossy().into_owned())],
+            capture_stdout: true,
+            ..powershell(Shell::Powershell, script)
+        };
+        let out = proc.run(&mut |_| {})?;
+        let letter = out.stdout.trim().chars().next().filter(char::is_ascii_alphabetic);
+        match (out.code, letter) {
+            (0, Some(letter)) => Ok(MountedIso { path: iso.to_path_buf(), letter }),
+            _ => bail!("couldn't mount {} (exit {}): {}", iso.display(), out.code, out.stdout.trim()),
+        }
+    }
+}
+
+impl Drop for MountedIso {
+    fn drop(&mut self) {
+        let proc = Proc {
+            env: vec![("GH_ISO".into(), self.path.to_string_lossy().into_owned())],
+            ..powershell(Shell::Powershell, "Dismount-DiskImage -ImagePath $env:GH_ISO | Out-Null")
+        };
+        let _ = proc.run(&mut |_| {});
+    }
 }
 
 /// "Servicing is busy until a restart" means try again after one; anything else is a failure.
@@ -526,14 +917,18 @@ fn explain(e: anyhow::Error, kind: &str, name: &str, log_path: &Path) -> anyhow:
     if hint.is_empty() { anyhow::anyhow!("{e:#}; {logs}") } else { anyhow::anyhow!("{e:#}: {hint}; {logs}") }
 }
 
-fn set_registry(r: &RegistryValue) -> Result<Outcome> {
-    let data = match (&r.data, r.kind) {
+fn registry_data(r: &RegistryValue) -> Data<'_> {
+    match (&r.data, r.kind) {
         (RegistryData::String(s), RegistryType::ExpandString) => Data::ExpandString(s),
         (RegistryData::String(s), _) => Data::String(s),
         (RegistryData::MultiString(v), _) => Data::MultiString(v),
         (RegistryData::Dword(n), _) => Data::Dword(*n),
         (RegistryData::Qword(n), _) => Data::Qword(*n),
-    };
+    }
+}
+
+fn set_registry(r: &RegistryValue) -> Result<Outcome> {
+    let data = registry_data(r);
     let (root, sub) = registry::split_key(&r.key)?;
     let mut changed = false;
     for scope in &r.scope {
@@ -625,6 +1020,26 @@ fn check_exit(code: i32, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Copies `src` over `dest` unless they already match, through a temp file so `dest` is
+/// never half-written. Compares sizes, then hashes, without reading either into memory.
+fn copy_if_different(src: &Path, dest: &Path) -> Result<bool> {
+    let same = match (std::fs::metadata(src), std::fs::metadata(dest)) {
+        (Ok(a), Ok(b)) if a.len() == b.len() => {
+            groundhog_core::fetch::sha256_file(src)? == groundhog_core::fetch::sha256_file(dest)?
+        }
+        _ => false,
+    };
+    if same {
+        return Ok(false);
+    }
+    let dir = dest.parent().context("destination has no parent directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dest.with_extension("groundhog.tmp");
+    std::fs::copy(src, &tmp).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, dest).with_context(|| format!("replacing {}", dest.display()))?;
+    Ok(true)
+}
+
 fn write_if_different(dest: &Path, bytes: &[u8]) -> Result<bool> {
     if std::fs::read(dest).is_ok_and(|current| current == bytes) {
         return Ok(false);
@@ -645,7 +1060,7 @@ fn write_if_different(dest: &Path, bytes: &[u8]) -> Result<bool> {
 /// running from the renamed copy, which is removed once nothing holds it (on this run or a
 /// later one). The rename fails only when a file inside is open without delete sharing, and
 /// then nothing has changed.
-fn replace_with_zip(bytes: &[u8], dest: &Path, strip: usize) -> Result<()> {
+fn replace_with_zip(zip: &Path, dest: &Path, strip: usize) -> Result<()> {
     let name = dest.file_name().context("destination has no folder name")?.to_string_lossy().into_owned();
     let sibling = |suffix: &str| dest.with_file_name(format!("{name}{suffix}"));
     let staging = sibling(".groundhog-new");
@@ -657,7 +1072,7 @@ fn replace_with_zip(bytes: &[u8], dest: &Path, strip: usize) -> Result<()> {
         std::fs::remove_dir_all(&staging).with_context(|| format!("removing leftover {}", staging.display()))?;
     }
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
-    if let Err(e) = archive::unzip_stripped(bytes, &staging, strip) {
+    if let Err(e) = archive::unzip_file(zip, &staging, strip) {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
@@ -696,7 +1111,7 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<bool> {
         if entry.file_type()?.is_dir() {
             changed |= copy_dir(&entry.path(), &target)?;
         } else {
-            changed |= write_if_different(&target, &std::fs::read(entry.path())?)?;
+            changed |= copy_if_different(&entry.path(), &target)?;
         }
     }
     Ok(changed)
@@ -705,6 +1120,26 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_installed_version_from_winget_list() {
+        let out = "   - \r   \\ \r\nName         Id       Version     Available Source\n--------------------------------------------------\nGit          Git.Git  2.47.0      2.48.1    winget\n";
+        assert_eq!(version_from_list(out, "git.git").as_deref(), Some("2.47.0"));
+        let fuzzy = "Name Id Version\n------\nTool Vendor.Tool < 1.2.3 winget\n";
+        assert_eq!(version_from_list(fuzzy, "Vendor.Tool").as_deref(), Some("< 1.2.3"));
+        assert_eq!(version_from_list("No installed package found", "Git.Git"), None);
+    }
+
+    #[test]
+    fn refuses_to_remove_roots_and_system_folders() {
+        for p in [r"C:\", r"C:\Windows", r"C:\Users", r"C:\Program Files", r"C:\Program Files\"] {
+            assert!(refuse_protected(Path::new(p)).is_err(), "{p}");
+        }
+        let profile = std::env::var("USERPROFILE").unwrap();
+        assert!(refuse_protected(Path::new(&profile)).is_err());
+        assert!(refuse_protected(Path::new(r"C:\tools\old")).is_ok());
+        assert!(refuse_protected(Path::new(r"C:\Program Files\Old Tool")).is_ok());
+    }
 
     fn secrets(pairs: &[(&str, &str)]) -> Secrets {
         pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
@@ -752,6 +1187,7 @@ mod tests {
             kind: RegistryType::String,
             data: RegistryData::MultiString(vec!["a=${secret:K}".into(), "b".into()]),
             scope: vec![HiveScope::CurrentUser],
+            state: groundhog_core::model::Presence::Present,
         };
         assert_eq!(
             fill_registry(&s, &r).unwrap().data,
@@ -763,6 +1199,7 @@ mod tests {
 
     #[test]
     fn replacing_a_folder_drops_stale_files_and_survives_a_running_program() {
+        let zips = tempfile::tempdir().unwrap();
         let zip = |files: &[(&str, &str)]| {
             use std::io::Write;
             let mut bytes = Vec::new();
@@ -772,7 +1209,9 @@ mod tests {
                 z.write_all(body.as_bytes()).unwrap();
             }
             z.finish().unwrap();
-            bytes
+            let path = zips.path().join(format!("{}.zip", files[0].1));
+            std::fs::write(&path, bytes).unwrap();
+            path
         };
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("app");

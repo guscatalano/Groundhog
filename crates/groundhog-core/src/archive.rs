@@ -15,7 +15,17 @@ pub fn unzip(bytes: &[u8], dir: &Path) -> Result<()> {
 /// `tar --strip-components` does. GitHub source archives wrap everything in a
 /// `repo-<ref>\` folder whose name changes with every version; `strip: 1` removes it.
 pub fn unzip_stripped(bytes: &[u8], dir: &Path, strip: usize) -> Result<()> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).context("not a valid zip file")?;
+    unzip_from(Cursor::new(bytes), dir, strip)
+}
+
+/// Unpacks a zip file on disk without reading it into memory.
+pub fn unzip_file(zip: &Path, dir: &Path, strip: usize) -> Result<()> {
+    let file = std::fs::File::open(zip).with_context(|| format!("opening {}", zip.display()))?;
+    unzip_from(std::io::BufReader::new(file), dir, strip)
+}
+
+fn unzip_from<R: std::io::Read + std::io::Seek>(reader: R, dir: &Path, strip: usize) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(reader).context("not a valid zip file")?;
     let mut written = 0usize;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;

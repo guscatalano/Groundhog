@@ -18,18 +18,180 @@ pub const CURRENT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Groundhogfile {
     pub users: Vec<User>,
+    pub certificates: Vec<Certificate>,
+    pub defender_exclusions: Vec<DefenderExclusion>,
     pub features: Vec<Feature>,
     pub capabilities: Vec<Capability>,
+    /// Built-in Store apps to remove, by package name (wildcards allowed).
+    pub remove_apps: Vec<String>,
     pub apps: Vec<App>,
     pub files: Vec<FileCopy>,
     pub env: BTreeMap<String, EnvVar>,
     pub path: Vec<PathEntry>,
     pub registry: Vec<RegistryValue>,
+    pub services: Vec<Service>,
+    pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
     pub verify: Vec<Check>,
     /// The oldest agent that understands this file (the highest `agent:` across `extends`).
     #[serde(skip)]
     pub requires_agent: Option<crate::update::Version>,
+}
+
+/// Whether something should exist. Left out of the serialized form when `present`, so the
+/// step ids of everything written before `state: absent` existed don't change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Presence {
+    #[default]
+    Present,
+    Absent,
+}
+
+impl Presence {
+    pub fn is_present(&self) -> bool {
+        *self == Presence::Present
+    }
+}
+
+/// A certificate to trust (or distrust, or remove).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Certificate {
+    /// The certificate file (`.cer`/`.crt`, DER or PEM). `None` when removing by thumbprint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<Url>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Content hash found at load time when `sha256` is not pinned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    /// Upper-case hex SHA-1 thumbprint, for removal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbprint: Option<String>,
+    pub store: CertStore,
+    pub scope: CertScope,
+    #[serde(skip_serializing_if = "Presence::is_present")]
+    pub state: Presence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertStore {
+    /// Trusted root authorities.
+    Root,
+    /// Intermediate authorities.
+    Ca,
+    /// Personal.
+    My,
+    TrustedPeople,
+    TrustedPublisher,
+    /// Explicitly distrusted.
+    Disallowed,
+}
+
+impl CertStore {
+    /// The store's name in the Windows API (`Cert:\LocalMachine\<name>`).
+    pub fn system_name(self) -> &'static str {
+        match self {
+            CertStore::Root => "Root",
+            CertStore::Ca => "CA",
+            CertStore::My => "My",
+            CertStore::TrustedPeople => "TrustedPeople",
+            CertStore::TrustedPublisher => "TrustedPublisher",
+            CertStore::Disallowed => "Disallowed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertScope {
+    #[default]
+    Machine,
+    User,
+}
+
+/// A Windows service's start type and, optionally, whether it runs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Service {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup: Option<StartupType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<ServiceState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StartupType {
+    Automatic,
+    /// Automatic, started shortly after boot.
+    Delayed,
+    Manual,
+    Disabled,
+}
+
+/// A Windows Firewall rule, found again by its name.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FirewallRule {
+    pub name: String,
+    /// Ports as Windows writes them: `8791`, `80,443`, `8000-8100`. Empty: any port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ports: Option<String>,
+    pub protocol: FirewallProtocol,
+    pub direction: FirewallDirection,
+    pub action: FirewallAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    /// `any`, or a comma list of `domain`, `private`, `public`.
+    pub profile: String,
+    /// Remote addresses: `any`, `LocalSubnet`, `10.0.0.0/8`, a comma list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    #[serde(skip_serializing_if = "Presence::is_present")]
+    pub state: Presence,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FirewallProtocol {
+    #[default]
+    Tcp,
+    Udp,
+    Any,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FirewallDirection {
+    #[default]
+    In,
+    Out,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FirewallAction {
+    #[default]
+    Allow,
+    Block,
+}
+
+/// Something Microsoft Defender's real-time scanning leaves alone.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DefenderExclusion {
+    pub kind: ExclusionKind,
+    pub value: String,
+    #[serde(skip_serializing_if = "Presence::is_present")]
+    pub state: Presence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExclusionKind {
+    Path,
+    Process,
+    Extension,
 }
 
 /// A Windows optional feature (`NetFx3`, `Microsoft-Windows-Subsystem-Linux`, ...).
@@ -81,6 +243,8 @@ pub struct User {
     pub password_never_expires: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub reset_password: bool,
+    #[serde(skip_serializing_if = "Presence::is_present")]
+    pub state: Presence,
 }
 
 /// Where a password comes from. Never the password itself: a Groundhogfile is shared, logged
@@ -180,6 +344,12 @@ pub enum App {
         /// Kill the step (and everything it started) if it runs longer than this.
         #[serde(skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
+        /// Upgrade an installed copy whenever a newer version is available.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        upgrade: bool,
+        /// `absent`: uninstall it.
+        #[serde(skip_serializing_if = "Presence::is_present")]
+        state: Presence,
     },
     /// An installer fetched from a URL (or found in a cache by hash) and run directly.
     Url {
@@ -237,6 +407,9 @@ pub struct FileCopy {
     /// The GitHub release a `github:` reference resolved to, for logs and step identity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release: Option<String>,
+    /// `absent`: delete `to` (a file, or a folder and everything in it).
+    #[serde(skip_serializing_if = "Presence::is_present")]
+    pub state: Presence,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -277,6 +450,8 @@ pub struct EnvVar {
     pub value: String,
     #[serde(skip_serializing_if = "EnvScope::is_user")]
     pub scope: EnvScope,
+    #[serde(skip_serializing_if = "Presence::is_present")]
+    pub state: Presence,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -284,6 +459,8 @@ pub struct PathEntry {
     pub dir: String,
     #[serde(skip_serializing_if = "EnvScope::is_user")]
     pub scope: EnvScope,
+    #[serde(skip_serializing_if = "Presence::is_present")]
+    pub state: Presence,
 }
 
 /// Which user hives a `HKCU\...` value is written to. Ignored for other roots.
@@ -307,6 +484,9 @@ pub struct RegistryValue {
     pub kind: RegistryType,
     pub data: RegistryData,
     pub scope: Vec<HiveScope>,
+    /// `absent`: delete the value, or the whole key when there's no `name`.
+    #[serde(skip_serializing_if = "Presence::is_present")]
+    pub state: Presence,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -406,10 +586,13 @@ pub(crate) mod raw {
 
     use serde::Deserialize;
 
-    use super::{EnvScope, EventsSince, HiveScope, RegistryType, ServiceState, Shell};
+    use super::{
+        CertScope, CertStore, EnvScope, EventsSince, FirewallAction, FirewallDirection, FirewallProtocol, HiveScope,
+        Presence, RegistryType, ServiceState, Shell, StartupType,
+    };
 
     #[derive(Debug, Default, Deserialize)]
-    #[serde(deny_unknown_fields)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
     pub struct File {
         pub version: Option<u32>,
         /// The oldest agent version that understands this file, as `">=0.5.0"`.
@@ -436,6 +619,72 @@ pub(crate) mod raw {
         pub features: Vec<StringOr<Feature>>,
         #[serde(default)]
         pub capabilities: Vec<StringOr<Capability>>,
+        /// Values for `${var:NAME}`. Read in a pass of their own before the rest of the file
+        /// (see `vars.rs`); declared here so the strict reader accepts the key.
+        #[serde(default)]
+        #[allow(dead_code)]
+        pub vars: BTreeMap<String, String>,
+        #[serde(default)]
+        pub certificates: Vec<Certificate>,
+        #[serde(default)]
+        pub services: Vec<Service>,
+        #[serde(default)]
+        pub firewall: Vec<FirewallRule>,
+        #[serde(default)]
+        pub defender_exclusions: Vec<StringOr<DefenderExclusion>>,
+        #[serde(default)]
+        pub remove_apps: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct Certificate {
+        pub from: Option<String>,
+        pub sha256: Option<String>,
+        pub thumbprint: Option<String>,
+        pub store: Option<CertStore>,
+        pub scope: Option<CertScope>,
+        pub state: Option<Presence>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct Service {
+        pub name: String,
+        pub startup: Option<StartupType>,
+        pub status: Option<ServiceState>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct FirewallRule {
+        pub name: String,
+        pub port: Option<Ports>,
+        pub protocol: Option<FirewallProtocol>,
+        pub direction: Option<FirewallDirection>,
+        pub action: Option<FirewallAction>,
+        pub program: Option<String>,
+        pub profile: Option<OneOrMany<String>>,
+        pub remote: Option<OneOrMany<String>>,
+        pub state: Option<Presence>,
+    }
+
+    /// `8791`, `"8000-8100"` or `[80, 443]`.
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    pub enum Ports {
+        One(u64),
+        Text(String),
+        List(Vec<Scalar>),
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct DefenderExclusion {
+        pub path: Option<String>,
+        pub process: Option<String>,
+        pub extension: Option<String>,
+        pub state: Option<Presence>,
     }
 
     #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +733,7 @@ pub(crate) mod raw {
         pub password_never_expires: Option<bool>,
         #[serde(default)]
         pub reset_password: bool,
+        pub state: Option<Presence>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -594,9 +844,10 @@ pub(crate) mod raw {
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct EnvFull {
-        pub value: String,
+        pub value: Option<String>,
         #[serde(default)]
         pub scope: EnvScope,
+        pub state: Option<Presence>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -605,6 +856,7 @@ pub(crate) mod raw {
         pub dir: String,
         #[serde(default)]
         pub scope: EnvScope,
+        pub state: Option<Presence>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -619,6 +871,9 @@ pub(crate) mod raw {
         pub timeout: Option<Duration>,
         #[serde(default)]
         pub prerelease: bool,
+        #[serde(default)]
+        pub upgrade: bool,
+        pub state: Option<Presence>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -626,6 +881,7 @@ pub(crate) mod raw {
     pub struct FileCopy {
         pub from: Option<String>,
         pub content: Option<String>,
+        pub state: Option<Presence>,
         pub to: String,
         pub sha256: Option<String>,
         #[serde(default)]
@@ -642,9 +898,10 @@ pub(crate) mod raw {
         pub name: Option<String>,
         #[serde(rename = "type", default = "default_reg_type")]
         pub kind: RegistryType,
-        pub value: Scalar,
+        pub value: Option<Scalar>,
         #[serde(default)]
         pub scope: Option<OneOrMany<HiveScope>>,
+        pub state: Option<Presence>,
     }
 
     fn default_reg_type() -> RegistryType {
