@@ -4,6 +4,54 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.14.0] - 2026-10-03
+
+### Added
+- **Removing things: `state: absent`.** Apps (winget uninstall), files and folders, env vars,
+  PATH entries, registry values and whole keys, users, certificates, firewall rules and
+  Defender exclusions can be taken back. Deleting an entry from a file still leaves the
+  machine alone; `state: absent` is how to undo, and a file that `extends` another can undo
+  what the base added. Guards refuse to delete a drive root, Windows' own folders, or a
+  registry key near the top of a hive.
+- **`remove-apps:`** removes built-in Store apps (`Microsoft.BingNews`, `Clipchamp.*`) for every
+  user and unprovisions them so new profiles don't get them.
+- **`certificates:`** trusts (or removes) public certificates in the machine's stores: an
+  internal root CA, an intermediate, a test signer. DER or PEM, from a path or URL.
+- **`services:`** sets a service's start type (automatic, delayed, manual, disabled) and
+  whether it runs.
+- **`firewall:`** Windows Firewall rules by name: ports, protocol, direction, program,
+  profiles, remote addresses. A rule that drifted is replaced; one that matches is left alone.
+- **`defender-exclusions:`** paths, processes and extensions Microsoft Defender skips.
+- **Conditions and variables.** `when: { arch: arm64, build: ">=26100", os: client }` on any
+  entry keeps it only on matching machines. `${var:NAME}` works in any string, with values
+  from `vars:` (a file overrides the library it extends), `--var`/`pending.json` (per
+  machine), and built-ins `${var:arch}`, `${var:build}`, `${var:os}`.
+- **`plan --check`** shows, step by step, what `apply` would do on this machine (`ok`,
+  `change`, `run`, `done`, `?`) without changing anything.
+- **winget versions and upgrades.** A `version` is now enforced: a different installed
+  version is replaced with that one, up or down. `upgrade: true` follows new releases on
+  every apply.
+- **Feature and capability sources** can be a `.zip`, an `.iso` (mounted for the step) or an
+  `http(s)` URL to either.
+
+### Upgrading
+- **A winget `version` is now enforced.** Before, an installed app was left alone whatever its
+  version; now a different version is replaced with the pinned one (up or down) the next time
+  that step runs. Steps already applied aren't rerun just by updating the agent, but check
+  your pins before editing a file that has them.
+
+### Changed
+- **Downloads stream to disk.** Installers, archives and files are hashed as they arrive
+  instead of being held in memory; a 192 MB archive peaks at 13 MB of agent memory.
+- The `debuggers` library entry uses `${var:arch}`, so it works on ARM64 too.
+
+### Fixed
+- **A winget app added to a file after its first apply failed** with "winget is not
+  available": the step that locates winget was recorded as done and skipped. (Present since
+  0.1.0.)
+- `state: absent` for a per-user winget package (most portable tools): winget won't uninstall
+  one from an elevated process, so the agent retries as the same user, unelevated.
+
 ## [0.13.1] - 2026-10-01
 
 ### Added
@@ -291,6 +339,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.14.0]: https://github.com/guscatalano/Groundhog/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/guscatalano/Groundhog/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/guscatalano/Groundhog/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/guscatalano/Groundhog/compare/v0.11.0...v0.12.0

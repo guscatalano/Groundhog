@@ -3,8 +3,33 @@
 A Groundhogfile is YAML (`.yaml`/`.yml`, or no extension) or JSON (`.json`). Unknown keys are
 errors, so typos fail at load time instead of being ignored.
 
-Steps run in this order: `users`, `features`, `capabilities`, winget bootstrap (if any winget
-apps), `apps`, `files`, `env`, `path`, `registry`, `run`, then the `verify` checks.
+Steps run in this order: `users`, `certificates`, `defender-exclusions`, `features`,
+`capabilities`, `remove-apps`, winget bootstrap (if any winget apps), `apps`, `files`, `env`,
+`path`, `registry`, `services`, `firewall`, `run`, then the `verify` checks.
+
+**Removing things.** Most entries take `state: absent` (the default is `present`): an app is
+uninstalled, a file or folder deleted, an env var, PATH entry, registry value or key, user,
+certificate, firewall rule or Defender exclusion removed. Deleting an entry from a Groundhogfile
+leaves the machine as it is; to take something back, say `state: absent`. A file that
+`extends` another can do that for anything the base added.
+
+## Previewing: `plan --check`
+
+`groundhog-agent plan <file> --check` looks at this machine and says, step by step, what
+`apply` would do, without changing anything:
+
+```
+  9. [1c3ec175f551f30b] ok     ensure winget is available
+ 10. [4fcd80fd8de0ff0b] change install jqlang.jq 1.7.1 (winget)
+ 17. [575a6e94dfa43102] change service Spooler: disabled, stopped
+ 20. [48a63590bffe7213] run    verify C:\ghtools\config.json exists
+18 change, 1 run, 1 ok
+```
+
+`ok` means already so, `change` that applying would change it, `run` a command or check (they
+always run), `done` a step an earlier `apply` recorded (it's skipped), and `?` that it can't
+tell without doing it (a direct installer, a zip to unpack over an existing folder). Steps that
+use secrets show as `?` unless the check is given them (`--secrets-file`).
 
 ## When steps run again
 
@@ -119,6 +144,45 @@ machine that can't reach GitHub can use a copy from your own share by path inste
 | `explorer-dev` | Explorer shows extensions, hidden and system files, and full paths. |
 | `time-sync` | Windows Time runs at boot, corrects even a large error in one go, and is checked against time.windows.com. Not part of `windows-internals`. Needs outbound NTP (UDP 123). |
 
+## Conditions and variables
+
+```yaml
+vars:
+  port: "8791"
+  tools: C:\Tools
+
+firewall:
+  - name: Deskhand
+    port: ${var:port}
+path:
+  - ${var:tools}\bin
+  - C:\Program Files (x86)\Windows Kits\10\Debuggers\${var:arch}
+apps:
+  - id: Vendor.ArmBuild
+    when: { arch: arm64 }             # only on ARM64 machines
+  - id: Vendor.NewThing
+    when: { build: ">=26100", os: client }
+env:
+  LEGACY_MODE:
+    value: "1"
+    when: { build: "<22000" }
+```
+
+**`when:`** on any list entry, or an `env` value, keeps it only on machines that match every
+condition: `arch` (`x64`, `arm64`, `x86`, or a list), `build` (the Windows build number, exact
+or with `>=`, `<=`, `>`, `<`), `os` (`client` or `server`). An entry that doesn't match is left
+out, as if it weren't written.
+
+**`${var:NAME}`** works in any string. Values come from, strongest first:
+1. the caller: `groundhog-agent apply … --var port=9000`, or `vars` in `pending.json`
+   (`groundhog pending … --var port=9000`), for per-machine values;
+2. `vars:` in the file being applied;
+3. `vars:` in the files it `extends`, so a library can declare a default its users override;
+4. built in: `${var:arch}`, `${var:build}`, `${var:os}` (reserved names).
+
+An unknown variable is a load error. `$${var:` writes a literal `${var:`. Files that use
+neither `when` nor variables are read exactly as before, with line numbers in their errors.
+
 ## `users`
 
 ```yaml
@@ -130,6 +194,8 @@ users:
   - name: svc-agent
     password: generate                 # random, known to nobody (also the default)
     password-never-expires: true       # the default: Windows' 42-day expiry would break unattended logons
+  - name: old-tester
+    state: absent                      # delete the account (its profile folder stays)
 ```
 
 Local accounts, created if missing. An existing account is brought in line (groups, password
@@ -214,6 +280,40 @@ groundhog pending https://cfg.example/dev.yaml --report https://status.example/v
   --header "status.example=Authorization: Bearer `${secret:STATUS_TOKEN}" --secret STATUS_TOKEN
 ```
 
+## `certificates`
+
+```yaml
+certificates:
+  - from: certs/corp-root.cer          # .cer/.crt, DER or PEM; a path or URL, like `files`
+  - from: https://pki.example/issuing.crt
+    store: ca                           # root (default) | ca | my | trusted-people | trusted-publisher | disallowed
+  - from: certs/legacy-root.cer
+    state: absent                       # remove it again
+  - thumbprint: 1A2B3C...               # or remove one by its SHA-1 thumbprint
+    store: root
+    state: absent
+```
+
+Public certificates, for trusting an internal CA or a test signer. They go in the machine's
+stores (`scope: machine`, the default); `scope: user` works for every store except `root`,
+where Windows insists on an on-screen confirmation. Certificates run early, before installers
+that may download from an internal server; the agent's *own* downloads happen before any step,
+so a template that fetches from an internal HTTPS server needs the CA baked in.
+
+## `defender-exclusions`
+
+```yaml
+defender-exclusions:
+  - C:\src                              # a path (a string is a path)
+  - process: devenv.exe
+  - extension: .obj
+  - { path: C:\old, state: absent }
+```
+
+Folders, processes and file types Microsoft Defender's real-time scanning leaves alone, which
+can make builds and big unpacks much faster. `%VARS%` are expanded. When Defender isn't the
+active antivirus, these steps do nothing and say so. Needs the agent elevated.
+
 ## `features` and `capabilities`
 
 Windows optional features (`Microsoft-Windows-Subsystem-Linux`, `VirtualMachinePlatform`,
@@ -266,9 +366,13 @@ best taken before long installs.
   `source:` is for machines that can't do that (offline, or WSUS without the payloads, error
   `0x800F0954`): a folder or share with the `sources\sxs` folder of install media for this
   exact Windows build (for `NetFx3`), or an unpacked Features on Demand repository
-  ("Languages and Optional Features" ISO). A mounted ISO works as a drive path
-  (`D:\sources\sxs`). A relative path works when the Groundhogfile is a local file. Zip and
-  web sources aren't supported yet; these repositories are gigabytes.
+  ("Languages and Optional Features" ISO). A relative path works when the Groundhogfile is a
+  local file. A source can also be:
+  - a **`.iso`** (a path or an `http(s)` URL): mounted for the step, and its root,
+    `sources\sxs` and `LanguagesAndOptionalFeatures` folders offered to Windows;
+  - a **`.zip`** (a path or URL): unpacked once into the agent's work folder;
+  - any **`http(s)` URL** to one of those: downloaded straight to disk (streamed, so a
+    multi-gigabyte repository never sits in memory) and reused from the agent's object store.
 - **Needs the agent elevated.** Not supported inside Windows Sandbox (the step fails
   immediately with that explanation).
 
@@ -283,22 +387,47 @@ Common failures, and what the error suggests:
 
 Details are in `%ProgramData%\groundhog\work\dism.log` and `C:\Windows\Logs\CBS\CBS.log`.
 
+## `remove-apps`
+
+```yaml
+remove-apps:
+  - Microsoft.BingNews              # package names, as Get-AppxPackage shows them
+  - Clipchamp.*                     # wildcards work
+```
+
+Built-in Store apps are removed for every existing user and unprovisioned, so profiles created
+later don't get them either. Removal runs before `apps`.
+
 ## `apps`
 
 ```yaml
 apps:
   - Git.Git                         # winget id
   - id: Microsoft.DotNet.SDK.10
-    version: 10.0.100               # optional
+    version: 10.0.100               # stay on exactly this version (up or down)
     args: --scope machine           # extra winget arguments, verbatim
+  - id: BurntSushi.ripgrep.MSVC
+    upgrade: true                   # upgrade whenever a newer version is out
+  - id: Old.Tool
+    state: absent                   # uninstall it
   - id: internal-tool               # a direct installer
     url: https://files.example.com/tool.msi
     sha256: <64 hex>                # pin a build (and allow caching); omit to follow latest
     args: ADDLOCAL=ALL              # installer arguments, verbatim
 ```
 
-**winget apps** are skipped if `winget list --id <id> --exact` finds them. If winget is missing,
-the agent installs it first (via the `Microsoft.WinGet.Client` PowerShell module).
+**winget apps**, as `winget list --id <id> --exact` sees them:
+- Without `version`, an installed app is left as it is.
+- With `version`, a different installed version is replaced with that one, up or down.
+- With `upgrade: true`, the app is upgraded whenever winget has a newer version; that step
+  runs on every apply. (`version` and `upgrade` don't go together.)
+- With `state: absent`, it's uninstalled. A package installed per user (portable tools such
+  as ripgrep or jq usually are) can't be uninstalled by an elevated process, which the agent
+  is; the agent then retries as the same user, unelevated, through a one-off scheduled task.
+
+If winget is missing, the agent installs it first (via the `Microsoft.WinGet.Client` PowerShell
+module). Direct installers can't be uninstalled with `state: absent` (they don't say how); use a
+`run` step with the vendor's uninstaller.
 
 **URL apps** support:
 
@@ -324,10 +453,17 @@ files:
   - to: C:\ProgramData\Tool\config.json
     content: |                       # or the text itself, written as UTF-8
       { "endpoint": "https://api.example", "key": "${secret:TOOL_KEY}" }
+  - to: C:\Tools\old-version
+    state: absent                    # delete a file, or a folder and everything in it
 ```
 
 A file whose contents already match is left alone. `content` can hold
-[secret references](#secrets); `from` files are copied as they are.
+[secret references](#secrets); `from` files are copied as they are. Downloads stream to disk,
+so a file of any size is fine.
+
+`state: absent` refuses a drive root and the folders Windows depends on (`C:\Windows`,
+`C:\Program Files`, `C:\Users`, the user profile, `ProgramData`, …), so a typo in `to` can't
+take out the machine.
 
 ### Unpacking archives
 
@@ -392,16 +528,18 @@ env:
   _NT_SYMBOL_PATH:                    # machine-wide: every account and service sees it
     value: srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
     scope: machine
+  OLD_SETTING: { state: absent }      # remove a variable
 path:
   - C:\tools\bin
   - dir: C:\Program Files\Sysinternals
     scope: machine
+  - { dir: C:\old\bin, state: absent }   # take one folder out; the rest stays as it is
 ```
 
 By default these are the agent user's own variables (`HKCU\Environment`). `scope: machine`
 writes the system environment instead, which every account, service and SYSTEM starts with;
-that needs the agent elevated. `path` entries are appended if missing, never reordered or
-removed, and a machine PATH that can't be read is left alone rather than rewritten.
+that needs the agent elevated. `path` entries are appended if missing and otherwise never
+reordered, and a machine PATH that can't be read is left alone rather than rewritten.
 `env: PATH` with `scope: machine` is refused, since it would replace the whole system PATH.
 
 Running programs are notified of the change, but a program that's already running keeps the
@@ -421,14 +559,55 @@ registry:
     type: dword                      # string (default), expand-string, multi-string, dword, qword
     value: 0                         # numbers may also be "0x10"
     scope: [current-user, default-user]
+  - key: HKCU\Software\Vendor\Tool
+    name: Telemetry
+    state: absent                    # delete one value
+  - key: HKCU\Software\Vendor\OldTool
+    state: absent                    # no name: delete the key and everything under it
 ```
 
-Roots: `HKCU`, `HKLM`, `HKCR`, `HKU` (or their long names).
+Roots: `HKCU`, `HKLM`, `HKCR`, `HKU` (or their long names). Deleting a whole key is refused
+within two levels of a hive's root (`HKLM\SOFTWARE` itself, say).
 
 `scope` applies only to `HKCU` keys:
 - `current-user` (default): the account the agent runs as.
 - `default-user`: `C:\Users\Default\NTUSER.DAT`, so profiles created **later** get the value
   too. Requires the agent to run elevated.
+
+## `services`
+
+```yaml
+services:
+  - name: Spooler                  # the service name (or its display name)
+    startup: disabled              # automatic | delayed | manual | disabled
+    status: stopped                # running | stopped
+  - name: MyAgentSvc
+    status: running
+```
+
+Brings an existing service's start type and state in line; at least one of them is needed.
+Stopping a service also stops the services that depend on it. Services run after `apps` (which
+often install them) and before `run`; a service a `run` step creates is that step's business.
+
+## `firewall`
+
+```yaml
+firewall:
+  - name: Deskhand                 # the rule's name: how it's found again
+    port: 8791                     # or "8000-8100", or [80, 443]; omit for any port
+    protocol: tcp                  # tcp (default) | udp | any
+    direction: in                  # in (default) | out
+    action: allow                  # allow (default) | block
+    program: '%ProgramFiles%\Deskhand\deskhand.exe'   # optional
+    profile: [domain, private]     # any (default) | domain | private | public
+    remote: LocalSubnet            # optional: addresses or ranges, one or a list
+  - name: Old rule
+    state: absent
+```
+
+Windows Firewall rules, created in a `Groundhog` group. A rule is found by its name; one that
+doesn't match what's written (or that someone edited) is replaced, and one that does is left
+alone. Ports are local for inbound rules and remote for outbound ones.
 
 ## `run`
 

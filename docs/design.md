@@ -77,14 +77,15 @@ task, restarts, and continues. It gives up after 5 restarts in one run.
 - **Lock mode**: re-apply exactly the hashes recorded by an earlier run.
 - **`stop:` on `files:` entries**: stop named services or processes before replacing files, and
   restart services afterwards (Restart Manager can report who holds a file).
-- **More Windows servicing.** `features:` and `capabilities:` shipped in 0.9.0 (DISM API,
-  live-state checks, deferred restarts per section). Next: `remove-apps:` for inbox apps
-  (provisioned and per user), `verify: feature/capability` checks, online drivers via
-  pnputil, prefix matching for capability names (needs DISM's array layout confirmed against
-  `dismapi.h`), and zipped or HTTP sources (needs streaming downloads; Features on Demand
-  repositories are gigabytes). Not planned: Windows Update orchestration, or offline WIM
-  servicing; bake a base layer into the template instead (docs/templates.md).
-- More built-in steps: services, ACLs, symlinks, file associations.
+- **More Windows servicing.** `features:` and `capabilities:` shipped in 0.9.0, and
+  `remove-apps:` plus zip, ISO and HTTP sources in 0.14.0. Next: `verify: feature/capability`
+  checks, online drivers via pnputil, prefix matching for capability names (needs DISM's array
+  layout confirmed against `dismapi.h`). Not planned: Windows Update orchestration, or offline
+  WIM servicing; bake a base layer into the template instead (docs/templates.md).
+- More built-in steps: ACLs, symlinks, file associations, fonts, drivers. (Services, firewall
+  rules, certificates and Defender exclusions shipped in 0.14.0.)
+- **`plan --check` for downloads**: compare an unpacked archive with its source without
+  unpacking it again (today it says `?`), and check group membership for existing accounts.
 - Signed Groundhogfiles, checked against a key built into a template.
 - **Stronger agent-update trust**: today an update is accepted when its SHA-256 matches the
   source's `agent.json`, which trusts whoever controls the source. Verifying GitHub's build
