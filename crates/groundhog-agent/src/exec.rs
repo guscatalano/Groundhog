@@ -235,11 +235,13 @@ fn check_registry(r: &RegistryValue, secrets: &Secrets) -> Result<Probe> {
     Ok(if changes { Probe::WouldChange } else { Probe::Satisfied })
 }
 
-/// Whether winget knows a newer version of an installed package.
+/// Whether winget knows a newer version of an installed package. Its exit code says nothing
+/// here (0 even for "No installed package found"), so this looks for the package's row.
 fn upgrade_available(winget: &Path, id: &str) -> Result<bool> {
     let args =
         ["list", "--id", id, "--exact", "--upgrade-available", "--accept-source-agreements", "--disable-interactivity"];
-    Ok(Proc { capture_stdout: true, ..Proc::new(winget).args(args) }.run(&mut |_| {})?.code == 0)
+    let out = Proc { capture_stdout: true, ..Proc::new(winget).args(args) }.run(&mut |_| {})?;
+    Ok(version_from_list(&out.stdout, id).is_some())
 }
 
 impl WinExecutor<'_> {
@@ -264,7 +266,12 @@ impl WinExecutor<'_> {
         Ok(path)
     }
 
-    fn winget(&self) -> Result<&Path> {
+    /// Where winget is. Found again when needed: on a later apply the "ensure winget" step is
+    /// recorded as done and skipped, but a new or always-run app step still needs it.
+    fn winget(&mut self) -> Result<&Path> {
+        if self.winget.is_none() {
+            self.winget = winget::locate();
+        }
         self.winget.as_deref().context("winget is not available")
     }
 
@@ -305,6 +312,20 @@ impl WinExecutor<'_> {
                 .timeout_ms(timeout_ms)
                 .run(log)?
                 .code;
+            if code == codes::USER_SCOPE_NEEDS_UNELEVATED {
+                // A per-user (often portable) package: winget only removes it from a process
+                // that isn't elevated, so ask again as this user, unelevated.
+                log("retrying as this user without elevation (winget's rule for per-user packages)");
+                let mut unelevated: Vec<&str> = vec!["uninstall"];
+                unelevated.extend(common);
+                unelevated.push("--silent");
+                let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(10 * 60 * 1000));
+                let (code, lines) = groundhog_win::tasks::run_unelevated(&winget, &unelevated, timeout)?;
+                for line in lines.iter().map(|l| l.rsplit('\r').next().unwrap_or(l).trim()).filter(|l| !l.is_empty()) {
+                    log(line);
+                }
+                return winget_outcome(code, id, "uninstall");
+            }
             return winget_outcome(code, id, "uninstall");
         }
 

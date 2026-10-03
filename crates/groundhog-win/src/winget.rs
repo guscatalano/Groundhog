@@ -12,6 +12,9 @@ pub mod codes {
     pub const INSTALL_REBOOT_REQUIRED_FOR_INSTALL: i32 = 0x8A15010A_u32 as i32;
     pub const INSTALL_REBOOT_INITIATED: i32 = 0x8A15010B_u32 as i32;
     pub const INSTALL_ALREADY_INSTALLED: i32 = 0x8A15010D_u32 as i32;
+    /// "The package installed for user scope cannot be uninstalled when running with
+    /// administrator privileges" (portable packages installed per user).
+    pub const USER_SCOPE_NEEDS_UNELEVATED: i32 = 0x8A15007D_u32 as i32;
 }
 
 pub fn locate() -> Option<PathBuf> {

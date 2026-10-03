@@ -2002,8 +2002,9 @@ path:
                 &Url::parse(&format!("groundhog:{}", name.trim_end_matches(".groundhog.yaml"))).unwrap(),
             )
             .unwrap_or_else(|e| panic!("{name}: {e:#}"));
-            let mut raw = parse(&std::fs::read(&path).unwrap(), &url, &Facts::default().builtin_vars(), &Facts::default())
-                .unwrap_or_else(|e| panic!("{e:#}"));
+            let mut raw =
+                parse(&std::fs::read(&path).unwrap(), &url, &Facts::default().builtin_vars(), &Facts::default())
+                    .unwrap_or_else(|e| panic!("{e:#}"));
             for base in std::mem::take(&mut raw.extends).into_vec() {
                 let base = resolve_source_ref(&url, base).unwrap();
                 let file = base.url.path_segments().unwrap().next_back().unwrap().to_owned();
