@@ -10,8 +10,8 @@ use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{Action, Executor, Outcome, Probe, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
-    App, Capability, Certificate, EnvScope, Feature, FileCopy, HiveScope, Password, RegistryData, RegistryType,
-    RegistryValue, RunAction, Shell, Theme, ThemeMode, User, Wallpaper, WallpaperStyle,
+    App, Capability, Certificate, EnvScope, Feature, FileCopy, HiveScope, LockScreen, Password, RegistryData,
+    RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, Theme, ThemeMode, User, Wallpaper, WallpaperStyle,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
@@ -129,6 +129,8 @@ impl Executor for WinExecutor<'_> {
             Action::Capability(c) => self.ensure_capability(c, log),
             Action::Wallpaper(w) => self.wallpaper(w, false).map(|changed| Outcome::Done { changed }),
             Action::Theme(t) => theme(t, false).map(|changed| Outcome::Done { changed }),
+            Action::LockScreen(l) => self.lock_screen(l, false).map(|changed| Outcome::Done { changed }),
+            Action::ScreenSaver(s) => screen_saver(s, false).map(|changed| Outcome::Done { changed }),
             Action::Verify(c) => {
                 crate::checks::run(c, self.started, log)?;
                 Ok(Outcome::Done { changed: false })
@@ -185,6 +187,8 @@ impl Executor for WinExecutor<'_> {
             Action::Certificate(c) => would(self.certificate(c, true, quiet)?),
             Action::Wallpaper(w) => would(self.wallpaper(w, true)?),
             Action::Theme(t) => would(theme(t, true)?),
+            Action::LockScreen(l) => would(self.lock_screen(l, true)?),
+            Action::ScreenSaver(s) => would(screen_saver(s, true)?),
             Action::Service(s) => would(crate::ensure::service(s, true, quiet)?),
             Action::Firewall(r) => would(crate::ensure::firewall(r, true, quiet)?),
             Action::Defender(e) => would(crate::ensure::defender(e, true, quiet)?),
@@ -475,29 +479,48 @@ impl WinExecutor<'_> {
     /// The desktop picture and background color, for each user hive in scope. The picture is
     /// copied to `<home>\desktop`, a stable place every account can read (so the Default User
     /// profile can point at it too) that `clean` leaves alone.
+    /// A picture's stable copy in `<home>\desktop`, fetched and copied unless only checking.
+    /// `None` when checking and its content isn't known yet (it would change).
+    fn desktop_picture(&self, from: &Url, known: Option<&str>, check: bool) -> Result<Option<String>> {
+        let ext = Path::new(&file_name(from))
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|| "jpg".into());
+        let dir = self.work_dir.parent().unwrap_or(&self.work_dir).join("desktop");
+        if check {
+            return Ok(known.map(|hash| dir.join(format!("{}.{ext}", &hash[..16])).to_string_lossy().into_owned()));
+        }
+        let fetched = self.content.get_file(from, known)?;
+        let path = dir.join(format!("{}.{ext}", &fetched.sha256[..16]));
+        if !path.exists() {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::copy(&fetched.path, &path).with_context(|| format!("writing {}", path.display()))?;
+        }
+        Ok(Some(path.to_string_lossy().into_owned()))
+    }
+
+    /// The machine's lock screen picture and idle lock.
+    fn lock_screen(&mut self, l: &LockScreen, check: bool) -> Result<bool> {
+        let mut changed = false;
+        if let Some(image) = &l.image {
+            match self.desktop_picture(image, l.sha256.as_deref().or(l.resolved.as_deref()), check)? {
+                Some(picture) => changed |= desktop::set_lock_screen_image(&picture, check)?,
+                None => changed = true,
+            }
+        }
+        if let Some(secs) = l.lock_after_secs {
+            changed |= desktop::set_lock_after(secs, check)?;
+        }
+        Ok(changed)
+    }
+
     fn wallpaper(&mut self, w: &Wallpaper, check: bool) -> Result<bool> {
         let picture = match &w.from {
             None => String::new(),
-            Some(from) => {
-                let known = w.sha256.as_deref().or(w.resolved.as_deref());
-                let ext = Path::new(&file_name(from))
-                    .extension()
-                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                    .unwrap_or_else(|| "jpg".into());
-                let dir = self.work_dir.parent().unwrap_or(&self.work_dir).join("desktop");
-                if check {
-                    let Some(hash) = known else { return Ok(true) };
-                    dir.join(format!("{}.{ext}", &hash[..16])).to_string_lossy().into_owned()
-                } else {
-                    let fetched = self.content.get_file(from, known)?;
-                    let path = dir.join(format!("{}.{ext}", &fetched.sha256[..16]));
-                    if !path.exists() {
-                        std::fs::create_dir_all(&dir)?;
-                        std::fs::copy(&fetched.path, &path).with_context(|| format!("writing {}", path.display()))?;
-                    }
-                    path.to_string_lossy().into_owned()
-                }
-            }
+            Some(from) => match self.desktop_picture(from, w.sha256.as_deref().or(w.resolved.as_deref()), check)? {
+                Some(picture) => picture,
+                None => return Ok(true),
+            },
         };
         let rgb = w.background.as_deref().map(|c| {
             let n = u32::from_str_radix(c.trim_start_matches('#'), 16).unwrap_or(0);
@@ -746,6 +769,31 @@ fn delete_registry(r: &RegistryValue) -> Result<Outcome> {
         };
     }
     Ok(Outcome::Done { changed })
+}
+
+/// The screen saver for each user hive in scope; the running session picks it up at once.
+fn screen_saver(s: &ScreenSaver, check: bool) -> Result<bool> {
+    let program = s.program.as_deref().map(env::expand).transpose()?;
+    let settings = desktop::ScreenSaver {
+        enabled: s.enabled,
+        timeout_secs: s.timeout_secs,
+        secure: s.secure,
+        program: program.as_deref(),
+    };
+    let hkcu = registry::hkcu();
+    let mut changed = false;
+    for scope in &s.scope {
+        let hive = match scope {
+            HiveScope::CurrentUser => None,
+            HiveScope::DefaultUser => Some(DefaultUserHive::load()?),
+        };
+        let root = hive.as_ref().map_or(&hkcu, |h| h.root());
+        changed |= desktop::set_screen_saver(root, &settings, check)?;
+    }
+    if changed && !check && s.scope.contains(&HiveScope::CurrentUser) {
+        desktop::apply_screen_saver_now(&settings)?;
+    }
+    Ok(changed)
 }
 
 /// Light or dark mode for each user hive in scope; the running session switches at once.

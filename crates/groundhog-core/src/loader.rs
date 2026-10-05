@@ -16,9 +16,9 @@ use crate::github;
 use crate::library;
 use crate::model::{
     App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, EnvScope, EnvVar,
-    ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, Password, PathEntry,
-    Presence, RegistryData, RegistryType, RegistryValue, RunAction, Service, ServiceState, Shell, SourceRef, Theme,
-    ThemeMode, User, Wallpaper, WallpaperStyle, raw,
+    ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, LockScreen, Password,
+    PathEntry, Presence, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState,
+    Shell, SourceRef, Theme, ThemeMode, User, Wallpaper, WallpaperStyle, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
@@ -214,6 +214,9 @@ impl<'a> Loader<'a> {
         if let Some(Wallpaper { from: Some(from), sha256, .. }) = &mut file.wallpaper {
             from_github(from, sha256, &mut None)?;
         }
+        if let Some(LockScreen { image: Some(image), sha256, .. }) = &mut file.lock_screen {
+            from_github(image, sha256, &mut None)?;
+        }
 
         let mut seen: HashMap<Url, String> = HashMap::new();
         let mut resolve = |url: &Url, pinned: &Option<String>, slot: &mut Option<String>| -> Result<()> {
@@ -253,6 +256,9 @@ impl<'a> Loader<'a> {
         }
         if let Some(Wallpaper { from: Some(from), sha256, resolved, .. }) = &mut file.wallpaper {
             resolve(from, sha256, resolved)?;
+        }
+        if let Some(LockScreen { image: Some(image), sha256, resolved, .. }) = &mut file.lock_screen {
+            resolve(image, sha256, resolved)?;
         }
         for r in &mut file.run {
             match r {
@@ -569,9 +575,9 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     if remove_apps.iter().any(|a| a.trim().is_empty()) {
         bail!("remove-apps: an entry is empty");
     }
-    let (wallpaper, theme) = match desktop {
+    let DesktopParts { wallpaper, theme, lock_screen, screen_saver } = match desktop {
         Some(d) => resolve_desktop(base, d).context("desktop")?,
-        None => (None, None),
+        None => DesktopParts { wallpaper: None, theme: None, lock_screen: None, screen_saver: None },
     };
 
     let file = Groundhogfile {
@@ -588,6 +594,8 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         registry,
         wallpaper,
         theme,
+        lock_screen,
+        screen_saver,
         services,
         firewall,
         run,
@@ -834,7 +842,41 @@ fn resolve_firewall(r: raw::FirewallRule) -> Result<FirewallRule> {
     })
 }
 
-fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<(Option<Wallpaper>, Option<Theme>)> {
+/// Everything `desktop:` resolves to.
+struct DesktopParts {
+    wallpaper: Option<Wallpaper>,
+    theme: Option<Theme>,
+    lock_screen: Option<LockScreen>,
+    screen_saver: Option<ScreenSaver>,
+}
+
+/// A picture reference (wallpaper, lock screen), checked to look like one.
+fn picture_url(base: &Url, from: &str, what: &str) -> Result<Url> {
+    let url = resolve_ref(base, from)?;
+    let name = url.path().to_ascii_lowercase();
+    let pictures = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".jfif"];
+    if !github::is_github(&url) && !pictures.iter().any(|ext| name.ends_with(ext)) {
+        bail!("{what} '{from}' should be a picture (.jpg, .png, .bmp, …)");
+    }
+    Ok(url)
+}
+
+/// Built-in screen savers by short name; anything else is a path to a `.scr`.
+fn screen_saver_program(name: &str) -> Result<String> {
+    let builtin = match name.to_ascii_lowercase().as_str() {
+        "blank" => "scrnsave.scr",
+        "bubbles" => "Bubbles.scr",
+        "mystify" => "Mystify.scr",
+        "ribbons" => "Ribbons.scr",
+        "photos" => "PhotoScreensaver.scr",
+        "3d-text" => "ssText3d.scr",
+        _ if name.to_ascii_lowercase().ends_with(".scr") => return Ok(name.to_owned()),
+        _ => bail!("screen saver '{name}' isn't blank, bubbles, mystify, ribbons, photos, 3d-text or a .scr path"),
+    };
+    Ok(format!(r"%SystemRoot%\System32\{builtin}"))
+}
+
+fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<DesktopParts> {
     let mut scope = d.scope.map(raw::OneOrMany::into_vec).unwrap_or_else(|| vec![HiveScope::CurrentUser]);
     scope.sort();
     scope.dedup();
@@ -850,12 +892,7 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<(Option<Wallpaper>, Op
     }
     let wallpaper = match picture {
         Some((from, sha256)) => {
-            let url = resolve_ref(base, &from)?;
-            let name = url.path().to_ascii_lowercase();
-            let pictures = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".jfif"];
-            if !github::is_github(&url) && !pictures.iter().any(|ext| name.ends_with(ext)) {
-                bail!("wallpaper '{from}' should be a picture (.jpg, .png, .bmp, …)");
-            }
+            let url = picture_url(base, &from, "wallpaper")?;
             Some(Wallpaper {
                 from: Some(url),
                 sha256: pin(sha256)?,
@@ -892,7 +929,42 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<(Option<Wallpaper>, Op
             Ok(Theme { apps: f.apps, windows: f.windows, scope: scope.clone() })
         }
     });
-    Ok((wallpaper, theme.transpose()?))
+    let lock_screen = d
+        .lock_screen
+        .map(|l| -> Result<LockScreen> {
+            let (image, sha256) = match l.image {
+                None => (None, None),
+                Some(raw::StringOr::Short(from)) => (Some(picture_url(base, &from, "lock screen image")?), None),
+                Some(raw::StringOr::Full(w)) => (Some(picture_url(base, &w.from, "lock screen image")?), w.sha256),
+            };
+            if image.is_none() && l.lock_after.is_none() {
+                bail!("lock-screen needs 'image', 'lock-after' or both");
+            }
+            let lock_after_secs = l.lock_after.map(duration_ms).transpose()?.map(|ms| ms / 1000);
+            Ok(LockScreen { image, sha256: pin(sha256)?, resolved: None, lock_after_secs })
+        })
+        .transpose()
+        .context("lock-screen")?;
+
+    let screen_saver = d
+        .screen_saver
+        .map(|s| -> Result<ScreenSaver> {
+            let enabled = s.enabled.unwrap_or(true);
+            if !enabled && (s.timeout.is_some() || s.secure.is_some() || s.program.is_some()) {
+                bail!("'enabled: false' turns the screen saver off; the other settings don't go with it");
+            }
+            let program = match (enabled, s.program) {
+                (false, _) => None,
+                (true, Some(p)) => Some(screen_saver_program(&p)?),
+                (true, None) => Some(screen_saver_program("blank")?),
+            };
+            let timeout_secs = s.timeout.map(duration_ms).transpose()?.map(|ms| (ms / 1000).max(60));
+            Ok(ScreenSaver { enabled, timeout_secs, secure: s.secure, program, scope: scope.clone() })
+        })
+        .transpose()
+        .context("screen-saver")?;
+
+    Ok(DesktopParts { wallpaper, theme: theme.transpose()?, lock_screen, screen_saver })
 }
 
 /// `#RRGGBB` (or `RRGGBB`), normalized to upper case with the `#`.
@@ -1434,6 +1506,8 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
 
     // Desktop settings: the later file wins, setting by setting.
     let wallpaper = top.wallpaper.or(base.wallpaper);
+    let lock_screen = top.lock_screen.or(base.lock_screen);
+    let screen_saver = top.screen_saver.or(base.screen_saver);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -1453,6 +1527,8 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
         registry,
         wallpaper,
         theme,
+        lock_screen,
+        screen_saver,
         services,
         firewall,
         run,
@@ -1962,6 +2038,23 @@ firewall:
         assert_eq!((t.apps, t.windows), (Some(ThemeMode::Light), Some(ThemeMode::Dark)), "merged setting by setting");
         assert_eq!(t.scope, [HiveScope::CurrentUser, HiveScope::DefaultUser]);
 
+        let locks = MapFetcher::default()
+            .with(
+                "https://cfg.test/l.yaml",
+                "desktop:\n  lock-screen: { image: lock.png, lock-after: 15m }\n  screen-saver: { timeout: 10m, secure: true, program: mystify }",
+            )
+            .with("https://cfg.test/lock.png", "png bytes");
+        let g = load_with(&locks, "https://cfg.test/l.yaml", dir.path()).unwrap().file;
+        let l = g.lock_screen.unwrap();
+        assert_eq!((l.lock_after_secs, l.resolved.is_some()), (Some(900), true));
+        let s = g.screen_saver.unwrap();
+        assert_eq!((s.enabled, s.timeout_secs, s.secure), (true, Some(600), Some(true)));
+        assert_eq!(s.program.as_deref(), Some(r"%SystemRoot%\System32\Mystify.scr"));
+        let off =
+            MapFetcher::default().with("https://cfg.test/o.yaml", "desktop: { screen-saver: { enabled: false } }");
+        let s = load_with(&off, "https://cfg.test/o.yaml", dir.path()).unwrap().file.screen_saver.unwrap();
+        assert_eq!((s.enabled, s.program), (false, None));
+
         let only_color = MapFetcher::default().with("https://cfg.test/c.yaml", "desktop: { background: 0a0b0c }");
         let g = load_with(&only_color, "https://cfg.test/c.yaml", dir.path()).unwrap().file;
         assert_eq!(g.wallpaper.unwrap().background.as_deref(), Some("#0A0B0C"));
@@ -1972,6 +2065,10 @@ firewall:
             ("desktop: { wallpaper-style: fill }", "needs a 'wallpaper'"),
             ("desktop: { wallpaper: notes.txt }", "should be a picture"),
             ("desktop: { wallpapr: a.jpg }", "unknown field"),
+            ("desktop: { lock-screen: {} }", "'image', 'lock-after' or both"),
+            ("desktop: { screen-saver: { enabled: false, timeout: 5m } }", "don't go with it"),
+            ("desktop: { screen-saver: { program: aquarium } }", "isn't blank, bubbles"),
+            ("desktop: { lock-screen: { image: lock.txt } }", "should be a picture"),
         ] {
             let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());

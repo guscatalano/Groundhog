@@ -31,6 +31,8 @@ pub struct Groundhogfile {
     pub registry: Vec<RegistryValue>,
     pub wallpaper: Option<Wallpaper>,
     pub theme: Option<Theme>,
+    pub lock_screen: Option<LockScreen>,
+    pub screen_saver: Option<ScreenSaver>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -224,6 +226,35 @@ pub enum WallpaperStyle {
     Tile,
     Center,
     Span,
+}
+
+/// The lock screen, for the whole machine: its picture, and how long the machine may sit idle
+/// before it locks.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LockScreen {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<Url>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Content hash found at load time when `sha256` is not pinned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_after_secs: Option<u64>,
+}
+
+/// The screen saver, per user.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScreenSaver {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secure: Option<bool>,
+    /// The `.scr` to run, as a full path (may contain `%VARS%`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    pub scope: Vec<HiveScope>,
 }
 
 /// Light or dark mode, for apps and for Windows itself (taskbar, Start, notifications).
@@ -693,7 +724,25 @@ pub(crate) mod raw {
         pub wallpaper: Option<StringOr<WallpaperFull>>,
         pub wallpaper_style: Option<WallpaperStyle>,
         pub background: Option<String>,
+        pub lock_screen: Option<LockScreenFull>,
+        pub screen_saver: Option<ScreenSaverFull>,
         pub scope: Option<OneOrMany<HiveScope>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct LockScreenFull {
+        pub image: Option<StringOr<WallpaperFull>>,
+        pub lock_after: Option<Duration>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct ScreenSaverFull {
+        pub enabled: Option<bool>,
+        pub timeout: Option<Duration>,
+        pub secure: Option<bool>,
+        pub program: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]

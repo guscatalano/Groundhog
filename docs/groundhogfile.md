@@ -582,6 +582,14 @@ desktop:
   wallpaper: images/lab.jpg         # a picture: a path or URL, like `files` (or { from, sha256 })
   wallpaper-style: fill             # fill (default) | fit | stretch | tile | center | span
   background: "#203040"             # solid color: alone, or around a fit/center picture
+  lock-screen:                      # for the whole machine
+    image: images/lock.jpg          # a picture, like `wallpaper`
+    lock-after: 15m                 # lock after this much idle time, for every account
+  screen-saver:
+    timeout: 10m                    # start after this much idle time (at least 1m)
+    secure: true                    # resuming needs a sign-in
+    program: blank                  # blank (default) | bubbles | mystify | ribbons | photos | 3d-text | a .scr path
+    # enabled: false                # or turn it off
   scope: [current-user, default-user]
 ```
 
@@ -590,6 +598,11 @@ picture, and the solid background color. For the account the agent runs as they 
 at once, as when changed in Settings; `default-user` sets them for profiles created later.
 The picture is copied to `%ProgramData%\groundhog\desktop`, where every account can read it,
 and `groundhog-agent clean` leaves it there, so a template's wallpaper survives sealing.
+
+The **lock screen** settings are machine-wide (`scope` doesn't apply): the picture every
+account sees at sign-in, written where the Personalization CSP (Intune, MDM) writes it, and
+the idle time after which Windows locks ("Interactive logon: Machine inactivity limit"). The
+**screen saver** is per user, like the wallpaper.
 
 A later file overrides an earlier one setting by setting: a file that extends a base with
 `theme: light` can say `theme: { windows: dark }` and keep the base's light apps.

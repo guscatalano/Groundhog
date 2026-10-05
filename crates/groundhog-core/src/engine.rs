@@ -16,8 +16,8 @@ use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
     App, Capability, CertScope, Certificate, Check, DefenderExclusion, EnvScope, Feature, FileCopy, FirewallRule,
-    Groundhogfile, Presence, RegistryData, RegistryValue, RunAction, Service, ServiceState, Theme, ThemeMode, User,
-    Wallpaper,
+    Groundhogfile, LockScreen, Presence, RegistryData, RegistryValue, RunAction, ScreenSaver, Service, ServiceState,
+    Theme, ThemeMode, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -62,6 +62,8 @@ pub enum Action {
     },
     Wallpaper(Wallpaper),
     Theme(Theme),
+    LockScreen(LockScreen),
+    ScreenSaver(ScreenSaver),
 }
 
 impl Action {
@@ -166,6 +168,29 @@ fn title(action: &Action) -> String {
             }
             format!("set wallpaper {}", parts.join(", "))
         }
+        Action::LockScreen(l) => {
+            let mut parts = Vec::new();
+            if let Some(image) = &l.image {
+                parts.push(format!("picture {}", file_name(image)));
+            }
+            if let Some(secs) = l.lock_after_secs {
+                parts.push(format!("lock after {}", humantime::format_duration(std::time::Duration::from_secs(secs))));
+            }
+            format!("set lock screen: {}", parts.join(", "))
+        }
+        Action::ScreenSaver(s) if !s.enabled => "turn the screen saver off".to_owned(),
+        Action::ScreenSaver(s) => {
+            let name =
+                s.program.as_deref().map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p)).unwrap_or("screen saver");
+            let mut parts = vec![name.to_owned()];
+            if let Some(secs) = s.timeout_secs {
+                parts.push(format!("after {}", humantime::format_duration(std::time::Duration::from_secs(secs))));
+            }
+            if s.secure == Some(true) {
+                parts.push("sign-in to resume".to_owned());
+            }
+            format!("set screen saver: {}", parts.join(", "))
+        }
         Action::Theme(t) => match (t.apps, t.windows) {
             (Some(a), Some(w)) if a == w => format!("set {} theme", format!("{a:?}").to_ascii_lowercase()),
             (a, w) => {
@@ -201,9 +226,9 @@ fn build_label(action: &Action) -> Option<String> {
         Action::App(App::Url { release, resolved, .. }) | Action::File(FileCopy { release, resolved, .. }) => {
             (release.as_deref(), resolved.as_deref())
         }
-        Action::Certificate(Certificate { resolved, .. }) | Action::Wallpaper(Wallpaper { resolved, .. }) => {
-            (None, resolved.as_deref())
-        }
+        Action::Certificate(Certificate { resolved, .. })
+        | Action::Wallpaper(Wallpaper { resolved, .. })
+        | Action::LockScreen(LockScreen { resolved, .. }) => (None, resolved.as_deref()),
         Action::Run(RunAction::Script { resolved, .. } | RunAction::Plugin { resolved, .. }) => {
             (None, resolved.as_deref())
         }
@@ -286,6 +311,8 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     actions.extend(file.registry.iter().cloned().map(Action::Registry));
     actions.extend(file.wallpaper.iter().cloned().map(Action::Wallpaper));
     actions.extend(file.theme.iter().cloned().map(Action::Theme));
+    actions.extend(file.lock_screen.iter().cloned().map(Action::LockScreen));
+    actions.extend(file.screen_saver.iter().cloned().map(Action::ScreenSaver));
     // Services and firewall rules after apps, which often install what they refer to.
     actions.extend(file.services.iter().cloned().map(Action::Service));
     actions.extend(file.firewall.iter().cloned().map(Action::Firewall));
@@ -357,7 +384,7 @@ fn section(action: &Action) -> &'static str {
         Action::User(_) => "users",
         Action::EnsureWinget | Action::App(_) | Action::RemoveApp { .. } => "apps",
         Action::Certificate(_) => "certificates",
-        Action::Wallpaper(_) | Action::Theme(_) => "desktop",
+        Action::Wallpaper(_) | Action::Theme(_) | Action::LockScreen(_) | Action::ScreenSaver(_) => "desktop",
         Action::Defender(_) => "defender",
         Action::Service(_) => "services",
         Action::Firewall(_) => "firewall",

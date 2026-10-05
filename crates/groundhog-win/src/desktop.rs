@@ -9,8 +9,9 @@ use std::io;
 use anyhow::{Result, bail};
 use windows_sys::Win32::Graphics::Gdi::{COLOR_DESKTOP, SetSysColors};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    HWND_BROADCAST, SMTO_ABORTIFHUNG, SPI_SETDESKWALLPAPER, SPIF_SENDWININICHANGE, SPIF_UPDATEINIFILE,
-    SendMessageTimeoutW, SystemParametersInfoW, WM_SETTINGCHANGE,
+    HWND_BROADCAST, SMTO_ABORTIFHUNG, SPI_SETDESKWALLPAPER, SPI_SETSCREENSAVEACTIVE, SPI_SETSCREENSAVESECURE,
+    SPI_SETSCREENSAVETIMEOUT, SPIF_SENDWININICHANGE, SPIF_UPDATEINIFILE, SendMessageTimeoutW, SystemParametersInfoW,
+    WM_SETTINGCHANGE,
 };
 use winreg::RegKey;
 
@@ -112,6 +113,100 @@ pub fn apply_now(picture: &str, background: Option<(u8, u8, u8)>) -> Result<()> 
         bail!("setting the wallpaper: {}", io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// The screen saver for one user hive: on or off, the idle time before it starts, whether
+/// resuming needs a sign-in, and which `.scr` runs.
+pub struct ScreenSaver<'a> {
+    pub enabled: bool,
+    pub timeout_secs: Option<u64>,
+    pub secure: Option<bool>,
+    pub program: Option<&'a str>,
+}
+
+pub fn set_screen_saver(root: &RegKey, s: &ScreenSaver, check: bool) -> Result<bool> {
+    let flag = |b: bool| if b { "1" } else { "0" };
+    let timeout = s.timeout_secs.map(|t| t.to_string());
+    let mut wanted: Vec<(&str, &str)> = vec![("ScreenSaveActive", flag(s.enabled))];
+    if s.enabled {
+        if let Some(t) = &timeout {
+            wanted.push(("ScreenSaveTimeOut", t));
+        }
+        if let Some(secure) = s.secure {
+            wanted.push(("ScreenSaverIsSecure", flag(secure)));
+        }
+        if let Some(program) = s.program {
+            wanted.push(("SCRNSAVE.EXE", program));
+        }
+    }
+    let mut changed = false;
+    for (name, value) in wanted {
+        let data = Data::String(value);
+        if check {
+            changed |= !registry::value_matches(root, DESKTOP, Some(name), &data);
+        } else {
+            changed |= registry::set_value(root, DESKTOP, Some(name), &data)?;
+        }
+    }
+    Ok(changed)
+}
+
+/// Applies the current user's screen saver settings to the running session.
+pub fn apply_screen_saver_now(s: &ScreenSaver) -> Result<()> {
+    let spi = |action: u32, value: u32| {
+        // SAFETY: these actions take their value in `uiParam` and no buffer.
+        if unsafe {
+            SystemParametersInfoW(action, value, std::ptr::null_mut(), SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE)
+        } == 0
+        {
+            bail!("applying the screen saver setting: {}", io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    spi(SPI_SETSCREENSAVEACTIVE, u32::from(s.enabled))?;
+    if s.enabled {
+        if let Some(t) = s.timeout_secs {
+            spi(SPI_SETSCREENSAVETIMEOUT, u32::try_from(t).unwrap_or(u32::MAX))?;
+        }
+        if let Some(secure) = s.secure {
+            spi(SPI_SETSCREENSAVESECURE, u32::from(secure))?;
+        }
+    }
+    Ok(())
+}
+
+const PERSONALIZATION_CSP: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP";
+const SYSTEM_POLICIES: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+
+/// The lock screen picture for the whole machine (the values the Personalization CSP and
+/// Intune write), so every account sees it at sign-in.
+pub fn set_lock_screen_image(picture: &str, check: bool) -> Result<bool> {
+    let hklm = RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
+    let wanted = [
+        ("LockScreenImagePath", Data::String(picture)),
+        ("LockScreenImageUrl", Data::String(picture)),
+        ("LockScreenImageStatus", Data::Dword(1)),
+    ];
+    let mut changed = false;
+    for (name, data) in &wanted {
+        if check {
+            changed |= !registry::value_matches(&hklm, PERSONALIZATION_CSP, Some(name), data);
+        } else {
+            changed |= registry::set_value(&hklm, PERSONALIZATION_CSP, Some(name), data)?;
+        }
+    }
+    Ok(changed)
+}
+
+/// Lock the machine after this much idle time (the "Interactive logon: Machine inactivity
+/// limit" security setting), for every account.
+pub fn set_lock_after(secs: u64, check: bool) -> Result<bool> {
+    let hklm = RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
+    let data = Data::Dword(u32::try_from(secs).unwrap_or(u32::MAX));
+    if check {
+        return Ok(!registry::value_matches(&hklm, SYSTEM_POLICIES, Some("InactivityTimeoutSecs"), &data));
+    }
+    registry::set_value(&hklm, SYSTEM_POLICIES, Some("InactivityTimeoutSecs"), &data)
 }
 
 /// Tells Explorer and apps that the light/dark setting changed, so they switch now.
