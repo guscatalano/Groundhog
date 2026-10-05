@@ -44,13 +44,6 @@ elevation if needed, and applies the file:
 & ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) https://example.com/dev.groundhog.yaml
 ```
 
-**With winget** (the package is in review, [winget-pkgs#446805](https://github.com/microsoft/winget-pkgs/pull/446805)),
-which puts `groundhog-agent` on the PATH:
-
-```powershell
-winget install GusCatalano.Groundhog
-```
-
 Or download from [Releases](https://github.com/guscatalano/Groundhog/releases/latest):
 
 | Asset | Use |
