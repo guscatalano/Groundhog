@@ -11,7 +11,7 @@ use groundhog_core::engine::{Action, Executor, Outcome, Probe, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
     App, Capability, Certificate, EnvScope, Feature, FileCopy, HiveScope, Password, RegistryData, RegistryType,
-    RegistryValue, RunAction, Shell, User,
+    RegistryValue, RunAction, Shell, Theme, ThemeMode, User, Wallpaper, WallpaperStyle,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
@@ -20,7 +20,7 @@ use groundhog_win::dism::{self, DismError};
 use groundhog_win::process::Proc;
 use groundhog_win::registry::{self, Data, DefaultUserHive};
 use groundhog_win::winget::{self, codes};
-use groundhog_win::{accounts, env};
+use groundhog_win::{accounts, desktop, env};
 use url::Url;
 
 use crate::secrets::Secrets;
@@ -127,6 +127,8 @@ impl Executor for WinExecutor<'_> {
             }
             Action::Feature(f) => self.ensure_feature(f, log),
             Action::Capability(c) => self.ensure_capability(c, log),
+            Action::Wallpaper(w) => self.wallpaper(w, false).map(|changed| Outcome::Done { changed }),
+            Action::Theme(t) => theme(t, false).map(|changed| Outcome::Done { changed }),
             Action::Verify(c) => {
                 crate::checks::run(c, self.started, log)?;
                 Ok(Outcome::Done { changed: false })
@@ -181,6 +183,8 @@ impl Executor for WinExecutor<'_> {
                 would(state.is_on() != c.present)
             }
             Action::Certificate(c) => would(self.certificate(c, true, quiet)?),
+            Action::Wallpaper(w) => would(self.wallpaper(w, true)?),
+            Action::Theme(t) => would(theme(t, true)?),
             Action::Service(s) => would(crate::ensure::service(s, true, quiet)?),
             Action::Firewall(r) => would(crate::ensure::firewall(r, true, quiet)?),
             Action::Defender(e) => would(crate::ensure::defender(e, true, quiet)?),
@@ -468,6 +472,64 @@ impl WinExecutor<'_> {
         crate::ensure::certificate(c, file.as_deref(), check, log)
     }
 
+    /// The desktop picture and background color, for each user hive in scope. The picture is
+    /// copied to `<home>\desktop`, a stable place every account can read (so the Default User
+    /// profile can point at it too) that `clean` leaves alone.
+    fn wallpaper(&mut self, w: &Wallpaper, check: bool) -> Result<bool> {
+        let picture = match &w.from {
+            None => String::new(),
+            Some(from) => {
+                let known = w.sha256.as_deref().or(w.resolved.as_deref());
+                let ext = Path::new(&file_name(from))
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_else(|| "jpg".into());
+                let dir = self.work_dir.parent().unwrap_or(&self.work_dir).join("desktop");
+                if check {
+                    let Some(hash) = known else { return Ok(true) };
+                    dir.join(format!("{}.{ext}", &hash[..16])).to_string_lossy().into_owned()
+                } else {
+                    let fetched = self.content.get_file(from, known)?;
+                    let path = dir.join(format!("{}.{ext}", &fetched.sha256[..16]));
+                    if !path.exists() {
+                        std::fs::create_dir_all(&dir)?;
+                        std::fs::copy(&fetched.path, &path).with_context(|| format!("writing {}", path.display()))?;
+                    }
+                    path.to_string_lossy().into_owned()
+                }
+            }
+        };
+        let rgb = w.background.as_deref().map(|c| {
+            let n = u32::from_str_radix(c.trim_start_matches('#'), 16).unwrap_or(0);
+            ((n >> 16) as u8, (n >> 8) as u8, n as u8)
+        });
+        let style = match w.style {
+            WallpaperStyle::Fill => desktop::Style::Fill,
+            WallpaperStyle::Fit => desktop::Style::Fit,
+            WallpaperStyle::Stretch => desktop::Style::Stretch,
+            WallpaperStyle::Tile => desktop::Style::Tile,
+            WallpaperStyle::Center => desktop::Style::Center,
+            WallpaperStyle::Span => desktop::Style::Span,
+        };
+        let hkcu = registry::hkcu();
+        let mut changed = false;
+        for scope in &w.scope {
+            let hive = match scope {
+                HiveScope::CurrentUser => None,
+                HiveScope::DefaultUser => Some(DefaultUserHive::load()?),
+            };
+            let root = hive.as_ref().map_or(&hkcu, |h| h.root());
+            changed |= desktop::set_wallpaper(root, &picture, style, check)?;
+            if let Some(rgb) = rgb {
+                changed |= desktop::set_background(root, rgb, check)?;
+            }
+        }
+        if changed && !check && w.scope.contains(&HiveScope::CurrentUser) {
+            desktop::apply_now(&picture, rgb)?;
+        }
+        Ok(changed)
+    }
+
     fn restart_later_if(&mut self, pending: bool) -> Outcome {
         if pending {
             self.deferred_restart = true;
@@ -684,6 +746,25 @@ fn delete_registry(r: &RegistryValue) -> Result<Outcome> {
         };
     }
     Ok(Outcome::Done { changed })
+}
+
+/// Light or dark mode for each user hive in scope; the running session switches at once.
+fn theme(t: &Theme, check: bool) -> Result<bool> {
+    let light = |m: Option<ThemeMode>| m.map(|m| m == ThemeMode::Light);
+    let hkcu = registry::hkcu();
+    let mut changed = false;
+    for scope in &t.scope {
+        let hive = match scope {
+            HiveScope::CurrentUser => None,
+            HiveScope::DefaultUser => Some(DefaultUserHive::load()?),
+        };
+        let root = hive.as_ref().map_or(&hkcu, |h| h.root());
+        changed |= desktop::set_theme(root, light(t.apps), light(t.windows), check)?;
+    }
+    if changed && !check && t.scope.contains(&HiveScope::CurrentUser) {
+        desktop::broadcast_theme_change();
+    }
+    Ok(changed)
 }
 
 /// What a winget app entry asks for.

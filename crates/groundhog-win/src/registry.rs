@@ -71,6 +71,11 @@ pub fn set_value(root: &RegKey, subkey: &str, name: Option<&str>, data: &Data) -
     Ok(true)
 }
 
+/// `HKEY_CURRENT_USER`: the account this process runs as.
+pub fn hkcu() -> RegKey {
+    RegKey::predef(HKEY_CURRENT_USER)
+}
+
 /// Reads a string value, if present.
 pub fn get_string(root: &RegKey, subkey: &str, name: &str) -> Option<String> {
     root.open_subkey_with_flags(subkey, KEY_READ).ok()?.get_value(name).ok()

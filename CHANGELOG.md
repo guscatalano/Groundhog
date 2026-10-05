@@ -4,6 +4,20 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.15.0] - 2026-10-04
+
+### Added
+- **`desktop:`** sets the light or dark theme (for apps and for Windows, together or
+  separately), the desktop picture (a path or URL, with fill, fit, stretch, tile, center or
+  span) and a solid background color, for the agent's user (live, like Settings) and, with
+  `scope: default-user`, for profiles created later.
+  ```yaml
+  desktop:
+    theme: dark
+    wallpaper: https://example.com/lab.jpg
+    background: "#203040"
+  ```
+
 ## [0.14.1] - 2026-10-03
 
 ### Fixed
@@ -348,6 +362,7 @@ First release.
   and `pending` writes the bootstrap file for templated VMs (Proxmox, Hyper-V, …).
 - HTTPS uses Windows' own TLS and certificate store, so enterprise CAs work.
 
+[0.15.0]: https://github.com/guscatalano/Groundhog/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/guscatalano/Groundhog/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/guscatalano/Groundhog/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/guscatalano/Groundhog/compare/v0.13.0...v0.13.1

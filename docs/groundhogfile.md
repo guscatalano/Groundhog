@@ -5,7 +5,7 @@ errors, so typos fail at load time instead of being ignored.
 
 Steps run in this order: `users`, `certificates`, `defender-exclusions`, `features`,
 `capabilities`, `remove-apps`, winget bootstrap (if any winget apps), `apps`, `files`, `env`,
-`path`, `registry`, `services`, `firewall`, `run`, then the `verify` checks.
+`path`, `registry`, `desktop`, `services`, `firewall`, `run`, then the `verify` checks.
 
 **Removing things.** Most entries take `state: absent` (the default is `present`): an app is
 uninstalled, a file or folder deleted, an env var, PATH entry, registry value or key, user,
@@ -573,6 +573,26 @@ within two levels of a hive's root (`HKLM\SOFTWARE` itself, say).
 - `current-user` (default): the account the agent runs as.
 - `default-user`: `C:\Users\Default\NTUSER.DAT`, so profiles created **later** get the value
   too. Requires the agent to run elevated.
+
+## `desktop`
+
+```yaml
+desktop:
+  theme: dark                       # dark | light, or { apps: dark, windows: light }
+  wallpaper: images/lab.jpg         # a picture: a path or URL, like `files` (or { from, sha256 })
+  wallpaper-style: fill             # fill (default) | fit | stretch | tile | center | span
+  background: "#203040"             # solid color: alone, or around a fit/center picture
+  scope: [current-user, default-user]
+```
+
+The light or dark mode (for apps, and for Windows itself: taskbar, Start), the desktop
+picture, and the solid background color. For the account the agent runs as they take effect
+at once, as when changed in Settings; `default-user` sets them for profiles created later.
+The picture is copied to `%ProgramData%\groundhog\desktop`, where every account can read it,
+and `groundhog-agent clean` leaves it there, so a template's wallpaper survives sealing.
+
+A later file overrides an earlier one setting by setting: a file that extends a base with
+`theme: light` can say `theme: { windows: dark }` and keep the base's light apps.
 
 ## `services`
 

@@ -29,6 +29,8 @@ pub struct Groundhogfile {
     pub env: BTreeMap<String, EnvVar>,
     pub path: Vec<PathEntry>,
     pub registry: Vec<RegistryValue>,
+    pub wallpaper: Option<Wallpaper>,
+    pub theme: Option<Theme>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -192,6 +194,53 @@ pub enum ExclusionKind {
     Path,
     Process,
     Extension,
+}
+
+/// The desktop picture and/or solid background color.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Wallpaper {
+    /// The picture (path or URL). `None`: no picture, just the background color.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<Url>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Content hash found at load time when `sha256` is not pinned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    pub style: WallpaperStyle,
+    /// `#RRGGBB`, upper case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    pub scope: Vec<HiveScope>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WallpaperStyle {
+    #[default]
+    Fill,
+    Fit,
+    Stretch,
+    Tile,
+    Center,
+    Span,
+}
+
+/// Light or dark mode, for apps and for Windows itself (taskbar, Start, notifications).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Theme {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apps: Option<ThemeMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows: Option<ThemeMode>,
+    pub scope: Vec<HiveScope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThemeMode {
+    Light,
+    Dark,
 }
 
 /// A Windows optional feature (`NetFx3`, `Microsoft-Windows-Subsystem-Linux`, ...).
@@ -588,7 +637,7 @@ pub(crate) mod raw {
 
     use super::{
         CertScope, CertStore, EnvScope, EventsSince, FirewallAction, FirewallDirection, FirewallProtocol, HiveScope,
-        Presence, RegistryType, ServiceState, Shell, StartupType,
+        Presence, RegistryType, ServiceState, Shell, StartupType, ThemeMode, WallpaperStyle,
     };
 
     #[derive(Debug, Default, Deserialize)]
@@ -634,6 +683,31 @@ pub(crate) mod raw {
         pub defender_exclusions: Vec<StringOr<DefenderExclusion>>,
         #[serde(default)]
         pub remove_apps: Vec<String>,
+        pub desktop: Option<Desktop>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct Desktop {
+        pub theme: Option<StringOr<ThemeFull>>,
+        pub wallpaper: Option<StringOr<WallpaperFull>>,
+        pub wallpaper_style: Option<WallpaperStyle>,
+        pub background: Option<String>,
+        pub scope: Option<OneOrMany<HiveScope>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ThemeFull {
+        pub apps: Option<ThemeMode>,
+        pub windows: Option<ThemeMode>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct WallpaperFull {
+        pub from: String,
+        pub sha256: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]

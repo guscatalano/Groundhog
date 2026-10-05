@@ -16,7 +16,8 @@ use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
     App, Capability, CertScope, Certificate, Check, DefenderExclusion, EnvScope, Feature, FileCopy, FirewallRule,
-    Groundhogfile, Presence, RegistryData, RegistryValue, RunAction, Service, ServiceState, User,
+    Groundhogfile, Presence, RegistryData, RegistryValue, RunAction, Service, ServiceState, Theme, ThemeMode, User,
+    Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -59,6 +60,8 @@ pub enum Action {
     RemoveApp {
         name: String,
     },
+    Wallpaper(Wallpaper),
+    Theme(Theme),
 }
 
 impl Action {
@@ -153,6 +156,26 @@ fn title(action: &Action) -> String {
             }
         }
         Action::RemoveApp { name } => format!("remove built-in app {name}"),
+        Action::Wallpaper(w) => {
+            let mut parts = Vec::new();
+            if let Some(from) = &w.from {
+                parts.push(format!("{} ({})", file_name(from), format!("{:?}", w.style).to_ascii_lowercase()));
+            }
+            if let Some(color) = &w.background {
+                parts.push(format!("background {color}"));
+            }
+            format!("set wallpaper {}", parts.join(", "))
+        }
+        Action::Theme(t) => match (t.apps, t.windows) {
+            (Some(a), Some(w)) if a == w => format!("set {} theme", format!("{a:?}").to_ascii_lowercase()),
+            (a, w) => {
+                let part = |who: &str, m: Option<ThemeMode>| {
+                    m.map(|m| format!("{who} {}", format!("{m:?}").to_ascii_lowercase()))
+                };
+                let parts: Vec<String> = [part("apps", a), part("windows", w)].into_iter().flatten().collect();
+                format!("set theme: {}", parts.join(", "))
+            }
+        },
         Action::Run(RunAction::Command { command, .. }) => format!("run: {}", command_title(command)),
         Action::Run(RunAction::Script { script, .. }) => format!("run script {}", file_name(script)),
         Action::Run(RunAction::Plugin { plugin, .. }) => format!("run plugin {}", file_name(plugin)),
@@ -178,7 +201,9 @@ fn build_label(action: &Action) -> Option<String> {
         Action::App(App::Url { release, resolved, .. }) | Action::File(FileCopy { release, resolved, .. }) => {
             (release.as_deref(), resolved.as_deref())
         }
-        Action::Certificate(Certificate { resolved, .. }) => (None, resolved.as_deref()),
+        Action::Certificate(Certificate { resolved, .. }) | Action::Wallpaper(Wallpaper { resolved, .. }) => {
+            (None, resolved.as_deref())
+        }
         Action::Run(RunAction::Script { resolved, .. } | RunAction::Plugin { resolved, .. }) => {
             (None, resolved.as_deref())
         }
@@ -259,6 +284,8 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     }));
     actions.extend(file.path.iter().map(|p| Action::Path { dir: p.dir.clone(), scope: p.scope, state: p.state }));
     actions.extend(file.registry.iter().cloned().map(Action::Registry));
+    actions.extend(file.wallpaper.iter().cloned().map(Action::Wallpaper));
+    actions.extend(file.theme.iter().cloned().map(Action::Theme));
     // Services and firewall rules after apps, which often install what they refer to.
     actions.extend(file.services.iter().cloned().map(Action::Service));
     actions.extend(file.firewall.iter().cloned().map(Action::Firewall));
@@ -330,6 +357,7 @@ fn section(action: &Action) -> &'static str {
         Action::User(_) => "users",
         Action::EnsureWinget | Action::App(_) | Action::RemoveApp { .. } => "apps",
         Action::Certificate(_) => "certificates",
+        Action::Wallpaper(_) | Action::Theme(_) => "desktop",
         Action::Defender(_) => "defender",
         Action::Service(_) => "services",
         Action::Firewall(_) => "firewall",

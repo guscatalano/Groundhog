@@ -17,7 +17,8 @@ use crate::library;
 use crate::model::{
     App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, EnvScope, EnvVar,
     ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, Password, PathEntry,
-    Presence, RegistryData, RegistryType, RegistryValue, RunAction, Service, ServiceState, Shell, SourceRef, User, raw,
+    Presence, RegistryData, RegistryType, RegistryValue, RunAction, Service, ServiceState, Shell, SourceRef, Theme,
+    ThemeMode, User, Wallpaper, WallpaperStyle, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
@@ -210,6 +211,9 @@ impl<'a> Loader<'a> {
                 from_github(from, &mut c.sha256, &mut None)?;
             }
         }
+        if let Some(Wallpaper { from: Some(from), sha256, .. }) = &mut file.wallpaper {
+            from_github(from, sha256, &mut None)?;
+        }
 
         let mut seen: HashMap<Url, String> = HashMap::new();
         let mut resolve = |url: &Url, pinned: &Option<String>, slot: &mut Option<String>| -> Result<()> {
@@ -246,6 +250,9 @@ impl<'a> Loader<'a> {
             if let Some(from) = &c.from {
                 resolve(from, &c.sha256, &mut c.resolved)?;
             }
+        }
+        if let Some(Wallpaper { from: Some(from), sha256, resolved, .. }) = &mut file.wallpaper {
+            resolve(from, sha256, resolved)?;
         }
         for r in &mut file.run {
             match r {
@@ -475,6 +482,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         firewall,
         defender_exclusions,
         remove_apps,
+        desktop,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -561,6 +569,10 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     if remove_apps.iter().any(|a| a.trim().is_empty()) {
         bail!("remove-apps: an entry is empty");
     }
+    let (wallpaper, theme) = match desktop {
+        Some(d) => resolve_desktop(base, d).context("desktop")?,
+        None => (None, None),
+    };
 
     let file = Groundhogfile {
         users,
@@ -574,6 +586,8 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         env,
         path,
         registry,
+        wallpaper,
+        theme,
         services,
         firewall,
         run,
@@ -818,6 +832,76 @@ fn resolve_firewall(r: raw::FirewallRule) -> Result<FirewallRule> {
         remote: r.remote.map(|r| r.into_vec().join(",")),
         state,
     })
+}
+
+fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<(Option<Wallpaper>, Option<Theme>)> {
+    let mut scope = d.scope.map(raw::OneOrMany::into_vec).unwrap_or_else(|| vec![HiveScope::CurrentUser]);
+    scope.sort();
+    scope.dedup();
+
+    let background = d.background.map(|c| parse_color(&c)).transpose()?;
+    let picture = match d.wallpaper {
+        None => None,
+        Some(raw::StringOr::Short(from)) => Some((from, None)),
+        Some(raw::StringOr::Full(w)) => Some((w.from, w.sha256)),
+    };
+    if picture.is_none() && d.wallpaper_style.is_some() {
+        bail!("'wallpaper-style' needs a 'wallpaper' (a picture)");
+    }
+    let wallpaper = match picture {
+        Some((from, sha256)) => {
+            let url = resolve_ref(base, &from)?;
+            let name = url.path().to_ascii_lowercase();
+            let pictures = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".jfif"];
+            if !github::is_github(&url) && !pictures.iter().any(|ext| name.ends_with(ext)) {
+                bail!("wallpaper '{from}' should be a picture (.jpg, .png, .bmp, …)");
+            }
+            Some(Wallpaper {
+                from: Some(url),
+                sha256: pin(sha256)?,
+                resolved: None,
+                style: d.wallpaper_style.unwrap_or_default(),
+                background,
+                scope: scope.clone(),
+            })
+        }
+        // Only a color: a plain desktop of that color.
+        None => background.map(|background| Wallpaper {
+            from: None,
+            sha256: None,
+            resolved: None,
+            style: WallpaperStyle::default(),
+            background: Some(background),
+            scope: scope.clone(),
+        }),
+    };
+
+    let theme = d.theme.map(|t| match t {
+        raw::StringOr::Short(mode) => {
+            let mode = match mode.to_ascii_lowercase().as_str() {
+                "dark" => ThemeMode::Dark,
+                "light" => ThemeMode::Light,
+                other => bail!("theme '{other}' isn't dark or light (or {{ apps: …, windows: … }})"),
+            };
+            Ok(Theme { apps: Some(mode), windows: Some(mode), scope: scope.clone() })
+        }
+        raw::StringOr::Full(f) => {
+            if f.apps.is_none() && f.windows.is_none() {
+                bail!("theme needs 'apps', 'windows' or both");
+            }
+            Ok(Theme { apps: f.apps, windows: f.windows, scope: scope.clone() })
+        }
+    });
+    Ok((wallpaper, theme.transpose()?))
+}
+
+/// `#RRGGBB` (or `RRGGBB`), normalized to upper case with the `#`.
+fn parse_color(c: &str) -> Result<String> {
+    let hex = c.trim().trim_start_matches('#');
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("color '{c}' should look like #203040");
+    }
+    Ok(format!("#{}", hex.to_ascii_uppercase()))
 }
 
 fn resolve_exclusion(e: raw::StringOr<raw::DefenderExclusion>) -> Result<DefenderExclusion> {
@@ -1348,6 +1432,13 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
     // The strictest requirement wins: a base that needs a newer agent still needs it.
     let requires_agent = base.requires_agent.max(top.requires_agent);
 
+    // Desktop settings: the later file wins, setting by setting.
+    let wallpaper = top.wallpaper.or(base.wallpaper);
+    let theme = match (base.theme, top.theme) {
+        (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
+        (b, t) => t.or(b),
+    };
+
     Groundhogfile {
         users,
         certificates,
@@ -1360,6 +1451,8 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
         env,
         path,
         registry,
+        wallpaper,
+        theme,
         services,
         firewall,
         run,
@@ -1841,6 +1934,44 @@ firewall:
             ("firewall: [{ name: X, port: 80, state: absent }]", "only needs 'name'"),
             ("firewall: [{ name: X, profile: work }]", "isn't any, domain"),
             ("defender-exclusions: [{ path: a, process: b }]", "one of 'path'"),
+        ] {
+            let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
+            let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn desktop_settings_parse_and_merge() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/base.yaml",
+                "desktop: { theme: light, wallpaper: lab.jpg, wallpaper-style: fit, background: '#203040' }",
+            )
+            .with("https://cfg.test/lab.jpg", "jpeg bytes")
+            .with(
+                "https://cfg.test/top.yaml",
+                "extends: base.yaml\ndesktop: { theme: { windows: dark }, scope: [current-user, default-user] }",
+            );
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let w = g.wallpaper.unwrap();
+        assert_eq!((w.style, w.background.as_deref()), (WallpaperStyle::Fit, Some("#203040")));
+        assert!(w.resolved.is_some(), "the picture is hashed at load");
+        let t = g.theme.unwrap();
+        assert_eq!((t.apps, t.windows), (Some(ThemeMode::Light), Some(ThemeMode::Dark)), "merged setting by setting");
+        assert_eq!(t.scope, [HiveScope::CurrentUser, HiveScope::DefaultUser]);
+
+        let only_color = MapFetcher::default().with("https://cfg.test/c.yaml", "desktop: { background: 0a0b0c }");
+        let g = load_with(&only_color, "https://cfg.test/c.yaml", dir.path()).unwrap().file;
+        assert_eq!(g.wallpaper.unwrap().background.as_deref(), Some("#0A0B0C"));
+
+        for (bad, why) in [
+            ("desktop: { theme: purple }", "isn't dark or light"),
+            ("desktop: { background: red }", "should look like #203040"),
+            ("desktop: { wallpaper-style: fill }", "needs a 'wallpaper'"),
+            ("desktop: { wallpaper: notes.txt }", "should be a picture"),
+            ("desktop: { wallpapr: a.jpg }", "unknown field"),
         ] {
             let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
