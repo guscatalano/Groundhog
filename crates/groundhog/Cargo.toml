@@ -3,6 +3,7 @@ name = "groundhog"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"

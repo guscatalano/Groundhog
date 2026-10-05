@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.15.0"
 edition = "2024"
 repository = "https://github.com/guscatalano/Groundhog"
+license = "MIT"
 
 [profile.release]
 # The agent gets copied into every VM; keep it small.
