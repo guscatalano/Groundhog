@@ -1,0 +1,166 @@
+# Windows without the nagging: no "finish setting up your device" or Microsoft account and
+# backup reminders, no tips, suggestions or ads in Start, Settings, Explorer or on the lock
+# screen, no apps installed behind your back, no web results in Start's search. For this user
+# and new ones; takes effect at the next sign-in (or when Explorer restarts).
+#
+# Only settings Windows offers in Settings or Group Policy; nothing is uninstalled. The
+# CloudContent policies at the end only take effect on Enterprise and Education (and are
+# harmless elsewhere); the per-user values cover Home and Pro.
+
+registry:
+  # "Let's finish setting up your device" (back up with OneDrive, sign in with a Microsoft
+  # account, Microsoft 365, Phone Link) after updates and at sign-in.
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement
+    name: ScoobeSystemSettingEnabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  # Account notifications in Start (the badge on your picture: back up, sign in, ...).
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced
+    name: Start_AccountNotifications
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  # ... and on the Settings home page.
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\SystemSettings\AccountNotifications
+    name: EnableAccountNotifications
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  # Recommendations for tips, shortcuts and new apps in Start.
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced
+    name: Start_IrisRecommendations
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  # OneDrive and Microsoft 365 ads in Explorer.
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced
+    name: ShowSyncProviderNotifications
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  # "Suggested" notifications (Windows suggesting ways to use it).
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.Suggested
+    name: Enabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+
+  # Content delivery: the source of tips, "suggested" apps and lock screen fun facts.
+  # The welcome experience after updates
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: SubscribedContent-310093Enabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  # Tips, tricks and suggestions as you use Windows
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: SubscribedContent-338389Enabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: SoftLandingEnabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  # Suggestions in Start
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: SubscribedContent-338388Enabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: SystemPaneSuggestionsEnabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  # Suggested content in Settings
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: SubscribedContent-338393Enabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: SubscribedContent-353694Enabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: SubscribedContent-353696Enabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  # Fun facts and tips on the lock screen
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: SubscribedContent-338387Enabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: RotatingLockScreenOverlayEnabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  # Apps installed without asking (Candy Crush and friends on a new profile)
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: SilentInstalledAppsEnabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: PreInstalledAppsEnabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager
+    name: OemPreInstalledAppsEnabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+
+  # Ads personalized with the advertising ID, and "tailored experiences".
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo
+    name: Enabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\Privacy
+    name: TailoredExperiencesWithDiagnosticDataEnabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+
+  # Start's search: local results only, no Bing and no "search highlights".
+  - key: HKCU\Software\Policies\Microsoft\Windows\Explorer
+    name: DisableSearchBoxSuggestions
+    type: dword
+    value: 1
+    scope: [current-user, default-user]
+  - key: HKCU\Software\Microsoft\Windows\CurrentVersion\SearchSettings
+    name: IsDynamicSearchBoxEnabled
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
+
+  # OneDrive's "Turn on Windows Backup" (move Desktop, Documents and Pictures into OneDrive).
+  # This is OneDrive's own policy, on every edition; it also removes that choice from
+  # OneDrive's settings, so leave this library out if you want that backup.
+  - key: HKLM\SOFTWARE\Policies\Microsoft\OneDrive
+    name: KFMBlockOptIn
+    type: dword
+    value: 1
+
+  # The same, as machine policy (Enterprise and Education).
+  - key: HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent
+    name: DisableWindowsConsumerFeatures
+    type: dword
+    value: 1
+  - key: HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent
+    name: DisableSoftLanding
+    type: dword
+    value: 1
+  - key: HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent
+    name: DisableConsumerAccountStateContent
+    type: dword
+    value: 1

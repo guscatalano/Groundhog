@@ -489,11 +489,12 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         defender_exclusions,
         remove_apps,
         desktop,
+        uac,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
     let apps = apps.into_iter().map(|a| resolve_app(base, a)).collect::<Result<_>>()?;
-    let files = files.into_iter().map(|f| resolve_file(base, f)).collect::<Result<_>>()?;
+    let mut files: Vec<FileCopy> = files.into_iter().map(|f| resolve_file(base, f)).collect::<Result<_>>()?;
 
     if let Some(bad) = env.keys().find(|k| k.is_empty() || k.contains('=')) {
         bail!("invalid environment variable name '{bad}'");
@@ -528,7 +529,10 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         })
         .collect();
 
-    let registry = registry.into_iter().map(resolve_registry).collect::<Result<_>>()?;
+    let mut registry: Vec<RegistryValue> = registry.into_iter().map(resolve_registry).collect::<Result<_>>()?;
+    if let Some(uac) = uac {
+        registry.extend(resolve_uac(uac).context("uac")?);
+    }
 
     let run = run
         .into_iter()
@@ -575,10 +579,20 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     if remove_apps.iter().any(|a| a.trim().is_empty()) {
         bail!("remove-apps: an entry is empty");
     }
-    let DesktopParts { wallpaper, theme, lock_screen, screen_saver } = match desktop {
-        Some(d) => resolve_desktop(base, d).context("desktop")?,
-        None => DesktopParts { wallpaper: None, theme: None, lock_screen: None, screen_saver: None },
-    };
+    let DesktopParts { wallpaper, theme, lock_screen, screen_saver, registry: desktop_registry, files: desktop_files } =
+        match desktop {
+            Some(d) => resolve_desktop(base, d).context("desktop")?,
+            None => DesktopParts {
+                wallpaper: None,
+                theme: None,
+                lock_screen: None,
+                screen_saver: None,
+                registry: Vec::new(),
+                files: Vec::new(),
+            },
+        };
+    registry.extend(desktop_registry);
+    files.extend(desktop_files);
 
     let file = Groundhogfile {
         users,
@@ -848,6 +862,10 @@ struct DesktopParts {
     theme: Option<Theme>,
     lock_screen: Option<LockScreen>,
     screen_saver: Option<ScreenSaver>,
+    /// Taskbar and Start settings, which are plain registry values.
+    registry: Vec<RegistryValue>,
+    /// The taskbar's pin list.
+    files: Vec<FileCopy>,
 }
 
 /// A picture reference (wallpaper, lock screen), checked to look like one.
@@ -964,7 +982,184 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<DesktopParts> {
         .transpose()
         .context("screen-saver")?;
 
-    Ok(DesktopParts { wallpaper, theme: theme.transpose()?, lock_screen, screen_saver })
+    let mut registry = Vec::new();
+    let mut files = Vec::new();
+    if let Some(t) = d.taskbar {
+        resolve_taskbar(t, &scope, &mut registry, &mut files).context("taskbar")?;
+    }
+    if let Some(s) = d.start {
+        registry.extend(resolve_start(s, &scope).context("start")?);
+    }
+
+    Ok(DesktopParts { wallpaper, theme: theme.transpose()?, lock_screen, screen_saver, registry, files })
+}
+
+fn dword(key: &str, name: &str, value: u32, scope: &[HiveScope]) -> RegistryValue {
+    RegistryValue {
+        key: key.to_owned(),
+        name: Some(name.to_owned()),
+        kind: RegistryType::Dword,
+        data: RegistryData::Dword(value),
+        scope: scope.to_vec(),
+        state: Presence::Present,
+        group_policy: false,
+    }
+}
+
+const EXPLORER_ADVANCED: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced";
+const EXPLORER_POLICIES: &str = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer";
+/// Where the taskbar pins go for everyone (named by the Start layout policy), next to the
+/// desktop pictures so `clean` leaves it.
+const TASKBAR_POLICY_FILE: &str = r"%ProgramData%\groundhog\desktop\taskbar.xml";
+/// Read once, when a new profile is created from the Default one.
+const TASKBAR_DEFAULT_PROFILE_FILE: &str =
+    r"%SystemDrive%\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml";
+
+fn resolve_taskbar(
+    t: raw::TaskbarFull,
+    scope: &[HiveScope],
+    registry: &mut Vec<RegistryValue>,
+    files: &mut Vec<FileCopy>,
+) -> Result<()> {
+    let before = registry.len() + files.len();
+    if let Some(a) = t.alignment {
+        registry.push(dword(EXPLORER_ADVANCED, "TaskbarAl", a as u32, scope));
+    }
+    if let Some(s) = t.search {
+        registry.push(dword(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Search",
+            "SearchboxTaskbarMode",
+            s as u32,
+            scope,
+        ));
+    }
+    if let Some(v) = t.task_view {
+        registry.push(dword(EXPLORER_ADVANCED, "ShowTaskViewButton", u32::from(v), scope));
+    }
+    // Windows guards the per-user widgets switch (TaskbarDa) against programs, so this is the
+    // machine policy instead, which only Group Policy itself may write: `false` turns widgets
+    // off, `true` lifts the policy.
+    if let Some(on) = t.widgets {
+        let mut v =
+            dword(r"HKLM\SOFTWARE\Policies\Microsoft\Dsh", "AllowNewsAndInterests", 0, &[HiveScope::CurrentUser]);
+        v.group_policy = true;
+        if on {
+            v.state = Presence::Absent;
+            v.data = RegistryData::String(String::new());
+        }
+        registry.push(v);
+    }
+    match (t.pins, t.pins_for) {
+        (None, Some(_)) => bail!("'pins-for' needs 'pins'"),
+        (None, None) => {}
+        (Some(pins), pins_for) => {
+            let content = taskbar_layout(&pins)?;
+            let to = match pins_for.unwrap_or_default() {
+                raw::PinsFor::Everyone => {
+                    registry.push(RegistryValue {
+                        key: EXPLORER_POLICIES.to_owned(),
+                        name: Some("StartLayoutFile".to_owned()),
+                        kind: RegistryType::ExpandString,
+                        data: RegistryData::String(TASKBAR_POLICY_FILE.to_owned()),
+                        scope: vec![HiveScope::CurrentUser],
+                        state: Presence::Present,
+                        group_policy: false,
+                    });
+                    registry.push(dword(EXPLORER_POLICIES, "LockedStartLayout", 1, &[HiveScope::CurrentUser]));
+                    TASKBAR_POLICY_FILE
+                }
+                raw::PinsFor::NewAccounts => TASKBAR_DEFAULT_PROFILE_FILE,
+            };
+            files.push(FileCopy {
+                from: None,
+                content: Some(content),
+                to: to.to_owned(),
+                sha256: None,
+                resolved: None,
+                extract: false,
+                strip: 0,
+                release: None,
+                state: Presence::Present,
+            });
+        }
+    }
+    if registry.len() + files.len() == before {
+        bail!("needs at least one of 'alignment', 'search', 'task-view', 'widgets' or 'pins'");
+    }
+    Ok(())
+}
+
+/// Short names for apps people pin most, so a file needn't spell out package ids.
+const PIN_ALIASES: &[(&str, &str)] = &[
+    ("file-explorer", "Microsoft.Windows.Explorer"),
+    ("edge", "MSEdge"),
+    ("terminal", "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"),
+    ("notepad", "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"),
+    ("paint", "Microsoft.Paint_8wekyb3d8bbwe!App"),
+    ("settings", "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"),
+    ("store", "Microsoft.WindowsStore_8wekyb3d8bbwe!App"),
+    ("calculator", "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"),
+];
+
+/// The taskbar pins as a Start layout file that replaces Windows' own pins. Each pin is an
+/// alias, a shortcut (`….lnk`), a packaged app's id (`…!App`), or a desktop app's id, as
+/// `Get-StartApps` lists them.
+fn taskbar_layout(pins: &[String]) -> Result<String> {
+    let mut items = String::new();
+    for pin in pins {
+        let pin = pin.trim();
+        if pin.is_empty() {
+            bail!("a pin is empty");
+        }
+        let id = PIN_ALIASES.iter().find(|(alias, _)| *alias == pin).map_or(pin, |(_, id)| id);
+        let id = xml_escape(id);
+        let item = if id.to_ascii_lowercase().ends_with(".lnk") {
+            format!(r#"<taskbar:DesktopApp DesktopApplicationLinkPath="{id}"/>"#)
+        } else if id.contains('!') {
+            format!(r#"<taskbar:UWA AppUserModelID="{id}"/>"#)
+        } else {
+            format!(r#"<taskbar:DesktopApp DesktopApplicationID="{id}"/>"#)
+        };
+        items.push_str("        ");
+        items.push_str(&item);
+        items.push('\n');
+    }
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<!-- Written by Groundhog: the taskbar's pinned apps. -->
+<LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">
+  <CustomTaskbarLayoutCollection PinListPlacement="Replace">
+    <defaultlayout:TaskbarLayout>
+      <taskbar:TaskbarPinList>
+{items}      </taskbar:TaskbarPinList>
+    </defaultlayout:TaskbarLayout>
+  </CustomTaskbarLayoutCollection>
+</LayoutModificationTemplate>
+"#
+    ))
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn resolve_start(s: raw::StartFull, scope: &[HiveScope]) -> Result<Vec<RegistryValue>> {
+    let values = [
+        ("Start_TrackDocs", s.recommended_files),
+        ("Start_TrackProgs", s.most_used_apps),
+        ("Start_IrisRecommendations", s.recommendations),
+        ("Start_AccountNotifications", s.account_notifications),
+    ];
+    let out: Vec<RegistryValue> = values
+        .into_iter()
+        .filter_map(|(name, v)| v.map(|v| dword(EXPLORER_ADVANCED, name, u32::from(v), scope)))
+        .collect();
+    if out.is_empty() {
+        bail!(
+            "needs at least one of 'recommended-files', 'most-used-apps', 'recommendations' or 'account-notifications'"
+        );
+    }
+    Ok(out)
 }
 
 /// `#RRGGBB` (or `RRGGBB`), normalized to upper case with the `#`.
@@ -1371,6 +1566,10 @@ fn resolve_registry(r: raw::RegistryValue) -> Result<RegistryValue> {
     if !is_hkcu && scope.contains(&HiveScope::DefaultUser) {
         bail!("registry key '{key}': scope 'default-user' only applies to HKCU keys");
     }
+    let group_policy = r.via == Some(raw::RegistryVia::GroupPolicy);
+    if group_policy && !matches!(root.as_str(), "HKLM" | "HKEY_LOCAL_MACHINE") {
+        bail!("registry key '{key}': 'via: group-policy' is for HKLM keys (the machine's policy)");
+    }
 
     let state = r.state.unwrap_or_default();
     let name = r.name.filter(|n| !n.is_empty());
@@ -1385,7 +1584,18 @@ fn resolve_registry(r: raw::RegistryValue) -> Result<RegistryValue> {
         if name.is_none() && key.split('\\').filter(|p| !p.is_empty()).count() < 3 {
             bail!("registry key {key}: refusing to delete a key this close to the root of the hive");
         }
-        return Ok(RegistryValue { key, name, kind: r.kind, data: RegistryData::String(String::new()), scope, state });
+        if group_policy && name.is_none() {
+            bail!("registry key {key}: 'via: group-policy' removes values, not whole keys");
+        }
+        return Ok(RegistryValue {
+            key,
+            name,
+            kind: r.kind,
+            data: RegistryData::String(String::new()),
+            scope,
+            state,
+            group_policy,
+        });
     }
     let value = r.value.ok_or_else(|| anyhow!("registry value {key}: needs a 'value' (or 'state: absent')"))?;
     let data = match (r.kind, value) {
@@ -1401,7 +1611,37 @@ fn resolve_registry(r: raw::RegistryValue) -> Result<RegistryValue> {
         (kind, _) => return Err(bad(&format!("value does not match type {kind:?}"))),
     };
 
-    Ok(RegistryValue { key, name, kind: r.kind, data, scope, state })
+    Ok(RegistryValue { key, name, kind: r.kind, data, scope, state, group_policy })
+}
+
+const UAC_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+
+/// `uac:` as the policy values it stands for. A `level` picks the Control Panel slider's
+/// values; `admin-prompt` and `secure-desktop` given alongside it win over the level's.
+fn resolve_uac(u: raw::Uac) -> Result<Vec<RegistryValue>> {
+    let (mut admin, mut secure) = match u.level {
+        None => (None, None),
+        Some(raw::UacLevel::AlwaysNotify) => (Some(raw::AdminPrompt::ConsentOnSecureDesktop as u32), Some(true)),
+        Some(raw::UacLevel::Default) => (Some(raw::AdminPrompt::ConsentForNonWindowsBinaries as u32), Some(true)),
+        Some(raw::UacLevel::NoDim) => (Some(raw::AdminPrompt::ConsentForNonWindowsBinaries as u32), Some(false)),
+        Some(raw::UacLevel::NeverNotify) => (Some(raw::AdminPrompt::ElevateWithoutPrompting as u32), Some(false)),
+    };
+    admin = u.admin_prompt.map(|a| a as u32).or(admin);
+    secure = u.secure_desktop.or(secure);
+    let values = [
+        ("EnableLUA", u.enabled.map(u32::from)),
+        ("ConsentPromptBehaviorAdmin", admin),
+        ("ConsentPromptBehaviorUser", u.user_prompt.map(|p| p as u32)),
+        ("PromptOnSecureDesktop", secure.map(u32::from)),
+    ];
+    let out: Vec<RegistryValue> = values
+        .into_iter()
+        .filter_map(|(name, v)| v.map(|v| dword(UAC_KEY, name, v, &[HiveScope::CurrentUser])))
+        .collect();
+    if out.is_empty() {
+        bail!("needs at least one of 'level', 'admin-prompt', 'user-prompt', 'secure-desktop' or 'enabled'");
+    }
+    Ok(out)
 }
 
 fn scalar_to_u64(v: raw::Scalar) -> Option<u64> {
@@ -2069,6 +2309,103 @@ firewall:
             ("desktop: { screen-saver: { enabled: false, timeout: 5m } }", "don't go with it"),
             ("desktop: { screen-saver: { program: aquarium } }", "isn't blank, bubbles"),
             ("desktop: { lock-screen: { image: lock.txt } }", "should be a picture"),
+        ] {
+            let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
+            let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn taskbar_and_start_become_registry_values_and_a_pin_list() {
+        let f = MapFetcher::default().with(
+            "https://cfg.test/t.yaml",
+            "desktop:\n  taskbar:\n    alignment: left\n    search: icon\n    task-view: false\n    widgets: false\n    pins: [file-explorer, terminal, 'C:\\Tools\\R&D.lnk', 'Vendor.App_abc!App', MSEdge]\n  start: { recommendations: false, recommended-files: false }\n  scope: [current-user, default-user]",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/t.yaml", dir.path()).unwrap().file;
+        let value = |name: &str| g.registry.iter().find(|r| r.name.as_deref() == Some(name)).unwrap();
+        assert_eq!(value("TaskbarAl").data, RegistryData::Dword(0));
+        assert_eq!(value("TaskbarAl").scope, vec![HiveScope::CurrentUser, HiveScope::DefaultUser]);
+        assert_eq!(value("SearchboxTaskbarMode").data, RegistryData::Dword(1));
+        assert_eq!(value("ShowTaskViewButton").data, RegistryData::Dword(0));
+        assert_eq!(value("AllowNewsAndInterests").data, RegistryData::Dword(0));
+        assert!(value("AllowNewsAndInterests").key.starts_with("HKLM"));
+        assert!(value("AllowNewsAndInterests").group_policy, "only Group Policy may write it");
+        assert!(!value("TaskbarAl").group_policy);
+        assert_eq!(value("Start_IrisRecommendations").data, RegistryData::Dword(0));
+        assert_eq!(value("Start_TrackDocs").data, RegistryData::Dword(0));
+        assert_eq!(value("StartLayoutFile").data, RegistryData::String(TASKBAR_POLICY_FILE.to_owned()));
+
+        assert_eq!(g.files.len(), 1);
+        assert_eq!(g.files[0].to, TASKBAR_POLICY_FILE);
+        let xml = g.files[0].content.as_deref().unwrap();
+        for item in [
+            r#"<taskbar:DesktopApp DesktopApplicationID="Microsoft.Windows.Explorer"/>"#,
+            r#"<taskbar:UWA AppUserModelID="Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"/>"#,
+            r#"<taskbar:DesktopApp DesktopApplicationLinkPath="C:\Tools\R&amp;D.lnk"/>"#,
+            r#"<taskbar:UWA AppUserModelID="Vendor.App_abc!App"/>"#,
+            r#"<taskbar:DesktopApp DesktopApplicationID="MSEdge"/>"#,
+        ] {
+            assert!(xml.contains(item), "{item} missing from\n{xml}");
+        }
+        assert!(xml.find("Explorer").unwrap() < xml.find("MSEdge").unwrap(), "pins keep their order");
+
+        let f = MapFetcher::default().with(
+            "https://cfg.test/n.yaml",
+            "desktop: { taskbar: { pins: [notepad], pins-for: new-accounts, widgets: true } }",
+        );
+        let g = load_with(&f, "https://cfg.test/n.yaml", dir.path()).unwrap().file;
+        assert_eq!(g.files[0].to, TASKBAR_DEFAULT_PROFILE_FILE);
+        assert!(!g.registry.iter().any(|r| r.name.as_deref() == Some("StartLayoutFile")), "no policy for new accounts");
+        assert_eq!(g.registry[0].state, Presence::Absent, "widgets: true lifts the policy");
+
+        for (bad, why) in [
+            ("desktop: { taskbar: {} }", "needs at least one"),
+            ("desktop: { taskbar: { pins-for: everyone } }", "'pins-for' needs 'pins'"),
+            ("desktop: { taskbar: { alignment: right } }", "unknown variant"),
+            ("desktop: { taskbar: { pins: [''] } }", "a pin is empty"),
+            ("desktop: { start: {} }", "needs at least one"),
+            ("desktop: { start: { pins: [edge] } }", "unknown field"),
+            (r"registry: [{ key: HKCU\X, name: N, value: 1, via: group-policy }]", "is for HKLM keys"),
+            (r"registry: [{ key: HKLM\SOFTWARE\X\Y, state: absent, via: group-policy }]", "not whole keys"),
+        ] {
+            let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
+            let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn uac_becomes_policy_values_and_merges_setting_by_setting() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/base.yaml", "uac: { level: always-notify, user-prompt: deny }")
+            .with("https://cfg.test/top.yaml", "extends: base.yaml\nuac: { secure-desktop: false }");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let mut got: Vec<(String, RegistryData)> =
+            g.registry.iter().map(|r| (r.name.clone().unwrap(), r.data.clone())).collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("ConsentPromptBehaviorAdmin".to_owned(), RegistryData::Dword(2)),
+                ("ConsentPromptBehaviorUser".to_owned(), RegistryData::Dword(0)),
+                ("PromptOnSecureDesktop".to_owned(), RegistryData::Dword(0)),
+            ]
+        );
+        assert!(g.registry.iter().all(|r| r.key == UAC_KEY));
+
+        let f = MapFetcher::default()
+            .with("https://cfg.test/u.yaml", "uac: { level: never-notify, admin-prompt: consent }");
+        let g = load_with(&f, "https://cfg.test/u.yaml", dir.path()).unwrap().file;
+        let admin = g.registry.iter().find(|r| r.name.as_deref() == Some("ConsentPromptBehaviorAdmin")).unwrap();
+        assert_eq!(admin.data, RegistryData::Dword(4), "an explicit admin-prompt wins over the level");
+
+        for (bad, why) in [
+            ("uac: {}", "needs at least one"),
+            ("uac: { level: off }", "unknown variant"),
+            ("uac: { user-prompt: consent }", "unknown variant"),
         ] {
             let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());

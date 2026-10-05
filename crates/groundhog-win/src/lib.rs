@@ -6,6 +6,7 @@ pub mod desktop;
 pub mod dism;
 pub mod dpapi;
 pub mod env;
+pub mod gpo;
 pub mod process;
 pub mod registry;
 pub mod system;

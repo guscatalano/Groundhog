@@ -20,7 +20,7 @@ use groundhog_win::dism::{self, DismError};
 use groundhog_win::process::Proc;
 use groundhog_win::registry::{self, Data, DefaultUserHive};
 use groundhog_win::winget::{self, codes};
-use groundhog_win::{accounts, desktop, env};
+use groundhog_win::{accounts, desktop, env, gpo};
 use url::Url;
 
 use crate::secrets::Secrets;
@@ -226,6 +226,9 @@ fn check_registry(r: &RegistryValue, secrets: &Secrets) -> Result<Probe> {
         Ok(f) => f,
         Err(_) => return Ok(Probe::Unknown),
     };
+    if r.group_policy {
+        return Ok(if group_policy(&filled, true)? { Probe::WouldChange } else { Probe::Satisfied });
+    }
     let mut changes = false;
     for scope in &r.scope {
         let hive = match scope {
@@ -755,6 +758,9 @@ fn refuse_protected(path: &Path) -> Result<()> {
 }
 
 fn delete_registry(r: &RegistryValue) -> Result<Outcome> {
+    if r.group_policy {
+        return Ok(Outcome::Done { changed: group_policy(r, false)? });
+    }
     let (root, sub) = registry::split_key(&r.key)?;
     let mut changed = false;
     for scope in &r.scope {
@@ -1069,6 +1075,15 @@ fn explain(e: anyhow::Error, kind: &str, name: &str, log_path: &Path) -> anyhow:
     if hint.is_empty() { anyhow::anyhow!("{e:#}; {logs}") } else { anyhow::anyhow!("{e:#}: {hint}; {logs}") }
 }
 
+/// A machine policy value set (or removed) through local Group Policy; the loader allows
+/// `via: group-policy` only for named HKLM values.
+fn group_policy(r: &RegistryValue, check: bool) -> Result<bool> {
+    let (_, sub) = registry::split_key(&r.key)?;
+    let name = r.name.as_deref().context("a group policy value needs a name")?;
+    let data = r.state.is_present().then(|| registry_data(r));
+    gpo::set_machine_value(&sub, name, data.as_ref(), check)
+}
+
 fn registry_data(r: &RegistryValue) -> Data<'_> {
     match (&r.data, r.kind) {
         (RegistryData::String(s), RegistryType::ExpandString) => Data::ExpandString(s),
@@ -1080,6 +1095,9 @@ fn registry_data(r: &RegistryValue) -> Data<'_> {
 }
 
 fn set_registry(r: &RegistryValue) -> Result<Outcome> {
+    if r.group_policy {
+        return Ok(Outcome::Done { changed: group_policy(r, false)? });
+    }
     let data = registry_data(r);
     let (root, sub) = registry::split_key(&r.key)?;
     let mut changed = false;
@@ -1340,6 +1358,7 @@ mod tests {
             data: RegistryData::MultiString(vec!["a=${secret:K}".into(), "b".into()]),
             scope: vec![HiveScope::CurrentUser],
             state: groundhog_core::model::Presence::Present,
+            group_policy: false,
         };
         assert_eq!(
             fill_registry(&s, &r).unwrap().data,

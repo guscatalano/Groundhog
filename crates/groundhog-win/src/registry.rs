@@ -24,6 +24,12 @@ pub enum Data<'a> {
 }
 
 impl Data<'_> {
+    /// The registry type number and the bytes as stored.
+    pub fn raw(&self) -> (u32, Vec<u8>) {
+        let v = self.to_reg_value();
+        (v.vtype as u32, v.bytes.into_owned())
+    }
+
     fn to_reg_value(&self) -> RegValue<'static> {
         let utf16 = |s: &str| s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
         let (bytes, vtype) = match self {

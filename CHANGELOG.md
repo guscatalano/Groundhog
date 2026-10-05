@@ -4,6 +4,27 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.16.0] - 2026-10-05
+
+### Added
+- **Taskbar and Start** under `desktop:`. For the taskbar: alignment, the search box, Task View,
+  widgets, and the pinned apps, for every account or only new ones. For Start:
+  recommendations, recommended files, most used apps and account notifications. Start's own
+  pinned apps can't be set: Windows 11 takes those only from MDM.
+  ```yaml
+  desktop:
+    taskbar: { alignment: left, search: icon, widgets: false, pins: [file-explorer, terminal, edge] }
+    start: { recommendations: false, recommended-files: false }
+  ```
+- **`uac:`** sets User Account Control policy: the Control Panel slider's `level`, or the
+  administrator and standard-user prompts and the secure desktop one by one.
+  ```yaml
+  uac: { level: never-notify }   # for a disposable test VM
+  ```
+- **`groundhog:quiet-windows`** turns off Windows' nagging: "finish setting up your device",
+  Microsoft account and OneDrive backup reminders, tips, suggestions and ads in Start, Settings,
+  Explorer and the lock screen, silently installed apps, and web results in Start's search.
+
 ## [0.15.0] - 2026-10-04
 
 ### Added

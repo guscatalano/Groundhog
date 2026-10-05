@@ -567,6 +567,10 @@ pub struct RegistryValue {
     /// `absent`: delete the value, or the whole key when there's no `name`.
     #[serde(skip_serializing_if = "Presence::is_present")]
     pub state: Presence,
+    /// Written through the machine's local Group Policy rather than directly, for policy keys
+    /// Windows guards against programs.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub group_policy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -715,6 +719,50 @@ pub(crate) mod raw {
         #[serde(default)]
         pub remove_apps: Vec<String>,
         pub desktop: Option<Desktop>,
+        pub uac: Option<Uac>,
+    }
+
+    /// User Account Control policy. Becomes values under
+    /// `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct Uac {
+        pub level: Option<UacLevel>,
+        pub admin_prompt: Option<AdminPrompt>,
+        pub user_prompt: Option<UserPrompt>,
+        pub secure_desktop: Option<bool>,
+        pub enabled: Option<bool>,
+    }
+
+    /// The four positions of the slider in Control Panel.
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum UacLevel {
+        AlwaysNotify,
+        Default,
+        NoDim,
+        NeverNotify,
+    }
+
+    /// ConsentPromptBehaviorAdmin, named as in Group Policy.
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum AdminPrompt {
+        ElevateWithoutPrompting = 0,
+        CredentialsOnSecureDesktop = 1,
+        ConsentOnSecureDesktop = 2,
+        Credentials = 3,
+        Consent = 4,
+        ConsentForNonWindowsBinaries = 5,
+    }
+
+    /// ConsentPromptBehaviorUser, named as in Group Policy.
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum UserPrompt {
+        Deny = 0,
+        CredentialsOnSecureDesktop = 1,
+        Credentials = 3,
     }
 
     #[derive(Debug, Deserialize)]
@@ -726,7 +774,56 @@ pub(crate) mod raw {
         pub background: Option<String>,
         pub lock_screen: Option<LockScreenFull>,
         pub screen_saver: Option<ScreenSaverFull>,
+        pub taskbar: Option<TaskbarFull>,
+        pub start: Option<StartFull>,
         pub scope: Option<OneOrMany<HiveScope>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct TaskbarFull {
+        pub alignment: Option<TaskbarAlignment>,
+        pub search: Option<TaskbarSearch>,
+        pub task_view: Option<bool>,
+        pub widgets: Option<bool>,
+        pub pins: Option<Vec<String>>,
+        pub pins_for: Option<PinsFor>,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum TaskbarAlignment {
+        Left = 0,
+        Center = 1,
+    }
+
+    /// SearchboxTaskbarMode.
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum TaskbarSearch {
+        Hidden = 0,
+        Icon = 1,
+        Box = 2,
+        IconAndLabel = 3,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum PinsFor {
+        /// The Start layout policy: every account, at its next sign-in.
+        #[default]
+        Everyone,
+        /// The Default profile: accounts created later, which may then change them.
+        NewAccounts,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct StartFull {
+        pub recommended_files: Option<bool>,
+        pub most_used_apps: Option<bool>,
+        pub recommendations: Option<bool>,
+        pub account_notifications: Option<bool>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1025,6 +1122,14 @@ pub(crate) mod raw {
         #[serde(default)]
         pub scope: Option<OneOrMany<HiveScope>>,
         pub state: Option<Presence>,
+        pub via: Option<RegistryVia>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum RegistryVia {
+        Registry,
+        GroupPolicy,
     }
 
     fn default_reg_type() -> RegistryType {

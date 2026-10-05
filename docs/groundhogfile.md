@@ -5,7 +5,7 @@ errors, so typos fail at load time instead of being ignored.
 
 Steps run in this order: `users`, `certificates`, `defender-exclusions`, `features`,
 `capabilities`, `remove-apps`, winget bootstrap (if any winget apps), `apps`, `files`, `env`,
-`path`, `registry`, `desktop`, `services`, `firewall`, `run`, then the `verify` checks.
+`path`, `registry` (with `uac`), `desktop`, `services`, `firewall`, `run`, then the `verify` checks.
 
 **Removing things.** Most entries take `state: absent` (the default is `present`): an app is
 uninstalled, a file or folder deleted, an env var, PATH entry, registry value or key, user,
@@ -142,6 +142,7 @@ machine that can't reach GitHub can use a copy from your own share by path inste
 | `symbols` | Machine-wide `_NT_SYMBOL_PATH` for Microsoft's symbol server, cached in `C:\Symbols`. |
 | `crash-dumps` | Full dumps of crashing programs in `C:\CrashDumps`; kernel dumps kept. |
 | `explorer-dev` | Explorer shows extensions, hidden and system files, and full paths. |
+| `quiet-windows` | No "finish setting up your device", Microsoft account or backup nags, no tips, suggestions or ads in Start, Settings, Explorer and the lock screen, no silently installed apps, no web results in Start search. For this user and new ones. Not part of `windows-internals`. |
 | `time-sync` | Windows Time runs at boot, corrects even a large error in one go, and is checked against time.windows.com. Not part of `windows-internals`. Needs outbound NTP (UDP 123). |
 
 ## Conditions and variables
@@ -590,6 +591,18 @@ desktop:
     secure: true                    # resuming needs a sign-in
     program: blank                  # blank (default) | bubbles | mystify | ribbons | photos | 3d-text | a .scr path
     # enabled: false                # or turn it off
+  taskbar:
+    alignment: left                 # left | center
+    search: icon                    # hidden | icon | box | icon-and-label
+    task-view: false
+    widgets: false                  # for the whole machine
+    pins: [file-explorer, terminal, edge]   # replaces Windows' own taskbar pins
+    pins-for: everyone              # everyone (default) | new-accounts
+  start:
+    recommendations: false          # tips, shortcuts and new apps
+    recommended-files: false        # recent files in Start and Explorer, jump lists
+    most-used-apps: false
+    account-notifications: false
   scope: [current-user, default-user]
 ```
 
@@ -604,8 +617,63 @@ account sees at sign-in, written where the Personalization CSP (Intune, MDM) wri
 the idle time after which Windows locks ("Interactive logon: Machine inactivity limit"). The
 **screen saver** is per user, like the wallpaper.
 
+The **taskbar** and **Start** settings are the switches in Settings → Personalization, per
+user like the wallpaper; for the agent's own account the taskbar changes at once. `widgets:
+false` is the machine policy that turns widgets off (Windows doesn't let programs flip the
+per-user switch); `widgets: true` lifts that policy, leaving the choice to each user.
+
+**Taskbar pins** replace the apps Windows pins. Each is one of:
+- a short name: `file-explorer`, `edge`, `terminal`, `notepad`, `paint`, `settings`, `store`,
+  `calculator`;
+- an app id, as `Get-StartApps` lists them: `Microsoft.WindowsTerminal_8wekyb3d8bbwe!App`,
+  `MSEdge`;
+- a shortcut: `%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Visual Studio Code.lnk`.
+
+With `pins-for: everyone` they're the Start layout policy: every account gets them at its
+next sign-in (not at once, even for the agent's own account), and existing accounts too.
+`new-accounts` writes them to the Default profile instead: accounts created later start with
+them and may change them, and existing accounts are left alone. `scope` doesn't apply to pins.
+
+**Start's pinned apps can't be set.** Windows 11 takes them only from MDM (Intune and the
+like): it ignores the same pin list written as a policy or into the Default profile, and
+refuses programs that try to pin or unpin. Groundhog sets what Start shows besides the pins.
+
 A later file overrides an earlier one setting by setting: a file that extends a base with
 `theme: light` can say `theme: { windows: dark }` and keep the base's light apps.
+
+## `uac`
+
+```yaml
+uac:
+  level: default              # always-notify | default | no-dim | never-notify (the Control Panel slider)
+  admin-prompt: consent       # how administrators are asked; overrides the level's choice
+  user-prompt: credentials    # deny | credentials-on-secure-desktop | credentials
+  secure-desktop: true        # dim the screen for the prompt; overrides the level's choice
+  # enabled: false            # turn UAC off entirely (see below)
+```
+
+User Account Control policy, for the whole machine. Each setting is optional, and each is
+the Group Policy setting of the same name under "User Account Control" (security options):
+
+| Setting | Value | Values |
+|---|---|---|
+| `admin-prompt` | ConsentPromptBehaviorAdmin | `elevate-without-prompting`, `credentials-on-secure-desktop`, `consent-on-secure-desktop`, `credentials`, `consent`, `consent-for-non-windows-binaries` (Windows' default) |
+| `user-prompt` | ConsentPromptBehaviorUser | `deny`, `credentials-on-secure-desktop`, `credentials` |
+| `secure-desktop` | PromptOnSecureDesktop | `true`, `false` |
+| `enabled` | EnableLUA | `true`, `false` |
+
+`level` sets `admin-prompt` and `secure-desktop` as the slider does: `always-notify` is
+consent on the secure desktop; `default` asks for consent for programs that aren't part of
+Windows, on the secure desktop; `no-dim` is the same without the secure desktop;
+`never-notify` elevates without asking.
+
+They're written as registry values under
+`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System` (so `plan` shows them as
+registry steps), and a later file overrides an earlier one setting by setting. The prompt
+settings take effect at once. **`enabled: false` takes effect only after a restart**, and
+it does more than silence prompts: every administrator then runs everything with full rights,
+and Store apps and Edge stop working. `never-notify` is almost always what's wanted instead,
+and on a disposable test VM it is what lets automation click through elevation.
 
 ## `services`
 
