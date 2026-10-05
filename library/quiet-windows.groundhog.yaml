@@ -1,11 +1,19 @@
 # Windows without the nagging: no "finish setting up your device" or Microsoft account and
 # backup reminders, no tips, suggestions or ads in Start, Settings, Explorer or on the lock
-# screen, no apps installed behind your back, no web results in Start's search. For this user
-# and new ones; takes effect at the next sign-in (or when Explorer restarts).
+# screen, no widgets, no feedback prompts, no apps installed behind your back, no web results
+# in Start's search. For this user and new ones; takes effect at the next sign-in (or when
+# Explorer restarts).
 #
 # Only settings Windows offers in Settings or Group Policy; nothing is uninstalled. The
 # CloudContent policies at the end only take effect on Enterprise and Education (and are
 # harmless elsewhere); the per-user values cover Home and Pro.
+
+# Widgets is a policy only Group Policy itself may write.
+agent: ">=0.16.0"
+
+desktop:
+  taskbar:
+    widgets: false
 
 registry:
   # "Let's finish setting up your device" (back up with OneDrive, sign in with a Microsoft
@@ -150,6 +158,13 @@ registry:
     name: KFMBlockOptIn
     type: dword
     value: 1
+
+  # "Windows should ask for my feedback": never (Feedback Hub prompts).
+  - key: HKCU\Software\Microsoft\Siuf\Rules
+    name: NumberOfSIUFInPeriod
+    type: dword
+    value: 0
+    scope: [current-user, default-user]
 
   # The same, as machine policy (Enterprise and Education).
   - key: HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent

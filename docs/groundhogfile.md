@@ -142,7 +142,7 @@ machine that can't reach GitHub can use a copy from your own share by path inste
 | `symbols` | Machine-wide `_NT_SYMBOL_PATH` for Microsoft's symbol server, cached in `C:\Symbols`. |
 | `crash-dumps` | Full dumps of crashing programs in `C:\CrashDumps`; kernel dumps kept. |
 | `explorer-dev` | Explorer shows extensions, hidden and system files, and full paths. |
-| `quiet-windows` | No "finish setting up your device", Microsoft account or backup nags, no tips, suggestions or ads in Start, Settings, Explorer and the lock screen, no silently installed apps, no web results in Start search. For this user and new ones. Not part of `windows-internals`. |
+| `quiet-windows` | No "finish setting up your device", Microsoft account or backup nags, no tips, suggestions or ads in Start, Settings, Explorer and the lock screen, no widgets, no feedback prompts, no silently installed apps, no web results in Start search. For this user and new ones. Not part of `windows-internals`. |
 | `time-sync` | Windows Time runs at boot, corrects even a large error in one go, and is checked against time.windows.com. Not part of `windows-internals`. Needs outbound NTP (UDP 123). |
 
 ## Conditions and variables

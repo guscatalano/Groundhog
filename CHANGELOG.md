@@ -4,6 +4,12 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.16.1] - 2026-10-05
+
+### Changed
+- `groundhog:quiet-windows` also turns off widgets (through local Group Policy, the only way
+  Windows allows) and Feedback Hub's "rate Windows" prompts.
+
 ## [0.16.0] - 2026-10-05
 
 ### Added
