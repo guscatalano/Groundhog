@@ -105,6 +105,9 @@ jobs:
       # What agents read to update themselves (and what `groundhog mirror-agent` copies).
       - name: Agent update manifest
         run: python3 scripts/agent-manifest.py dist "$GITHUB_REF_NAME"
+      # The one-line installer, stamped with this release so it fetches this release's agent.
+      - name: Bootstrap script
+        run: sed "s/__GROUNDHOG_VERSION__/${GITHUB_REF_NAME#v}/" scripts/apply.ps1 > dist/apply.ps1
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
