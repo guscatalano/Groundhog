@@ -15,7 +15,7 @@ import sys
 
 ID = "GusCatalano.Groundhog"
 REPO = "https://github.com/guscatalano/Groundhog"
-SCHEMA = "1.10.0"
+SCHEMA = "1.12.0"
 ARCHES = ["x64", "arm64"]
 
 HEADER = "# yaml-language-server: $schema=https://aka.ms/winget-manifest.{kind}.{schema}.schema.json\n\n"
