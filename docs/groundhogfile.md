@@ -575,6 +575,22 @@ within two levels of a hive's root (`HKLM\SOFTWARE` itself, say).
 - `default-user`: `C:\Users\Default\NTUSER.DAT`, so profiles created **later** get the value
   too. Requires the agent to run elevated.
 
+**`via: group-policy`** writes an `HKLM` value through the machine's local Group Policy, as
+gpedit would: into `%SystemRoot%\System32\GroupPolicy\Machine\Registry.pol`, then applied with
+`gpupdate`. Use it for policy keys Windows guards against programs, which refuse direct
+writes even from administrators ("Access is denied" for a key Administrators have full control
+of), such as `HKLM\SOFTWARE\Policies\Microsoft\Dsh`. `state: absent` takes the value out of
+the local policy, and Group Policy removes it. A domain policy that sets the same value wins.
+
+```yaml
+registry:
+  - key: HKLM\SOFTWARE\Policies\Microsoft\Dsh
+    name: AllowNewsAndInterests
+    type: dword
+    value: 0
+    via: group-policy
+```
+
 ## `desktop`
 
 ```yaml

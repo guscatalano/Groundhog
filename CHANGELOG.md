@@ -21,6 +21,8 @@ version that has no section here.
   ```yaml
   uac: { level: never-notify }   # for a disposable test VM
   ```
+- **`via: group-policy`** on a registry value writes it through the machine's local Group
+  Policy, for policy keys Windows refuses to let programs write directly (widgets' is one).
 - **`groundhog:quiet-windows`** turns off Windows' nagging: "finish setting up your device",
   Microsoft account and OneDrive backup reminders, tips, suggestions and ads in Start, Settings,
   Explorer and the lock screen, silently installed apps, and web results in Start's search.
