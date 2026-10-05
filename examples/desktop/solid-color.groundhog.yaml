@@ -1,0 +1,10 @@
+# A plain dark-blue desktop and dark mode, for this user and accounts created later.
+#
+#   & ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) https://raw.githubusercontent.com/guscatalano/Groundhog/main/examples/desktop/solid-color.groundhog.yaml
+
+agent: ">=0.15.0"
+
+desktop:
+  theme: dark
+  background: "#203040"
+  scope: [current-user, default-user]

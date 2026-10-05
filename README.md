@@ -44,6 +44,19 @@ elevation if needed, and applies the file:
 & ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) https://example.com/dev.groundhog.yaml
 ```
 
+The file can be written on the spot too. For example, to set the desktop background:
+
+```powershell
+# a solid color, and dark mode
+"desktop: { background: '#2E7D32', theme: dark }" | Set-Content $env:TEMP\bg.yaml; & ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) $env:TEMP\bg.yaml
+
+# a picture from the web (downloaded, then kept in %ProgramData%\groundhog\desktop)
+"desktop: { wallpaper: 'https://example.com/lab.jpg', wallpaper-style: fill }" | Set-Content $env:TEMP\bg.yaml; & ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) $env:TEMP\bg.yaml
+
+# a ready-made sample from this repo (see examples/desktop)
+& ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) https://raw.githubusercontent.com/guscatalano/Groundhog/main/examples/desktop/windows-wallpaper.groundhog.yaml
+```
+
 Or download from [Releases](https://github.com/guscatalano/Groundhog/releases/latest):
 
 | Asset | Use |
