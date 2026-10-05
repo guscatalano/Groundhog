@@ -4,6 +4,13 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.16.2] - 2026-10-05
+
+### Changed
+- `groundhog:quiet-windows` also stops "Allow my organization to manage this device" when
+  signing in to Office or Teams with a work account (the account still works; the machine
+  just isn't registered with the organization).
+
 ## [0.16.1] - 2026-10-05
 
 ### Changed

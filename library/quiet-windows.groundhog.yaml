@@ -159,6 +159,14 @@ registry:
     type: dword
     value: 1
 
+  # "Allow my organization to manage this device" when you sign in to Office or Teams with a
+  # work account: the account still works, the personal machine just isn't registered with
+  # the organization. (From github.com/redbelter/RedsCleanWindows.)
+  - key: HKLM\SOFTWARE\Policies\Microsoft\Windows\WorkplaceJoin
+    name: BlockAADWorkplaceJoin
+    type: dword
+    value: 1
+
   # "Windows should ask for my feedback": never (Feedback Hub prompts).
   - key: HKCU\Software\Microsoft\Siuf\Rules
     name: NumberOfSIUFInPeriod
