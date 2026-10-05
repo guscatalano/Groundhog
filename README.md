@@ -36,7 +36,22 @@ run:
 
 ## Install
 
-Download from [Releases](https://github.com/guscatalano/Groundhog/releases/latest):
+**Apply a Groundhogfile in one line**, on a machine with nothing installed. This fetches the
+right agent for the machine, checks it against the release's published hash, asks for
+elevation if needed, and applies the file:
+
+```powershell
+& ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) https://example.com/dev.groundhog.yaml
+```
+
+**With winget** (the package is in review, [winget-pkgs#446805](https://github.com/microsoft/winget-pkgs/pull/446805)),
+which puts `groundhog-agent` on the PATH:
+
+```powershell
+winget install GusCatalano.Groundhog
+```
+
+Or download from [Releases](https://github.com/guscatalano/Groundhog/releases/latest):
 
 | Asset | Use |
 |---|---|
