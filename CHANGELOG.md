@@ -10,13 +10,24 @@ version that has no section here.
 - **`desktop:`** sets the light or dark theme (for apps and for Windows, together or
   separately), the desktop picture (a path or URL, with fill, fit, stretch, tile, center or
   span) and a solid background color, for the agent's user (live, like Settings) and, with
-  `scope: default-user`, for profiles created later.
+  `scope: default-user`, for profiles created later. It also sets the machine's **lock
+  screen** picture and idle lock time, and the **screen saver** (timeout, sign-in to resume,
+  which one, or off).
   ```yaml
   desktop:
     theme: dark
     wallpaper: https://example.com/lab.jpg
     background: "#203040"
+    lock-screen: { image: https://example.com/lock.jpg, lock-after: 15m }
+    screen-saver: { timeout: 10m, secure: true }
   ```
+- **One-line install and apply.** Each release now includes `apply.ps1`, which picks the agent
+  for the machine's architecture, checks it against the release's published hash, asks for
+  elevation if needed, and applies a Groundhogfile:
+  ```powershell
+  & ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) https://example.com/dev.groundhog.yaml
+  ```
+- Groundhog is now MIT licensed.
 
 ## [0.14.1] - 2026-10-03
 
