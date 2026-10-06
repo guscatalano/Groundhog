@@ -4,6 +4,26 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.17.0] - 2026-10-06
+
+### Added
+- **Notifications** under `desktop:`: the master switch, **Do Not Disturb**, sounds, showing
+  them on the lock screen, and each app's switch. `enabled` and `do-not-disturb` take effect
+  at the next sign-in, the only time Windows reads them; the rest at once.
+  ```yaml
+  desktop:
+    notifications: { do-not-disturb: true, sounds: false, apps: { Microsoft.SkyDrive.Desktop: false } }
+  ```
+- **The notification area:** `desktop.tray` puts programs' icons on the taskbar (`show`) or in
+  the ^ overflow (`hide`), by file name, and shows or hides the touch keyboard button. A
+  program Windows hasn't seen show an icon yet is set by a later apply.
+- **Start's folders** next to the power button (`desktop.start.folders: [file-explorer,
+  downloads, settings]`) and **seconds on the taskbar clock** (`desktop.taskbar.clock-seconds`).
+- Registry values can be **`type: binary`**, written as hex.
+
+### Not possible
+- Hiding the volume, network or battery icons: Windows 11 ignores the old policies for them.
+
 ## [0.16.2] - 2026-10-05
 
 ### Changed

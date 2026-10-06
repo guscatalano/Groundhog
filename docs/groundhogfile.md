@@ -557,7 +557,7 @@ usually can be), any of them can plant a program that administrators and service
 registry:
   - key: HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced
     name: HideFileExt                # omit for the key's default value
-    type: dword                      # string (default), expand-string, multi-string, dword, qword
+    type: dword                      # string (default), expand-string, multi-string, dword, qword, binary ("86 08 73 52")
     value: 0                         # numbers may also be "0x10"
     scope: [current-user, default-user]
   - key: HKCU\Software\Vendor\Tool
@@ -614,11 +614,24 @@ desktop:
     widgets: false                  # for the whole machine
     pins: [file-explorer, terminal, edge]   # replaces Windows' own taskbar pins
     pins-for: everyone              # everyone (default) | new-accounts
+    clock-seconds: true
   start:
     recommendations: false          # tips, shortcuts and new apps
     recommended-files: false        # recent files in Start and Explorer, jump lists
     most-used-apps: false
     account-notifications: false
+    folders: [file-explorer, downloads, settings]   # next to the power button
+  notifications:
+    enabled: true                   # all notifications (from the next sign-in)
+    do-not-disturb: false           # (from the next sign-in)
+    sounds: false
+    lock-screen: false              # show them on the lock screen
+    apps:                           # app id: on/off
+      Microsoft.SkyDrive.Desktop: false
+  tray:
+    show: [SecurityHealthSystray.exe]   # programs whose icons sit on the taskbar
+    hide: [OneDrive.exe]                # ... or in the ^ overflow
+    touch-keyboard: false           # the touch keyboard button
   scope: [current-user, default-user]
 ```
 
@@ -649,6 +662,24 @@ With `pins-for: everyone` they're the Start layout policy: every account gets th
 next sign-in (not at once, even for the agent's own account), and existing accounts too.
 `new-accounts` writes them to the Default profile instead: accounts created later start with
 them and may change them, and existing accounts are left alone. `scope` doesn't apply to pins.
+
+Start's **folders** are any of `settings`, `file-explorer`, `documents`, `downloads`,
+`music`, `pictures`, `videos`, `network` and `personal-folder`. Start shows them in its own
+order, an empty list shows none, and they change at once.
+
+**Notifications** are the switches in Settings > System > Notifications. `sounds`,
+`lock-screen` and `apps` change at once. `enabled` and `do-not-disturb` are read by Windows
+when the user signs in, so they apply from the next sign-in: a session that's running keeps
+its state, and Windows offers programs no way to change it. An app's id is the name Windows
+stores it under, a key of `HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings`:
+`Microsoft.SkyDrive.Desktop` for OneDrive, `MSTeams_8wekyb3d8bbwe!MSTeams` for Teams.
+`do-not-disturb` is for the agent's own account only (`scope` doesn't apply).
+
+The **tray** (notification area) settings are per user and change at once. `show` and `hide`
+name programs by file name (`OneDrive.exe`) or the end of their path. Windows keeps an entry
+per program only once it has shown an icon, so one that hasn't yet (installed in the same
+apply, say) is set by a later apply: these steps run every time, and cost nothing when
+there's nothing to do. They're for the agent's own account only.
 
 **Start's pinned apps can't be set.** Windows 11 takes them only from MDM (Intune and the
 like): it ignores the same pin list written as a policy or into the Default profile, and

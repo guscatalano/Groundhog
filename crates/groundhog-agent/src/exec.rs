@@ -131,6 +131,13 @@ impl Executor for WinExecutor<'_> {
             Action::Theme(t) => theme(t, false).map(|changed| Outcome::Done { changed }),
             Action::LockScreen(l) => self.lock_screen(l, false).map(|changed| Outcome::Done { changed }),
             Action::ScreenSaver(s) => screen_saver(s, false).map(|changed| Outcome::Done { changed }),
+            Action::DoNotDisturb { on } => {
+                let changed = desktop::set_do_not_disturb(*on, false)?;
+                if changed {
+                    log("Windows applies it at the next sign-in");
+                }
+                Ok(Outcome::Done { changed })
+            }
             Action::TrayIcon(t) => {
                 let changed = match desktop::set_tray_icon(&t.program, t.shown, false)? {
                     desktop::TrayIcon::NotSeenYet => {
@@ -203,6 +210,7 @@ impl Executor for WinExecutor<'_> {
             Action::Theme(t) => would(theme(t, true)?),
             Action::LockScreen(l) => would(self.lock_screen(l, true)?),
             Action::ScreenSaver(s) => would(screen_saver(s, true)?),
+            Action::DoNotDisturb { on } => would(desktop::set_do_not_disturb(*on, true)?),
             Action::TrayIcon(t) => match desktop::set_tray_icon(&t.program, t.shown, true)? {
                 desktop::TrayIcon::NotSeenYet => Probe::Unknown,
                 desktop::TrayIcon::AsWanted => Probe::Satisfied,
@@ -1110,6 +1118,7 @@ fn registry_data(r: &RegistryValue) -> Data<'_> {
         (RegistryData::MultiString(v), _) => Data::MultiString(v),
         (RegistryData::Dword(n), _) => Data::Dword(*n),
         (RegistryData::Qword(n), _) => Data::Qword(*n),
+        (RegistryData::Binary(b), _) => Data::Binary(b),
     }
 }
 

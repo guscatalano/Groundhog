@@ -297,3 +297,90 @@ mod tray_tests {
         assert!(program_matches(r"C:\Tools\x.exe", r"C:\Tools\x.exe"));
     }
 }
+
+const QUIET_HOURS_KEY: &str = concat!(
+    r"Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\",
+    r"default$windows.data.donotdisturb.quiethourssettings\windows.data.donotdisturb.quiethourssettings"
+);
+const PROFILE_ON: &str = "Microsoft.QuietHoursProfile.PriorityOnly";
+const PROFILE_OFF: &str = "Microsoft.QuietHoursProfile.Unrestricted";
+
+/// Do Not Disturb for the current user, as Settings saves it. Windows reads it at sign-in:
+/// writing it doesn't change a session that's already running (the running state lives in
+/// the shell, which offers programs no way to change it).
+pub fn set_do_not_disturb(on: bool, check: bool) -> Result<bool> {
+    use winreg::enums::{HKEY_CURRENT_USER, REG_BINARY};
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let current = hkcu.open_subkey(QUIET_HOURS_KEY).and_then(|k| k.get_raw_value("Data")).ok();
+    let wanted = utf16(if on { PROFILE_ON } else { PROFILE_OFF });
+    let is_wanted = current.as_ref().is_some_and(|v| contains(&v.bytes, &wanted));
+    // Without a saved record Windows' default is off.
+    let is_off_by_default = current.is_none() && !on;
+    if is_wanted || is_off_by_default {
+        return Ok(false);
+    }
+    if check {
+        return Ok(true);
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let blob = quiet_hours_blob(if on { PROFILE_ON } else { PROFILE_OFF }, now);
+    let (key, _) = hkcu.create_subkey(QUIET_HOURS_KEY)?;
+    key.set_raw_value("Data", &winreg::RegValue { bytes: blob.into(), vtype: REG_BINARY })?;
+    Ok(true)
+}
+
+/// The quiet hours record in CloudStore's encoding, as Settings writes it: a header, the time
+/// it was saved, and a nested record naming the active profile.
+fn quiet_hours_blob(profile: &str, unix_time: u64) -> Vec<u8> {
+    let name = utf16(profile);
+    let mut inner = vec![0x43, 0x42, 0x01, 0x00, 0xc2, 0x0a, 0x01, 0xd2, 0x14];
+    inner.extend(leb128(name.len() as u64 / 2));
+    inner.extend(&name);
+    inner.extend([0xca, 0x28, 0x00, 0x00]);
+    let mut out = vec![0x43, 0x42, 0x01, 0x00, 0x0a, 0x02, 0x01, 0x00, 0x2a, 0x06];
+    out.extend(leb128(unix_time));
+    out.extend([0x2a, 0x2b, 0x0e]);
+    out.extend(leb128(inner.len() as u64));
+    out.extend(inner);
+    out.extend([0x00, 0x00, 0x00]);
+    out
+}
+
+fn leb128(mut n: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn utf16(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[cfg(test)]
+mod quiet_hours_tests {
+    use super::*;
+
+    /// What Settings wrote on Windows 11 25H2 (build 26200) when Do Not Disturb was turned on.
+    const SETTINGS_ON: &str = "43 42 01 00 0a 02 01 00 2a 06 c6 c8 95 d6 06 2a 2b 0e 5e 43 42 01 00 c2 0a 01 d2 14 28 4d 00 69 00 63 00 72 00 6f 00 73 00 6f 00 66 00 74 00 2e 00 51 00 75 00 69 00 65 00 74 00 48 00 6f 00 75 00 72 00 73 00 50 00 72 00 6f 00 66 00 69 00 6c 00 65 00 2e 00 50 00 72 00 69 00 6f 00 72 00 69 00 74 00 79 00 4f 00 6e 00 6c 00 79 00 ca 28 00 00 00 00 00";
+
+    #[test]
+    fn the_blob_matches_what_settings_writes() {
+        let expected: Vec<u8> = SETTINGS_ON.split(' ').map(|b| u8::from_str_radix(b, 16).unwrap()).collect();
+        assert_eq!(quiet_hours_blob(PROFILE_ON, 1_791_321_158), expected);
+        let off = quiet_hours_blob(PROFILE_OFF, 1_791_321_158);
+        assert_eq!(off.len(), expected.len());
+        assert!(contains(&off, &utf16(PROFILE_OFF)) && !contains(&off, &utf16(PROFILE_ON)));
+    }
+}

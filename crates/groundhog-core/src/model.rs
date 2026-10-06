@@ -34,6 +34,8 @@ pub struct Groundhogfile {
     pub lock_screen: Option<LockScreen>,
     pub screen_saver: Option<ScreenSaver>,
     pub tray_icons: Vec<TrayIcon>,
+    /// Do Not Disturb for the agent's user; Windows applies it at the next sign-in.
+    pub do_not_disturb: Option<bool>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -516,6 +518,8 @@ pub enum RegistryType {
     MultiString,
     Dword,
     Qword,
+    /// Raw bytes, written in YAML as hex (`"86 08 73 52"`).
+    Binary,
 }
 
 /// Where an environment variable or PATH entry is stored.
@@ -592,6 +596,7 @@ pub enum RegistryData {
     MultiString(Vec<String>),
     Dword(u32),
     Qword(u64),
+    Binary(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -811,6 +816,7 @@ pub(crate) mod raw {
         pub enabled: Option<bool>,
         pub sounds: Option<bool>,
         pub lock_screen: Option<bool>,
+        pub do_not_disturb: Option<bool>,
         /// App id (as in Settings' notification list) to on/off.
         pub apps: Option<BTreeMap<String, bool>>,
     }
@@ -820,9 +826,7 @@ pub(crate) mod raw {
     pub struct TrayFull {
         pub show: Option<Vec<String>>,
         pub hide: Option<Vec<String>>,
-        pub pen_menu: Option<bool>,
         pub touch_keyboard: Option<bool>,
-        pub touchpad: Option<bool>,
     }
 
     #[derive(Debug, Clone, Copy, Deserialize)]
@@ -859,6 +863,8 @@ pub(crate) mod raw {
         pub most_used_apps: Option<bool>,
         pub recommendations: Option<bool>,
         pub account_notifications: Option<bool>,
+        /// The folders next to the power button, by name.
+        pub folders: Option<Vec<String>>,
     }
 
     #[derive(Debug, Deserialize)]

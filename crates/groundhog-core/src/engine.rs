@@ -65,6 +65,10 @@ pub enum Action {
     LockScreen(LockScreen),
     ScreenSaver(ScreenSaver),
     TrayIcon(TrayIcon),
+    /// Do Not Disturb on or off, for the agent's user, from the next sign-in.
+    DoNotDisturb {
+        on: bool,
+    },
 }
 
 impl Action {
@@ -181,6 +185,9 @@ fn title(action: &Action) -> String {
                 parts.push(format!("lock after {}", humantime::format_duration(std::time::Duration::from_secs(secs))));
             }
             format!("set lock screen: {}", parts.join(", "))
+        }
+        Action::DoNotDisturb { on } => {
+            format!("turn Do Not Disturb {} (from the next sign-in)", if *on { "on" } else { "off" })
         }
         Action::TrayIcon(t) if t.shown => format!("show {}'s icon on the taskbar", t.program),
         Action::TrayIcon(t) => format!("move {}'s icon to the overflow", t.program),
@@ -320,6 +327,7 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     actions.extend(file.lock_screen.iter().cloned().map(Action::LockScreen));
     actions.extend(file.screen_saver.iter().cloned().map(Action::ScreenSaver));
     actions.extend(file.tray_icons.iter().cloned().map(Action::TrayIcon));
+    actions.extend(file.do_not_disturb.map(|on| Action::DoNotDisturb { on }));
     // Services and firewall rules after apps, which often install what they refer to.
     actions.extend(file.services.iter().cloned().map(Action::Service));
     actions.extend(file.firewall.iter().cloned().map(Action::Firewall));
@@ -359,7 +367,7 @@ pub fn secrets_in(action: &Action) -> BTreeSet<String> {
         Action::Registry(r) => match &r.data {
             RegistryData::String(v) => vec![v],
             RegistryData::MultiString(vs) => vs.iter().map(String::as_str).collect(),
-            RegistryData::Dword(_) | RegistryData::Qword(_) => vec![],
+            RegistryData::Dword(_) | RegistryData::Qword(_) | RegistryData::Binary(_) => vec![],
         },
         Action::Run(RunAction::Command { command, .. }) => vec![command],
         Action::Run(RunAction::Script { args: Some(a), .. }) => vec![a],
@@ -395,7 +403,8 @@ fn section(action: &Action) -> &'static str {
         | Action::Theme(_)
         | Action::LockScreen(_)
         | Action::ScreenSaver(_)
-        | Action::TrayIcon(_) => "desktop",
+        | Action::TrayIcon(_)
+        | Action::DoNotDisturb { .. } => "desktop",
         Action::Defender(_) => "defender",
         Action::Service(_) => "services",
         Action::Firewall(_) => "firewall",

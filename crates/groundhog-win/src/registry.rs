@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::System::Registry::{HKEY_USERS, RegLoadKeyW, RegUnLoadKeyW};
 use winreg::enums::{
-    HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_MULTI_SZ,
-    REG_QWORD, REG_SZ,
+    HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_BINARY, REG_DWORD, REG_EXPAND_SZ,
+    REG_MULTI_SZ, REG_QWORD, REG_SZ,
 };
 use winreg::{RegKey, RegValue};
 
@@ -21,6 +21,7 @@ pub enum Data<'a> {
     MultiString(&'a [String]),
     Dword(u32),
     Qword(u64),
+    Binary(&'a [u8]),
 }
 
 impl Data<'_> {
@@ -42,6 +43,7 @@ impl Data<'_> {
             }
             Data::Dword(n) => (n.to_le_bytes().to_vec(), REG_DWORD),
             Data::Qword(n) => (n.to_le_bytes().to_vec(), REG_QWORD),
+            Data::Binary(b) => (b.to_vec(), REG_BINARY),
         };
         RegValue { bytes: bytes.into(), vtype }
     }

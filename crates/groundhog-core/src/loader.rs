@@ -587,6 +587,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         registry: desktop_registry,
         files: desktop_files,
         tray_icons,
+        do_not_disturb,
     } = match desktop {
         Some(d) => resolve_desktop(base, d).context("desktop")?,
         None => DesktopParts {
@@ -597,6 +598,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
             registry: Vec::new(),
             files: Vec::new(),
             tray_icons: Vec::new(),
+            do_not_disturb: None,
         },
     };
     registry.extend(desktop_registry);
@@ -619,6 +621,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         lock_screen,
         screen_saver,
         tray_icons,
+        do_not_disturb,
         services,
         firewall,
         run,
@@ -876,6 +879,7 @@ struct DesktopParts {
     /// The taskbar's pin list.
     files: Vec<FileCopy>,
     tray_icons: Vec<TrayIcon>,
+    do_not_disturb: Option<bool>,
 }
 
 /// A picture reference (wallpaper, lock screen), checked to look like one.
@@ -1000,7 +1004,9 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<DesktopParts> {
     if let Some(s) = d.start {
         registry.extend(resolve_start(s, &scope).context("start")?);
     }
+    let mut do_not_disturb = None;
     if let Some(n) = d.notifications {
+        do_not_disturb = n.do_not_disturb;
         registry.extend(resolve_notifications(n, &scope).context("notifications")?);
     }
     let mut tray_icons = Vec::new();
@@ -1008,7 +1014,16 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<DesktopParts> {
         resolve_tray(t, &scope, &mut registry, &mut tray_icons).context("tray")?;
     }
 
-    Ok(DesktopParts { wallpaper, theme: theme.transpose()?, lock_screen, screen_saver, registry, files, tray_icons })
+    Ok(DesktopParts {
+        wallpaper,
+        theme: theme.transpose()?,
+        lock_screen,
+        screen_saver,
+        registry,
+        files,
+        tray_icons,
+        do_not_disturb,
+    })
 }
 
 fn dword(key: &str, name: &str, value: u32, scope: &[HiveScope]) -> RegistryValue {
@@ -1190,13 +1205,14 @@ fn resolve_notifications(n: raw::NotificationsFull, scope: &[HiveScope]) -> Resu
         }
         out.push(dword(&format!(r"{NOTIFICATION_SETTINGS}\{app}"), "Enabled", u32::from(on), scope));
     }
-    if out.is_empty() {
-        bail!("needs at least one of 'enabled', 'sounds', 'lock-screen' or 'apps'");
+    if out.is_empty() && n.do_not_disturb.is_none() {
+        bail!("needs at least one of 'enabled', 'sounds', 'lock-screen', 'do-not-disturb' or 'apps'");
     }
     Ok(out)
 }
 
-/// The notification area: which programs' icons sit on the taskbar, and the corner buttons.
+/// The notification area: which programs' icons sit on the taskbar, and the touch keyboard
+/// button.
 fn resolve_tray(
     t: raw::TrayFull,
     scope: &[HiveScope],
@@ -1204,19 +1220,8 @@ fn resolve_tray(
     icons: &mut Vec<TrayIcon>,
 ) -> Result<()> {
     let before = registry.len();
-    let corner = [
-        (
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\PenWorkspace",
-            "PenWorkspaceButtonDesiredVisibility",
-            t.pen_menu,
-        ),
-        (r"HKCU\Software\Microsoft\TabletTip\1.7", "TipbandDesiredVisibility", t.touch_keyboard),
-        (r"HKCU\Software\Microsoft\Touchpad\Status", "Enabled", t.touchpad),
-    ];
-    for (key, name, v) in corner {
-        if let Some(v) = v {
-            registry.push(dword(key, name, u32::from(v), scope));
-        }
+    if let Some(v) = t.touch_keyboard {
+        registry.push(dword(r"HKCU\Software\Microsoft\TabletTip\1.7", "TipbandDesiredVisibility", u32::from(v), scope));
     }
     for (programs, shown) in [(t.show.unwrap_or_default(), true), (t.hide.unwrap_or_default(), false)] {
         for program in programs {
@@ -1231,9 +1236,37 @@ fn resolve_tray(
         }
     }
     if registry.len() == before && icons.is_empty() {
-        bail!("needs at least one of 'show', 'hide', 'pen-menu', 'touch-keyboard' or 'touchpad'");
+        bail!("needs at least one of 'show', 'hide' or 'touch-keyboard'");
     }
     Ok(())
+}
+
+const START_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Start";
+
+/// The folders Start can show next to the power button, as Settings stores them (found by
+/// turning each on in Settings, Windows 11 25H2).
+const START_FOLDERS: &[(&str, &str)] = &[
+    ("settings", "52730886-51AA-4243-9F7B-2776584659D4"),
+    ("file-explorer", "148A24BC-D60C-4289-A080-6ED9BBA24882"),
+    ("documents", "2D34D5CE-FA5A-4543-82F2-22E6EAF7773C"),
+    ("downloads", "E367B32F-89DE-4355-BFCE-61F37B18A937"),
+    ("music", "B00B0620-7F51-4C32-AA1E-34CC547F7315"),
+    ("pictures", "383F07A0-E80A-4C80-B05A-86DB845DBC4D"),
+    ("videos", "42B3A5C5-7D86-42F4-80A4-93FACA7A88B5"),
+    ("network", "FE758144-080D-42AE-8BDA-34ED97B66394"),
+    ("personal-folder", "74BDB04A-F94A-4F68-8BD6-4398071DA8BC"),
+];
+
+/// A GUID's 16 bytes as Windows stores them: the first three groups little-endian.
+fn guid_bytes(guid: &str) -> Vec<u8> {
+    let hex: String = guid.chars().filter(|c| *c != '-').collect();
+    let b = parse_hex(&hex).expect("a constant GUID");
+    let mut out = Vec::with_capacity(16);
+    out.extend(b[0..4].iter().rev());
+    out.extend(b[4..6].iter().rev());
+    out.extend(b[6..8].iter().rev());
+    out.extend(&b[8..16]);
+    out
 }
 
 fn resolve_start(s: raw::StartFull, scope: &[HiveScope]) -> Result<Vec<RegistryValue>> {
@@ -1243,13 +1276,33 @@ fn resolve_start(s: raw::StartFull, scope: &[HiveScope]) -> Result<Vec<RegistryV
         ("Start_IrisRecommendations", s.recommendations),
         ("Start_AccountNotifications", s.account_notifications),
     ];
-    let out: Vec<RegistryValue> = values
+    let mut out: Vec<RegistryValue> = values
         .into_iter()
         .filter_map(|(name, v)| v.map(|v| dword(EXPLORER_ADVANCED, name, u32::from(v), scope)))
         .collect();
+    if let Some(folders) = s.folders {
+        let mut bytes = Vec::new();
+        for f in &folders {
+            let guid = START_FOLDERS.iter().find(|(name, _)| name.eq_ignore_ascii_case(f.trim())).map(|(_, g)| g);
+            let Some(guid) = guid else {
+                let names: Vec<_> = START_FOLDERS.iter().map(|(n, _)| *n).collect();
+                bail!("'{f}' isn't one of Start's folders: {}", names.join(", "));
+            };
+            bytes.extend(guid_bytes(guid));
+        }
+        out.push(RegistryValue {
+            key: START_KEY.to_owned(),
+            name: Some("VisiblePlaces".to_owned()),
+            kind: RegistryType::Binary,
+            data: RegistryData::Binary(bytes),
+            scope: scope.to_vec(),
+            state: Presence::Present,
+            group_policy: false,
+        });
+    }
     if out.is_empty() {
         bail!(
-            "needs at least one of 'recommended-files', 'most-used-apps', 'recommendations' or 'account-notifications'"
+            "needs at least one of 'recommended-files', 'most-used-apps', 'recommendations', 'account-notifications' or 'folders'"
         );
     }
     Ok(out)
@@ -1324,7 +1377,7 @@ fn check_secret_references(g: &Groundhogfile) -> Result<()> {
                     secret::parse(v).with_context(|| what.clone())?;
                 }
             }
-            RegistryData::Dword(_) | RegistryData::Qword(_) => {}
+            RegistryData::Dword(_) | RegistryData::Qword(_) | RegistryData::Binary(_) => {}
         }
     }
     for (i, r) in g.run.iter().enumerate() {
@@ -1701,6 +1754,9 @@ fn resolve_registry(r: raw::RegistryValue) -> Result<RegistryValue> {
                 .map_err(|_| bad("does not fit in a dword"))?,
         ),
         (RegistryType::Qword, v) => RegistryData::Qword(scalar_to_u64(v).ok_or_else(|| bad("expected a number"))?),
+        (RegistryType::Binary, raw::Scalar::Str(s)) => RegistryData::Binary(
+            parse_hex(&s).ok_or_else(|| bad("expected hex bytes, like \"86 08 73 52\" or \"86087352\""))?,
+        ),
         (kind, _) => return Err(bad(&format!("value does not match type {kind:?}"))),
     };
 
@@ -1735,6 +1791,15 @@ fn resolve_uac(u: raw::Uac) -> Result<Vec<RegistryValue>> {
         bail!("needs at least one of 'level', 'admin-prompt', 'user-prompt', 'secure-desktop' or 'enabled'");
     }
     Ok(out)
+}
+
+/// Hex bytes, optionally separated by spaces, commas or dashes: `86 08 73`, `86,08,73`, `860873`.
+fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    let digits: String = s.chars().filter(|c| !(c.is_whitespace() || matches!(c, ',' | '-'))).collect();
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..digits.len()).step_by(2).map(|i| u8::from_str_radix(digits.get(i..i + 2)?, 16).ok()).collect()
 }
 
 fn scalar_to_u64(v: raw::Scalar) -> Option<u64> {
@@ -1844,6 +1909,7 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
     let mut tray_icons: Vec<TrayIcon> =
         base.tray_icons.into_iter().filter(|b| !top.tray_icons.iter().any(|t| eq(&t.program, &b.program))).collect();
     tray_icons.extend(top.tray_icons);
+    let do_not_disturb = top.do_not_disturb.or(base.do_not_disturb);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -1866,6 +1932,7 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
         lock_screen,
         screen_saver,
         tray_icons,
+        do_not_disturb,
         services,
         firewall,
         run,
@@ -2478,11 +2545,11 @@ firewall:
         let f = MapFetcher::default()
             .with(
                 "https://cfg.test/base.yaml",
-                "desktop:\n  notifications: { enabled: true, sounds: false, lock-screen: false, apps: { MSTeams_8wekyb3d8bbwe!MSTeams: false } }\n  tray: { show: [OneDrive.exe, Teams.exe], touch-keyboard: false }\n  taskbar: { clock-seconds: true }",
+                "desktop:\n  notifications: { enabled: true, sounds: false, lock-screen: false, do-not-disturb: true, apps: { MSTeams_8wekyb3d8bbwe!MSTeams: false } }\n  tray: { show: [OneDrive.exe, Teams.exe], touch-keyboard: false }\n  taskbar: { clock-seconds: true }",
             )
             .with(
                 "https://cfg.test/top.yaml",
-                "extends: base.yaml\ndesktop: { tray: { hide: [onedrive.exe], pen-menu: false } }",
+                "extends: base.yaml\ndesktop: { tray: { hide: [onedrive.exe] } }",
             );
         let dir = tempfile::tempdir().unwrap();
         let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
@@ -2492,9 +2559,28 @@ firewall:
         assert_eq!(value("NOC_GLOBAL_SETTING_ALLOW_TOASTS_ABOVE_LOCK").data, RegistryData::Dword(0));
         assert_eq!(value("ShowSecondsInSystemClock").data, RegistryData::Dword(1));
         assert_eq!(value("TipbandDesiredVisibility").data, RegistryData::Dword(0));
-        assert_eq!(value("PenWorkspaceButtonDesiredVisibility").data, RegistryData::Dword(0));
         let teams = g.registry.iter().find(|r| r.key.ends_with(r"\MSTeams_8wekyb3d8bbwe!MSTeams")).unwrap();
         assert_eq!((teams.name.as_deref(), &teams.data), (Some("Enabled"), &RegistryData::Dword(0)));
+
+        assert_eq!(g.do_not_disturb, Some(true));
+        // Start's folders, byte for byte as Settings wrote Settings + Downloads.
+        let places = MapFetcher::default()
+            .with("https://cfg.test/p.yaml", "desktop: { start: { folders: [settings, Downloads] } }");
+        let p = load_with(&places, "https://cfg.test/p.yaml", dir.path()).unwrap().file;
+        let expected = parse_hex(
+            "86 08 73 52 aa 51 43 42 9f 7b 27 76 58 46 59 d4 2f b3 67 e3 de 89 55 43 bf ce 61 f3 7b 18 a9 37",
+        )
+        .unwrap();
+        assert_eq!(p.registry[0].data, RegistryData::Binary(expected));
+        assert_eq!(p.registry[0].name.as_deref(), Some("VisiblePlaces"));
+        let bad = MapFetcher::default().with("https://cfg.test/b.yaml", "desktop: { start: { folders: [games] } }");
+        let err = format!("{:#}", load_with(&bad, "https://cfg.test/b.yaml", dir.path()).unwrap_err());
+        assert!(err.contains("isn't one of Start's folders"), "{err}");
+        let hex = MapFetcher::default()
+            .with("https://cfg.test/h.yaml", r"registry: [{ key: HKCU\X, name: B, type: binary, value: '0a,0B ff' }]");
+        let h = load_with(&hex, "https://cfg.test/h.yaml", dir.path()).unwrap().file;
+        assert_eq!(h.registry[0].data, RegistryData::Binary(vec![0x0a, 0x0b, 0xff]));
+        assert!(!g.registry.iter().any(|r| r.key.contains("CloudStore")), "not a plain registry value");
 
         // The later file's hide replaces the base's show for the same program.
         assert_eq!(
