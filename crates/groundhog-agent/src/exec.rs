@@ -131,6 +131,20 @@ impl Executor for WinExecutor<'_> {
             Action::Theme(t) => theme(t, false).map(|changed| Outcome::Done { changed }),
             Action::LockScreen(l) => self.lock_screen(l, false).map(|changed| Outcome::Done { changed }),
             Action::ScreenSaver(s) => screen_saver(s, false).map(|changed| Outcome::Done { changed }),
+            Action::TrayIcon(t) => {
+                let changed = match desktop::set_tray_icon(&t.program, t.shown, false)? {
+                    desktop::TrayIcon::NotSeenYet => {
+                        log(&format!(
+                            "{} hasn't shown a tray icon yet; it's set on the next apply after it does",
+                            t.program
+                        ));
+                        false
+                    }
+                    desktop::TrayIcon::AsWanted => false,
+                    desktop::TrayIcon::Changed(_) => true,
+                };
+                Ok(Outcome::Done { changed })
+            }
             Action::Verify(c) => {
                 crate::checks::run(c, self.started, log)?;
                 Ok(Outcome::Done { changed: false })
@@ -189,6 +203,11 @@ impl Executor for WinExecutor<'_> {
             Action::Theme(t) => would(theme(t, true)?),
             Action::LockScreen(l) => would(self.lock_screen(l, true)?),
             Action::ScreenSaver(s) => would(screen_saver(s, true)?),
+            Action::TrayIcon(t) => match desktop::set_tray_icon(&t.program, t.shown, true)? {
+                desktop::TrayIcon::NotSeenYet => Probe::Unknown,
+                desktop::TrayIcon::AsWanted => Probe::Satisfied,
+                desktop::TrayIcon::Changed(_) => Probe::WouldChange,
+            },
             Action::Service(s) => would(crate::ensure::service(s, true, quiet)?),
             Action::Firewall(r) => would(crate::ensure::firewall(r, true, quiet)?),
             Action::Defender(e) => would(crate::ensure::defender(e, true, quiet)?),

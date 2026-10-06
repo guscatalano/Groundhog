@@ -17,7 +17,7 @@ use crate::loader::LoadedSource;
 use crate::model::{
     App, Capability, CertScope, Certificate, Check, DefenderExclusion, EnvScope, Feature, FileCopy, FirewallRule,
     Groundhogfile, LockScreen, Presence, RegistryData, RegistryValue, RunAction, ScreenSaver, Service, ServiceState,
-    Theme, ThemeMode, User, Wallpaper,
+    Theme, ThemeMode, TrayIcon, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -64,6 +64,7 @@ pub enum Action {
     Theme(Theme),
     LockScreen(LockScreen),
     ScreenSaver(ScreenSaver),
+    TrayIcon(TrayIcon),
 }
 
 impl Action {
@@ -75,6 +76,9 @@ impl Action {
             Action::Run(r) => r.always(),
             // Whether there's a newer version changes without the file changing.
             Action::App(App::Winget { upgrade: true, .. }) => true,
+            // Windows makes a program's tray entry only once it shows an icon, maybe after
+            // this apply; looking again each time is cheap and catches it then.
+            Action::TrayIcon(_) => true,
             _ => false,
         }
     }
@@ -178,6 +182,8 @@ fn title(action: &Action) -> String {
             }
             format!("set lock screen: {}", parts.join(", "))
         }
+        Action::TrayIcon(t) if t.shown => format!("show {}'s icon on the taskbar", t.program),
+        Action::TrayIcon(t) => format!("move {}'s icon to the overflow", t.program),
         Action::ScreenSaver(s) if !s.enabled => "turn the screen saver off".to_owned(),
         Action::ScreenSaver(s) => {
             let name =
@@ -313,6 +319,7 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     actions.extend(file.theme.iter().cloned().map(Action::Theme));
     actions.extend(file.lock_screen.iter().cloned().map(Action::LockScreen));
     actions.extend(file.screen_saver.iter().cloned().map(Action::ScreenSaver));
+    actions.extend(file.tray_icons.iter().cloned().map(Action::TrayIcon));
     // Services and firewall rules after apps, which often install what they refer to.
     actions.extend(file.services.iter().cloned().map(Action::Service));
     actions.extend(file.firewall.iter().cloned().map(Action::Firewall));
@@ -384,7 +391,11 @@ fn section(action: &Action) -> &'static str {
         Action::User(_) => "users",
         Action::EnsureWinget | Action::App(_) | Action::RemoveApp { .. } => "apps",
         Action::Certificate(_) => "certificates",
-        Action::Wallpaper(_) | Action::Theme(_) | Action::LockScreen(_) | Action::ScreenSaver(_) => "desktop",
+        Action::Wallpaper(_)
+        | Action::Theme(_)
+        | Action::LockScreen(_)
+        | Action::ScreenSaver(_)
+        | Action::TrayIcon(_) => "desktop",
         Action::Defender(_) => "defender",
         Action::Service(_) => "services",
         Action::Firewall(_) => "firewall",

@@ -18,7 +18,7 @@ use crate::model::{
     App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, EnvScope, EnvVar,
     ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, LockScreen, Password,
     PathEntry, Presence, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState,
-    Shell, SourceRef, Theme, ThemeMode, User, Wallpaper, WallpaperStyle, raw,
+    Shell, SourceRef, Theme, ThemeMode, TrayIcon, User, Wallpaper, WallpaperStyle, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
@@ -579,18 +579,26 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     if remove_apps.iter().any(|a| a.trim().is_empty()) {
         bail!("remove-apps: an entry is empty");
     }
-    let DesktopParts { wallpaper, theme, lock_screen, screen_saver, registry: desktop_registry, files: desktop_files } =
-        match desktop {
-            Some(d) => resolve_desktop(base, d).context("desktop")?,
-            None => DesktopParts {
-                wallpaper: None,
-                theme: None,
-                lock_screen: None,
-                screen_saver: None,
-                registry: Vec::new(),
-                files: Vec::new(),
-            },
-        };
+    let DesktopParts {
+        wallpaper,
+        theme,
+        lock_screen,
+        screen_saver,
+        registry: desktop_registry,
+        files: desktop_files,
+        tray_icons,
+    } = match desktop {
+        Some(d) => resolve_desktop(base, d).context("desktop")?,
+        None => DesktopParts {
+            wallpaper: None,
+            theme: None,
+            lock_screen: None,
+            screen_saver: None,
+            registry: Vec::new(),
+            files: Vec::new(),
+            tray_icons: Vec::new(),
+        },
+    };
     registry.extend(desktop_registry);
     files.extend(desktop_files);
 
@@ -610,6 +618,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         theme,
         lock_screen,
         screen_saver,
+        tray_icons,
         services,
         firewall,
         run,
@@ -866,6 +875,7 @@ struct DesktopParts {
     registry: Vec<RegistryValue>,
     /// The taskbar's pin list.
     files: Vec<FileCopy>,
+    tray_icons: Vec<TrayIcon>,
 }
 
 /// A picture reference (wallpaper, lock screen), checked to look like one.
@@ -990,8 +1000,15 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<DesktopParts> {
     if let Some(s) = d.start {
         registry.extend(resolve_start(s, &scope).context("start")?);
     }
+    if let Some(n) = d.notifications {
+        registry.extend(resolve_notifications(n, &scope).context("notifications")?);
+    }
+    let mut tray_icons = Vec::new();
+    if let Some(t) = d.tray {
+        resolve_tray(t, &scope, &mut registry, &mut tray_icons).context("tray")?;
+    }
 
-    Ok(DesktopParts { wallpaper, theme: theme.transpose()?, lock_screen, screen_saver, registry, files })
+    Ok(DesktopParts { wallpaper, theme: theme.transpose()?, lock_screen, screen_saver, registry, files, tray_icons })
 }
 
 fn dword(key: &str, name: &str, value: u32, scope: &[HiveScope]) -> RegistryValue {
@@ -1035,6 +1052,9 @@ fn resolve_taskbar(
     }
     if let Some(v) = t.task_view {
         registry.push(dword(EXPLORER_ADVANCED, "ShowTaskViewButton", u32::from(v), scope));
+    }
+    if let Some(v) = t.clock_seconds {
+        registry.push(dword(EXPLORER_ADVANCED, "ShowSecondsInSystemClock", u32::from(v), scope));
     }
     // Windows guards the per-user widgets switch (TaskbarDa) against programs, so this is the
     // machine policy instead, which only Group Policy itself may write: `false` turns widgets
@@ -1084,7 +1104,7 @@ fn resolve_taskbar(
         }
     }
     if registry.len() + files.len() == before {
-        bail!("needs at least one of 'alignment', 'search', 'task-view', 'widgets' or 'pins'");
+        bail!("needs at least one of 'alignment', 'search', 'task-view', 'clock-seconds', 'widgets' or 'pins'");
     }
     Ok(())
 }
@@ -1141,6 +1161,79 @@ fn taskbar_layout(pins: &[String]) -> Result<String> {
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+const NOTIFICATION_SETTINGS: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings";
+
+/// The switches in Settings > System > Notifications.
+fn resolve_notifications(n: raw::NotificationsFull, scope: &[HiveScope]) -> Result<Vec<RegistryValue>> {
+    let mut out = Vec::new();
+    if let Some(v) = n.enabled {
+        out.push(dword(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\PushNotifications",
+            "ToastEnabled",
+            u32::from(v),
+            scope,
+        ));
+    }
+    if let Some(v) = n.sounds {
+        out.push(dword(NOTIFICATION_SETTINGS, "NOC_GLOBAL_SETTING_ALLOW_NOTIFICATION_SOUND", u32::from(v), scope));
+    }
+    if let Some(v) = n.lock_screen {
+        out.push(dword(NOTIFICATION_SETTINGS, "NOC_GLOBAL_SETTING_ALLOW_TOASTS_ABOVE_LOCK", u32::from(v), scope));
+    }
+    for (app, on) in n.apps.unwrap_or_default() {
+        if app.trim().is_empty() || app.contains('\\') {
+            bail!(
+                "'{app}' isn't an app id (one of the names under Settings > Notifications, like MSTeams_8wekyb3d8bbwe!MSTeams)"
+            );
+        }
+        out.push(dword(&format!(r"{NOTIFICATION_SETTINGS}\{app}"), "Enabled", u32::from(on), scope));
+    }
+    if out.is_empty() {
+        bail!("needs at least one of 'enabled', 'sounds', 'lock-screen' or 'apps'");
+    }
+    Ok(out)
+}
+
+/// The notification area: which programs' icons sit on the taskbar, and the corner buttons.
+fn resolve_tray(
+    t: raw::TrayFull,
+    scope: &[HiveScope],
+    registry: &mut Vec<RegistryValue>,
+    icons: &mut Vec<TrayIcon>,
+) -> Result<()> {
+    let before = registry.len();
+    let corner = [
+        (
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\PenWorkspace",
+            "PenWorkspaceButtonDesiredVisibility",
+            t.pen_menu,
+        ),
+        (r"HKCU\Software\Microsoft\TabletTip\1.7", "TipbandDesiredVisibility", t.touch_keyboard),
+        (r"HKCU\Software\Microsoft\Touchpad\Status", "Enabled", t.touchpad),
+    ];
+    for (key, name, v) in corner {
+        if let Some(v) = v {
+            registry.push(dword(key, name, u32::from(v), scope));
+        }
+    }
+    for (programs, shown) in [(t.show.unwrap_or_default(), true), (t.hide.unwrap_or_default(), false)] {
+        for program in programs {
+            let program = program.trim().to_owned();
+            if program.is_empty() {
+                bail!("a program is empty");
+            }
+            if icons.iter().any(|i| i.program.eq_ignore_ascii_case(&program)) {
+                bail!("{program} is listed twice");
+            }
+            icons.push(TrayIcon { program, shown });
+        }
+    }
+    if registry.len() == before && icons.is_empty() {
+        bail!("needs at least one of 'show', 'hide', 'pen-menu', 'touch-keyboard' or 'touchpad'");
+    }
+    Ok(())
 }
 
 fn resolve_start(s: raw::StartFull, scope: &[HiveScope]) -> Result<Vec<RegistryValue>> {
@@ -1748,6 +1841,9 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
     let wallpaper = top.wallpaper.or(base.wallpaper);
     let lock_screen = top.lock_screen.or(base.lock_screen);
     let screen_saver = top.screen_saver.or(base.screen_saver);
+    let mut tray_icons: Vec<TrayIcon> =
+        base.tray_icons.into_iter().filter(|b| !top.tray_icons.iter().any(|t| eq(&t.program, &b.program))).collect();
+    tray_icons.extend(top.tray_icons);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -1769,6 +1865,7 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
         theme,
         lock_screen,
         screen_saver,
+        tray_icons,
         services,
         firewall,
         run,
@@ -2369,6 +2466,51 @@ firewall:
             ("desktop: { start: { pins: [edge] } }", "unknown field"),
             (r"registry: [{ key: HKCU\X, name: N, value: 1, via: group-policy }]", "is for HKLM keys"),
             (r"registry: [{ key: HKLM\SOFTWARE\X\Y, state: absent, via: group-policy }]", "not whole keys"),
+        ] {
+            let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
+            let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn notifications_and_tray_parse_and_merge() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/base.yaml",
+                "desktop:\n  notifications: { enabled: true, sounds: false, lock-screen: false, apps: { MSTeams_8wekyb3d8bbwe!MSTeams: false } }\n  tray: { show: [OneDrive.exe, Teams.exe], touch-keyboard: false }\n  taskbar: { clock-seconds: true }",
+            )
+            .with(
+                "https://cfg.test/top.yaml",
+                "extends: base.yaml\ndesktop: { tray: { hide: [onedrive.exe], pen-menu: false } }",
+            );
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let value = |name: &str| g.registry.iter().find(|r| r.name.as_deref() == Some(name)).unwrap();
+        assert_eq!(value("ToastEnabled").data, RegistryData::Dword(1));
+        assert_eq!(value("NOC_GLOBAL_SETTING_ALLOW_NOTIFICATION_SOUND").data, RegistryData::Dword(0));
+        assert_eq!(value("NOC_GLOBAL_SETTING_ALLOW_TOASTS_ABOVE_LOCK").data, RegistryData::Dword(0));
+        assert_eq!(value("ShowSecondsInSystemClock").data, RegistryData::Dword(1));
+        assert_eq!(value("TipbandDesiredVisibility").data, RegistryData::Dword(0));
+        assert_eq!(value("PenWorkspaceButtonDesiredVisibility").data, RegistryData::Dword(0));
+        let teams = g.registry.iter().find(|r| r.key.ends_with(r"\MSTeams_8wekyb3d8bbwe!MSTeams")).unwrap();
+        assert_eq!((teams.name.as_deref(), &teams.data), (Some("Enabled"), &RegistryData::Dword(0)));
+
+        // The later file's hide replaces the base's show for the same program.
+        assert_eq!(
+            g.tray_icons,
+            vec![
+                TrayIcon { program: "Teams.exe".into(), shown: true },
+                TrayIcon { program: "onedrive.exe".into(), shown: false },
+            ]
+        );
+
+        for (bad, why) in [
+            ("desktop: { notifications: {} }", "needs at least one"),
+            (r"desktop: { notifications: { apps: { 'C:\x.exe': false } } }", "isn't an app id"),
+            ("desktop: { tray: {} }", "needs at least one"),
+            ("desktop: { tray: { show: [a.exe], hide: [A.EXE] } }", "listed twice"),
+            ("desktop: { tray: { always-show-all: true } }", "unknown field"),
         ] {
             let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());

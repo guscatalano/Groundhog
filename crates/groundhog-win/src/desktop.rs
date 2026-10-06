@@ -226,3 +226,74 @@ pub fn broadcast_theme_change() {
         )
     };
 }
+
+/// What [`set_tray_icon`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayIcon {
+    /// The program has no entry yet: Windows makes one the first time it shows an icon.
+    NotSeenYet,
+    /// Every entry for the program was already as wanted.
+    AsWanted,
+    /// This many entries were (or, when checking, would be) changed.
+    Changed(usize),
+}
+
+const NOTIFY_ICON_SETTINGS: &str = r"Control Panel\NotifyIconSettings";
+
+/// Puts a program's notification-area icon on the taskbar (`shown`) or in the overflow, for
+/// the current user. `program` is a file name (`OneDrive.exe`) or the end of a path
+/// (`Microsoft OneDrive\OneDrive.exe`); every entry whose program matches is set.
+pub fn set_tray_icon(program: &str, shown: bool, check: bool) -> Result<TrayIcon> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+
+    let settings = match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(NOTIFY_ICON_SETTINGS, KEY_READ) {
+        Ok(k) => k,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(TrayIcon::NotSeenYet),
+        Err(e) => return Err(e.into()),
+    };
+    let wanted = u32::from(shown);
+    let (mut found, mut changed) = (0, 0);
+    for name in settings.enum_keys().collect::<io::Result<Vec<_>>>()? {
+        let entry = settings.open_subkey_with_flags(&name, KEY_READ | KEY_SET_VALUE)?;
+        let Ok(path) = entry.get_value::<String, _>("ExecutablePath") else { continue };
+        if !program_matches(&path, program) {
+            continue;
+        }
+        found += 1;
+        if entry.get_value::<u32, _>("IsPromoted").ok() != Some(wanted) {
+            if !check {
+                entry.set_value("IsPromoted", &wanted)?;
+            }
+            changed += 1;
+        }
+    }
+    Ok(match (found, changed) {
+        (0, _) => TrayIcon::NotSeenYet,
+        (_, 0) => TrayIcon::AsWanted,
+        (_, n) => TrayIcon::Changed(n),
+    })
+}
+
+/// Whether a tray entry's program (often written with a known-folder id in place of the
+/// folder, `{6D809377-…}\App\app.exe`) is `program`.
+fn program_matches(path: &str, program: &str) -> bool {
+    let path = path.to_ascii_lowercase().replace('/', "\\");
+    let program = program.to_ascii_lowercase().replace('/', "\\");
+    path == program || path.ends_with(&format!(r"\{}", program.trim_start_matches('\\')))
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use super::program_matches;
+
+    #[test]
+    fn tray_programs_match_by_file_name_or_path_tail() {
+        let p = r"{6D809377-6AF0-444B-8957-A3773F02200E}\Microsoft OneDrive\OneDrive.exe";
+        assert!(program_matches(p, "OneDrive.exe"));
+        assert!(program_matches(p, "onedrive.EXE"));
+        assert!(program_matches(p, r"Microsoft OneDrive\OneDrive.exe"));
+        assert!(!program_matches(p, "Drive.exe"), "a file name matches whole, not as a suffix");
+        assert!(!program_matches(p, "Teams.exe"));
+        assert!(program_matches(r"C:\Tools\x.exe", r"C:\Tools\x.exe"));
+    }
+}

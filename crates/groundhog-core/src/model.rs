@@ -33,6 +33,7 @@ pub struct Groundhogfile {
     pub theme: Option<Theme>,
     pub lock_screen: Option<LockScreen>,
     pub screen_saver: Option<ScreenSaver>,
+    pub tray_icons: Vec<TrayIcon>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -255,6 +256,17 @@ pub struct ScreenSaver {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
     pub scope: Vec<HiveScope>,
+}
+
+/// Whether a program's notification-area icon sits on the taskbar or in the overflow (^),
+/// for the agent's user. Windows keeps one entry per program, made the first time it shows
+/// an icon.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TrayIcon {
+    /// A program's file name (`OneDrive.exe`) or full path.
+    pub program: String,
+    /// On the taskbar (`true`) or in the overflow.
+    pub shown: bool,
 }
 
 /// Light or dark mode, for apps and for Windows itself (taskbar, Start, notifications).
@@ -776,6 +788,8 @@ pub(crate) mod raw {
         pub screen_saver: Option<ScreenSaverFull>,
         pub taskbar: Option<TaskbarFull>,
         pub start: Option<StartFull>,
+        pub notifications: Option<NotificationsFull>,
+        pub tray: Option<TrayFull>,
         pub scope: Option<OneOrMany<HiveScope>>,
     }
 
@@ -788,6 +802,27 @@ pub(crate) mod raw {
         pub widgets: Option<bool>,
         pub pins: Option<Vec<String>>,
         pub pins_for: Option<PinsFor>,
+        pub clock_seconds: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct NotificationsFull {
+        pub enabled: Option<bool>,
+        pub sounds: Option<bool>,
+        pub lock_screen: Option<bool>,
+        /// App id (as in Settings' notification list) to on/off.
+        pub apps: Option<BTreeMap<String, bool>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct TrayFull {
+        pub show: Option<Vec<String>>,
+        pub hide: Option<Vec<String>>,
+        pub pen_menu: Option<bool>,
+        pub touch_keyboard: Option<bool>,
+        pub touchpad: Option<bool>,
     }
 
     #[derive(Debug, Clone, Copy, Deserialize)]
