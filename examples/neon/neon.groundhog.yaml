@@ -1,0 +1,61 @@
+# A quiet, dark Windows with a neon city on the desktop, and two tools: Heisenberg (an MCP
+# server for debugging Windows) and FindNeedle (fast log search). Small on purpose: no SDKs,
+# no runtimes (both tools are self-contained), nothing that needs a restart.
+#
+#   & ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) https://raw.githubusercontent.com/guscatalano/Groundhog/main/examples/neon/neon.groundhog.yaml
+#
+# The taskbar pins appear at the next sign-in; everything else at once.
+
+agent: ">=0.17.0"
+
+# No setup nags, tips, ads, widgets or web results in search.
+extends: groundhog:quiet-windows
+
+files:
+  - from: github:guscatalano/Heisenberg@latest/heisenberg.exe
+    to: C:\Program Files\Heisenberg\heisenberg.exe
+  # FindNeedle publishes every build as a prerelease; release.zip is the self-contained app.
+  - from: github:guscatalano/findneedle@latest/release.zip
+    prerelease: true
+    to: C:\Program Files\FindNeedle
+    extract: true
+
+path:
+  - dir: C:\Program Files\Heisenberg
+    scope: machine
+
+desktop:
+  theme: dark
+  wallpaper: neon-city.jpg            # rendered by make-wallpaper.py, next to this file
+  wallpaper-style: fill
+  taskbar:
+    search: icon
+    task-view: false
+    widgets: false
+    pins:
+      - file-explorer
+      - terminal
+      - '%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\FindNeedle.lnk'
+  start:
+    recommendations: false
+    recommended-files: false
+    folders: [file-explorer, downloads, settings]
+  notifications:
+    sounds: false
+  tray:
+    hide: [OneDrive.exe]
+  scope: [current-user, default-user]
+
+run:
+  - command: |
+      # A Start menu entry for FindNeedle (the zip has no installer to make one)
+      $lnk = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\FindNeedle.lnk"
+      $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+      $s.TargetPath = 'C:\Program Files\FindNeedle\FindNeedleUX.exe'
+      $s.WorkingDirectory = 'C:\Program Files\FindNeedle'
+      $s.Description = 'Search through logs'
+      $s.Save()
+
+verify:
+  - file: C:\Program Files\Heisenberg\heisenberg.exe
+  - file: C:\Program Files\FindNeedle\FindNeedleUX.exe
