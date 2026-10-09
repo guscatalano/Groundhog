@@ -153,7 +153,9 @@ registry:
 
   # OneDrive's "Turn on Windows Backup" (move Desktop, Documents and Pictures into OneDrive).
   # This is OneDrive's own policy, on every edition; it also removes that choice from
-  # OneDrive's settings, so leave this library out if you want that backup.
+  # OneDrive's settings, so leave this library out if you want that backup. OneDrive reads
+  # it when it starts, so a copy that's already running can nag once more, until the next
+  # sign-in.
   - key: HKLM\SOFTWARE\Policies\Microsoft\OneDrive
     name: KFMBlockOptIn
     type: dword
