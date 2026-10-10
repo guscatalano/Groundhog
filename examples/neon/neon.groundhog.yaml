@@ -1,6 +1,6 @@
-# A quiet, dark Windows with a neon city on the desktop, and two tools: Heisenberg (an MCP
-# server for debugging Windows) and FindNeedle (fast log search). Small on purpose: no SDKs,
-# no runtimes (both tools are self-contained), nothing that needs a restart.
+# A quiet, dark Windows with a neon city on the desktop, VS Code, and two tools: Heisenberg
+# (an MCP server for debugging Windows) and FindNeedle (fast log search). Small on purpose: no
+# SDKs, no runtimes (the tools are self-contained), nothing that needs a restart.
 #
 #   & ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) https://raw.githubusercontent.com/guscatalano/Groundhog/main/examples/neon/neon.groundhog.yaml
 #
@@ -10,6 +10,10 @@ agent: ">=0.17.0"
 
 # No setup nags, tips, ads, widgets or web results in search.
 extends: groundhog:quiet-windows
+
+apps:
+  - id: Microsoft.VisualStudioCode
+    args: --scope machine           # for every account, with a Start menu entry for all
 
 files:
   - from: github:guscatalano/Heisenberg@latest/heisenberg.exe
@@ -32,10 +36,10 @@ desktop:
     search: icon
     task-view: false
     widgets: false
+    # Only these: Windows' own pins (Edge, Store, Outlook, ...) go.
     pins:
-      - file-explorer
-      - terminal
       - '%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\FindNeedle.lnk'
+      - '%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk'
   start:
     recommendations: false
     recommended-files: false
@@ -59,3 +63,4 @@ run:
 verify:
   - file: C:\Program Files\Heisenberg\heisenberg.exe
   - file: C:\Program Files\FindNeedle\FindNeedleUX.exe
+  - file: '%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk'
