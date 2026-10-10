@@ -1,0 +1,14 @@
+# Node.js development: Node.js LTS and pnpm, on top of dev-core. (Node no longer ships
+# Corepack, so pnpm comes from winget.)
+#
+#   groundhog-agent apply groundhog:node
+
+extends: dev-core.groundhog.yaml
+
+apps:
+  - OpenJS.NodeJS.LTS
+  - { id: pnpm.pnpm, args: --scope machine }
+
+verify:
+  - file: '%ProgramFiles%\nodejs\node.exe'
+  - file: '%ProgramFiles%\nodejs\npm.cmd'

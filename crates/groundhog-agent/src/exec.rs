@@ -11,7 +11,8 @@ use groundhog_core::engine::{Action, Executor, Outcome, Probe, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
     App, Capability, Certificate, EnvScope, Feature, FileCopy, HiveScope, LockScreen, Password, RegistryData,
-    RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, Theme, ThemeMode, User, Wallpaper, WallpaperStyle,
+    RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, StartPins, Theme, ThemeMode, User, Wallpaper,
+    WallpaperStyle,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
@@ -138,6 +139,7 @@ impl Executor for WinExecutor<'_> {
                 }
                 Ok(Outcome::Done { changed })
             }
+            Action::StartPins(p) => self.start_pins(p, false).map(|changed| Outcome::Done { changed }),
             Action::TrayIcon(t) => {
                 let changed = match desktop::set_tray_icon(&t.program, t.shown, false)? {
                     desktop::TrayIcon::NotSeenYet => {
@@ -211,6 +213,7 @@ impl Executor for WinExecutor<'_> {
             Action::LockScreen(l) => would(self.lock_screen(l, true)?),
             Action::ScreenSaver(s) => would(screen_saver(s, true)?),
             Action::DoNotDisturb { on } => would(desktop::set_do_not_disturb(*on, true)?),
+            Action::StartPins(p) => would(self.start_pins(p, true)?),
             Action::TrayIcon(t) => match desktop::set_tray_icon(&t.program, t.shown, true)? {
                 desktop::TrayIcon::NotSeenYet => Probe::Unknown,
                 desktop::TrayIcon::AsWanted => Probe::Satisfied,
@@ -540,6 +543,32 @@ impl WinExecutor<'_> {
         }
         if let Some(secs) = l.lock_after_secs {
             changed |= desktop::set_lock_after(secs, check)?;
+        }
+        Ok(changed)
+    }
+
+    /// Start's pins, from a layout file, for this user and/or new accounts.
+    fn start_pins(&mut self, p: &StartPins, check: bool) -> Result<bool> {
+        let profiles = p.scope.iter().map(|s| match s {
+            HiveScope::CurrentUser => desktop::Profile::Current,
+            HiveScope::DefaultUser => desktop::Profile::Default,
+        });
+        let known = p.sha256.as_deref().or(p.resolved.as_deref());
+        if check {
+            // Without downloading: does each profile's file already have the layout's hash?
+            let Some(known) = known else { return Ok(true) };
+            for profile in profiles {
+                let path = desktop::start_layout_path(profile)?;
+                if !path.exists() || !groundhog_core::fetch::sha256_file(&path)?.eq_ignore_ascii_case(known) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        let layout = std::fs::read(&self.content.get_file(&p.from, known)?.path)?;
+        let mut changed = false;
+        for profile in profiles {
+            changed |= desktop::set_start_pins(&layout, profile)?;
         }
         Ok(changed)
     }

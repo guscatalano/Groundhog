@@ -36,6 +36,7 @@ pub struct Groundhogfile {
     pub tray_icons: Vec<TrayIcon>,
     /// Do Not Disturb for the agent's user; Windows applies it at the next sign-in.
     pub do_not_disturb: Option<bool>,
+    pub start_pins: Option<StartPins>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -269,6 +270,19 @@ pub struct TrayIcon {
     pub program: String,
     /// On the taskbar (`true`) or in the overflow.
     pub shown: bool,
+}
+
+/// Start's pinned apps, as a layout file (`start2.bin`) taken from a machine pinned by hand.
+/// Windows keeps them in that file only, in a format of its own.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StartPins {
+    pub from: Url,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Content hash found at load time when `sha256` is not pinned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    pub scope: Vec<HiveScope>,
 }
 
 /// Light or dark mode, for apps and for Windows itself (taskbar, Start, notifications).
@@ -865,6 +879,10 @@ pub(crate) mod raw {
         pub account_notifications: Option<bool>,
         /// The folders next to the power button, by name.
         pub folders: Option<Vec<String>>,
+        /// "Recently added" apps under Recommended.
+        pub recently_added: Option<bool>,
+        /// The pinned apps: a `start2.bin` taken from a machine pinned by hand.
+        pub pins_from: Option<StringOr<WallpaperFull>>,
     }
 
     #[derive(Debug, Deserialize)]

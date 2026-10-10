@@ -1,0 +1,25 @@
+# Python development: Python 3.13 for every account, on the machine PATH, and uv; UTF-8 mode
+# on. On top of dev-core.
+#
+#   groundhog-agent apply groundhog:python
+
+extends: dev-core.groundhog.yaml
+
+apps:
+  - id: Python.Python.3.13
+    args: --scope machine
+  - { id: astral-sh.uv, args: --scope machine }
+
+# Ahead of the Microsoft Store's "python" shortcut, which is on each user's PATH.
+path:
+  - dir: '%ProgramFiles%\Python313'
+    scope: machine
+  - dir: '%ProgramFiles%\Python313\Scripts'
+    scope: machine
+
+env:
+  PYTHONUTF8: "1"
+
+verify:
+  - file: '%ProgramFiles%\Python313\python.exe'
+  - command: uv --version

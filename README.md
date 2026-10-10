@@ -113,6 +113,14 @@ Performance Toolkit, .NET diagnostics, symbols, crash dumps) is one line:
 groundhog-agent apply groundhog:windows-internals
 ```
 
+Developer machines too: `dev-core` (Git, GitHub CLI, VS Code, PowerShell 7, the usual command
+line tools), with `dotnet`, `vs`, `node`, `python`, `rust`, `containers` and `ai` on top.
+Combine them in your own file:
+
+```yaml
+extends: [groundhog:python, groundhog:node, groundhog:ai]
+```
+
 ## Sources: path, URL or zip
 
 The agent takes a local path, a directory, an `https://` URL, or a `.zip` bundle (local or remote).

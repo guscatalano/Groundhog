@@ -17,7 +17,7 @@ use crate::loader::LoadedSource;
 use crate::model::{
     App, Capability, CertScope, Certificate, Check, DefenderExclusion, EnvScope, Feature, FileCopy, FirewallRule,
     Groundhogfile, LockScreen, Presence, RegistryData, RegistryValue, RunAction, ScreenSaver, Service, ServiceState,
-    Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    StartPins, Theme, ThemeMode, TrayIcon, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -69,6 +69,8 @@ pub enum Action {
     DoNotDisturb {
         on: bool,
     },
+    /// Start's pinned apps, from a layout file.
+    StartPins(StartPins),
 }
 
 impl Action {
@@ -189,6 +191,7 @@ fn title(action: &Action) -> String {
         Action::DoNotDisturb { on } => {
             format!("turn Do Not Disturb {} (from the next sign-in)", if *on { "on" } else { "off" })
         }
+        Action::StartPins(p) => format!("pin Start's apps as {} has them", file_name(&p.from)),
         Action::TrayIcon(t) if t.shown => format!("show {}'s icon on the taskbar", t.program),
         Action::TrayIcon(t) => format!("move {}'s icon to the overflow", t.program),
         Action::ScreenSaver(s) if !s.enabled => "turn the screen saver off".to_owned(),
@@ -241,6 +244,7 @@ fn build_label(action: &Action) -> Option<String> {
         }
         Action::Certificate(Certificate { resolved, .. })
         | Action::Wallpaper(Wallpaper { resolved, .. })
+        | Action::StartPins(StartPins { resolved, .. })
         | Action::LockScreen(LockScreen { resolved, .. }) => (None, resolved.as_deref()),
         Action::Run(RunAction::Script { resolved, .. } | RunAction::Plugin { resolved, .. }) => {
             (None, resolved.as_deref())
@@ -328,6 +332,7 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     actions.extend(file.screen_saver.iter().cloned().map(Action::ScreenSaver));
     actions.extend(file.tray_icons.iter().cloned().map(Action::TrayIcon));
     actions.extend(file.do_not_disturb.map(|on| Action::DoNotDisturb { on }));
+    actions.extend(file.start_pins.iter().cloned().map(Action::StartPins));
     // Services and firewall rules after apps, which often install what they refer to.
     actions.extend(file.services.iter().cloned().map(Action::Service));
     actions.extend(file.firewall.iter().cloned().map(Action::Firewall));
@@ -404,7 +409,8 @@ fn section(action: &Action) -> &'static str {
         | Action::LockScreen(_)
         | Action::ScreenSaver(_)
         | Action::TrayIcon(_)
-        | Action::DoNotDisturb { .. } => "desktop",
+        | Action::DoNotDisturb { .. }
+        | Action::StartPins(_) => "desktop",
         Action::Defender(_) => "defender",
         Action::Service(_) => "services",
         Action::Firewall(_) => "firewall",

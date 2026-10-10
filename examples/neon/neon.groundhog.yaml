@@ -6,7 +6,7 @@
 #
 # The taskbar pins appear at the next sign-in; everything else at once.
 
-agent: ">=0.17.0"
+agent: ">=0.19.0"
 
 # No setup nags, tips, ads, widgets or web results in search.
 extends: groundhog:quiet-windows
@@ -41,6 +41,10 @@ desktop:
       - '%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\FindNeedle.lnk'
       - '%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk'
   start:
+    # Settings, File Explorer, FindNeedle and VS Code, pinned by hand on a sandbox and saved
+    # from %LOCALAPPDATA%\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState
+    pins-from: start2.bin
+    recently-added: false
     recommendations: false
     recommended-files: false
     folders: [file-explorer, downloads, settings]

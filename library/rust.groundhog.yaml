@@ -1,0 +1,29 @@
+# Rust development: the Visual Studio C++ build tools Rust links with, then rustup with the
+# stable toolchain, clippy and rustfmt, for this user. On top of dev-core.
+#
+#   groundhog-agent apply groundhog:rust
+
+extends: dev-core.groundhog.yaml
+
+apps:
+  # The MSVC linker and Windows SDK, before rustup (which otherwise offers to install them)
+  - id: Microsoft.VisualStudio.BuildTools
+    args: --custom "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+    timeout: 60m
+  - Rustlang.Rustup
+
+path:
+  - '%USERPROFILE%\.cargo\bin'
+
+run:
+  - command: |
+      # the stable toolchain with clippy and rustfmt
+      # rustup.exe by full path: it was installed by this run, after the agent started.
+      $rustup = Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'
+      & $rustup default stable
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      & $rustup component add clippy rustfmt
+
+verify:
+  - file: '%USERPROFILE%\.cargo\bin\cargo.exe'
+  - file: '%USERPROFILE%\.cargo\bin\cargo-clippy.exe'

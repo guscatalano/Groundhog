@@ -18,6 +18,10 @@ use windows_sys::Win32::System::JobObjects::{
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// How often a running process is checked on.
+const TICK: Duration = Duration::from_millis(200);
+/// How long output is still read after the process ends.
+const AFTER_EXIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default, Clone)]
 pub struct Proc {
@@ -113,24 +117,34 @@ impl Proc {
         let mut recent: VecDeque<String> = VecDeque::new();
         let mut deadline = self.timeout.map(|t| Instant::now() + t);
         let mut timed_out = false;
+        // When the process ended. A program it started can hold our pipes open for as long as
+        // it runs (an installer that launches its app), so after that only what's already
+        // written is read.
+        let mut exited: Option<Instant> = None;
+        let mut pipes_closed = false;
         loop {
-            let (is_stdout, line) = match deadline {
-                None => match rx.recv() {
-                    Ok(m) => m,
-                    Err(_) => break,
-                },
-                Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
-                    Ok(m) => m,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                    Err(RecvTimeoutError::Timeout) => {
-                        timed_out = true;
-                        deadline = None; // keep reading what's left until the pipes close
-                        if let Some(job) = &job {
-                            job.terminate();
-                        }
-                        continue;
-                    }
-                },
+            if let Some(d) = deadline
+                && Instant::now() >= d
+            {
+                timed_out = true;
+                deadline = None; // keep reading what's left until the pipes close
+                if let Some(job) = &job {
+                    job.terminate();
+                }
+            }
+            if exited.is_none() && child.try_wait().context("checking on process")?.is_some() {
+                exited = Some(Instant::now());
+            }
+            if exited.is_some_and(|t| t.elapsed() >= AFTER_EXIT) {
+                break;
+            }
+            let (is_stdout, line) = match rx.recv_timeout(TICK) {
+                Ok(m) => m,
+                Err(RecvTimeoutError::Disconnected) => {
+                    pipes_closed = true;
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
             };
             if is_stdout && self.capture_stdout {
                 stdout.push_str(&line);
@@ -152,7 +166,9 @@ impl Proc {
                 }
             }
         }
-        let _ = (t1.join(), t2.join());
+        if pipes_closed {
+            let _ = (t1.join(), t2.join());
+        } // else the readers end with whatever holds the pipes; nothing waits for them
         let status = child.wait().context("waiting for process")?;
         if timed_out {
             let limit = self.timeout.unwrap_or_default();
@@ -366,6 +382,20 @@ mod tests {
 
         let fast = Proc::new("cmd.exe").args(["/d", "/c"]).raw(Some("exit 4")).timeout_ms(Some(10_000));
         assert_eq!(fast.run(&mut |_| {}).unwrap().code, 4, "finishing in time behaves as before");
+    }
+
+    #[test]
+    fn a_program_it_starts_does_not_keep_it_running() {
+        // Like an installer that launches its app: ping inherits the pipes and outlives cmd.
+        let started = Instant::now();
+        let mut lines = Vec::new();
+        let out = Proc::new("cmd.exe")
+            .args(["/d", "/c"])
+            .raw(Some("start /b ping -n 30 127.0.0.1 >nul & echo installed & exit 0"))
+            .run(&mut |l| lines.push(l.to_owned()))
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert_eq!((out.code, lines), (0, vec!["installed".to_owned()]));
     }
 
     #[test]

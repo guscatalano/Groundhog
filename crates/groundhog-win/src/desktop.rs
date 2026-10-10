@@ -302,6 +302,53 @@ const QUIET_HOURS_KEY: &str = concat!(
     r"Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\",
     r"default$windows.data.donotdisturb.quiethourssettings\windows.data.donotdisturb.quiethourssettings"
 );
+/// Where Start keeps its pinned apps, under a profile's folder.
+const START_LAYOUT: &str =
+    r"AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState\start2.bin";
+
+/// Whose Start: this user's (now) or new accounts' (from the Default profile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    Current,
+    Default,
+}
+
+/// The Start layout file of this user or of the Default profile.
+pub fn start_layout_path(profile: Profile) -> Result<std::path::PathBuf> {
+    let dir = match profile {
+        Profile::Current => std::path::PathBuf::from(crate::env::expand("%USERPROFILE%")?),
+        Profile::Default => registry::default_profile_dir()?,
+    };
+    Ok(dir.join(START_LAYOUT))
+}
+
+/// Puts a Start layout (`start2.bin`) in place. Windows has no setting for Start's pins on
+/// editions without device management; it keeps them in this file, in a format of its own
+/// that isn't tied to a machine or user, so one taken from a machine pinned by hand works
+/// anywhere. For this user, Start's host is ended first: it holds the file and would write
+/// its own copy back. It starts again by itself and shows the new pins.
+pub fn set_start_pins(layout: &[u8], profile: Profile) -> Result<bool> {
+    let path = start_layout_path(profile)?;
+    if std::fs::read(&path).is_ok_and(|now| now == layout) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(path.parent().expect("has a folder"))?;
+    let mut last = None;
+    for _ in 0..10 {
+        if profile == Profile::Current {
+            let _ = crate::process::Proc::new("taskkill.exe")
+                .args(["/f", "/im", "StartMenuExperienceHost.exe"])
+                .run(&mut |_| {});
+        }
+        match std::fs::write(&path, layout) {
+            Ok(()) => return Ok(true),
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    bail!("writing {}: {}", path.display(), last.map(|e| e.to_string()).unwrap_or_default())
+}
+
 const PROFILE_ON: &str = "Microsoft.QuietHoursProfile.PriorityOnly";
 const PROFILE_OFF: &str = "Microsoft.QuietHoursProfile.Unrestricted";
 

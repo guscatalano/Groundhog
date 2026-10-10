@@ -4,6 +4,31 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.19.0] - 2026-10-10
+
+### Added
+- **Developer templates** in the library, each on top of `dev-core`. Combine them freely
+  (`extends: [groundhog:python, groundhog:node]`):
+  - `dev-core`: Git, GitHub CLI, VS Code, PowerShell 7, Windows Terminal, 7-Zip, jq,
+    ripgrep, fd, fzf, bat and delta, plus Git defaults;
+  - `dotnet` (.NET 10 and 8), and `vs` (Visual Studio 2026 with the .NET, web and C++
+    workloads);
+  - `node` (Node.js LTS and pnpm), `python` (Python 3.13 and uv), and `rust` (the C++ build
+    tools, then rustup with clippy and rustfmt);
+  - `containers` (WSL 2, Docker Desktop, kubectl, Helm, k9s, kind);
+  - `ai` (Claude Code, Codex, Copilot CLI, Ollama).
+- **Start's pinned apps**: `desktop.start.pins-from: start2.bin`. Pin by hand on one
+  machine, copy its Start layout file next to your Groundhogfile, and every machine gets that
+  Start, at once for the agent's account and for new accounts through the Default profile.
+- `desktop.start.recently-added: false` hides "Recently added" apps in Start, at once.
+- The `neon` example pins only Settings, File Explorer, FindNeedle and VS Code to Start.
+
+### Fixed
+- An installer that starts its app (Ollama's does) no longer keeps the step waiting until
+  that app exits.
+- A file that extends two templates built on the same base gets the base's commands and
+  checks once, and the base's apps stay first.
+
 ## [0.18.1] - 2026-10-10
 
 ### Changed

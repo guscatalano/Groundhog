@@ -18,7 +18,7 @@ use crate::model::{
     App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, EnvScope, EnvVar,
     ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, LockScreen, Password,
     PathEntry, Presence, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState,
-    Shell, SourceRef, Theme, ThemeMode, TrayIcon, User, Wallpaper, WallpaperStyle, raw,
+    Shell, SourceRef, StartPins, Theme, ThemeMode, TrayIcon, User, Wallpaper, WallpaperStyle, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
@@ -214,6 +214,9 @@ impl<'a> Loader<'a> {
         if let Some(Wallpaper { from: Some(from), sha256, .. }) = &mut file.wallpaper {
             from_github(from, sha256, &mut None)?;
         }
+        if let Some(StartPins { from, sha256, .. }) = &mut file.start_pins {
+            from_github(from, sha256, &mut None)?;
+        }
         if let Some(LockScreen { image: Some(image), sha256, .. }) = &mut file.lock_screen {
             from_github(image, sha256, &mut None)?;
         }
@@ -255,6 +258,9 @@ impl<'a> Loader<'a> {
             }
         }
         if let Some(Wallpaper { from: Some(from), sha256, resolved, .. }) = &mut file.wallpaper {
+            resolve(from, sha256, resolved)?;
+        }
+        if let Some(StartPins { from, sha256, resolved, .. }) = &mut file.start_pins {
             resolve(from, sha256, resolved)?;
         }
         if let Some(LockScreen { image: Some(image), sha256, resolved, .. }) = &mut file.lock_screen {
@@ -588,6 +594,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         files: desktop_files,
         tray_icons,
         do_not_disturb,
+        start_pins,
     } = match desktop {
         Some(d) => resolve_desktop(base, d).context("desktop")?,
         None => DesktopParts {
@@ -599,6 +606,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
             files: Vec::new(),
             tray_icons: Vec::new(),
             do_not_disturb: None,
+            start_pins: None,
         },
     };
     registry.extend(desktop_registry);
@@ -622,6 +630,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         screen_saver,
         tray_icons,
         do_not_disturb,
+        start_pins,
         services,
         firewall,
         run,
@@ -880,6 +889,7 @@ struct DesktopParts {
     files: Vec<FileCopy>,
     tray_icons: Vec<TrayIcon>,
     do_not_disturb: Option<bool>,
+    start_pins: Option<StartPins>,
 }
 
 /// A picture reference (wallpaper, lock screen), checked to look like one.
@@ -1001,8 +1011,17 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<DesktopParts> {
     if let Some(t) = d.taskbar {
         resolve_taskbar(t, &scope, &mut registry, &mut files).context("taskbar")?;
     }
-    if let Some(s) = d.start {
-        registry.extend(resolve_start(s, &scope).context("start")?);
+    let mut start_pins = None;
+    if let Some(mut s) = d.start {
+        if let Some(pins) = s.pins_from.take() {
+            let (from, sha256) = match pins {
+                raw::StringOr::Short(from) => (from, None),
+                raw::StringOr::Full(f) => (f.from, f.sha256),
+            };
+            let url = resolve_ref(base, &from).context("start: pins-from")?;
+            start_pins = Some(StartPins { from: url, sha256: pin(sha256)?, resolved: None, scope: scope.clone() });
+        }
+        registry.extend(resolve_start(s, &scope, start_pins.is_some()).context("start")?);
     }
     let mut do_not_disturb = None;
     if let Some(n) = d.notifications {
@@ -1023,6 +1042,7 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<DesktopParts> {
         files,
         tray_icons,
         do_not_disturb,
+        start_pins,
     })
 }
 
@@ -1269,7 +1289,7 @@ fn guid_bytes(guid: &str) -> Vec<u8> {
     out
 }
 
-fn resolve_start(s: raw::StartFull, scope: &[HiveScope]) -> Result<Vec<RegistryValue>> {
+fn resolve_start(s: raw::StartFull, scope: &[HiveScope], has_pins: bool) -> Result<Vec<RegistryValue>> {
     let values = [
         ("Start_TrackDocs", s.recommended_files),
         ("Start_TrackProgs", s.most_used_apps),
@@ -1280,6 +1300,9 @@ fn resolve_start(s: raw::StartFull, scope: &[HiveScope]) -> Result<Vec<RegistryV
         .into_iter()
         .filter_map(|(name, v)| v.map(|v| dword(EXPLORER_ADVANCED, name, u32::from(v), scope)))
         .collect();
+    if let Some(shown) = s.recently_added {
+        out.push(dword(START_KEY, "ShowRecentList", u32::from(shown), scope));
+    }
     if let Some(folders) = s.folders {
         let mut bytes = Vec::new();
         for f in &folders {
@@ -1300,9 +1323,9 @@ fn resolve_start(s: raw::StartFull, scope: &[HiveScope]) -> Result<Vec<RegistryV
             group_policy: false,
         });
     }
-    if out.is_empty() {
+    if out.is_empty() && !has_pins {
         bail!(
-            "needs at least one of 'recommended-files', 'most-used-apps', 'recommendations', 'account-notifications' or 'folders'"
+            "needs at least one of 'pins-from', 'recommended-files', 'most-used-apps', 'recommendations',              'recently-added', 'account-notifications' or 'folders'"
         );
     }
     Ok(out)
@@ -1818,8 +1841,20 @@ fn scalar_to_u64(v: raw::Scalar) -> Option<u64> {
 
 /// Layers `top` over `base`. Entries that identify the same thing (app id, file destination,
 /// registry value, env var) are replaced by `top`'s version; everything else accumulates.
-pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
+pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
     let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+
+    // An entry exactly like one the base has keeps the base's place: two templates built on
+    // the same one (python and node on dev-core) still install its apps first.
+    fn drop_repeats<T: PartialEq>(base: &[T], top: &mut Vec<T>) {
+        top.retain(|t| !base.contains(t));
+    }
+    drop_repeats(&base.apps, &mut top.apps);
+    drop_repeats(&base.files, &mut top.files);
+    drop_repeats(&base.registry, &mut top.registry);
+    drop_repeats(&base.users, &mut top.users);
+    drop_repeats(&base.features, &mut top.features);
+    drop_repeats(&base.capabilities, &mut top.capabilities);
 
     let mut apps: Vec<App> = base.apps.into_iter().filter(|b| !top.apps.iter().any(|t| eq(t.id(), b.id()))).collect();
     apps.extend(top.apps);
@@ -1851,11 +1886,21 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
         base.registry.into_iter().filter(|b| !top.registry.iter().any(|t| same_value(t, b))).collect();
     registry.extend(top.registry);
 
+    // Commands and checks add up, but one the base already has isn't repeated: a file that
+    // extends two templates built on the same one gets that one's steps once.
     let mut run = base.run;
-    run.extend(top.run);
+    for r in top.run {
+        if !run.contains(&r) {
+            run.push(r);
+        }
+    }
 
     let mut verify = base.verify;
-    verify.extend(top.verify);
+    for c in top.verify {
+        if !verify.contains(&c) {
+            verify.push(c);
+        }
+    }
 
     let mut users: Vec<User> =
         base.users.into_iter().filter(|b| !top.users.iter().any(|t| eq(&t.name, &b.name))).collect();
@@ -1910,6 +1955,7 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
         base.tray_icons.into_iter().filter(|b| !top.tray_icons.iter().any(|t| eq(&t.program, &b.program))).collect();
     tray_icons.extend(top.tray_icons);
     let do_not_disturb = top.do_not_disturb.or(base.do_not_disturb);
+    let start_pins = top.start_pins.or(base.start_pins);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -1933,6 +1979,7 @@ pub fn merge(base: Groundhogfile, top: Groundhogfile) -> Groundhogfile {
         screen_saver,
         tray_icons,
         do_not_disturb,
+        start_pins,
         services,
         firewall,
         run,
@@ -2481,6 +2528,35 @@ firewall:
     }
 
     #[test]
+    fn start_pins_come_from_a_layout_file() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/layouts/start2.bin", "layout bytes")
+            .with(
+                "https://cfg.test/base.yaml",
+                "desktop:\n  start: { pins-from: layouts/start2.bin, recently-added: false }\n  scope: [current-user, default-user]",
+            )
+            .with("https://cfg.test/only.yaml", "desktop: { start: { pins-from: layouts/start2.bin } }")
+            .with("https://cfg.test/top.yaml", "extends: base.yaml\ndesktop: { start: { recommendations: false } }");
+        let dir = tempfile::tempdir().unwrap();
+
+        let g = load_with(&f, "https://cfg.test/base.yaml", dir.path()).unwrap().file;
+        let pins = g.start_pins.as_ref().unwrap();
+        assert_eq!(pins.from.as_str(), "https://cfg.test/layouts/start2.bin");
+        assert_eq!(pins.resolved.as_deref(), Some(crate::fetch::sha256_hex(b"layout bytes").as_str()));
+        assert_eq!(pins.scope, vec![HiveScope::CurrentUser, HiveScope::DefaultUser]);
+        let hide = g.registry.iter().find(|r| r.name.as_deref() == Some("ShowRecentList")).unwrap();
+        assert_eq!((hide.key.as_str(), &hide.data), (START_KEY, &RegistryData::Dword(0)));
+
+        // pins-from alone is enough, and an extending file keeps the base's pins.
+        let only = load_with(&f, "https://cfg.test/only.yaml", dir.path()).unwrap().file;
+        assert_eq!(only.start_pins.unwrap().scope, vec![HiveScope::CurrentUser]);
+        let top = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        assert!(top.start_pins.is_some());
+        let plan = crate::engine::plan(&top);
+        assert!(plan.iter().any(|s| s.title.starts_with("pin Start's apps as start2.bin has them @")), "{plan:#?}");
+    }
+
+    #[test]
     fn taskbar_and_start_become_registry_values_and_a_pin_list() {
         let f = MapFetcher::default().with(
             "https://cfg.test/t.yaml",
@@ -2849,6 +2925,33 @@ apps: [c]",
         let dir = tempfile::tempdir().unwrap();
         let err = load_with(&f, "https://cfg.test/a.yaml", dir.path()).unwrap_err();
         assert!(format!("{err:#}").contains("extends cycle"), "{err:#}");
+    }
+
+    #[test]
+    fn templates_sharing_a_base_run_its_steps_once() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/core.yaml",
+                "apps: [Git.Git]\nrun: [{ command: git config x }]\nverify: [{ file: C:\\git.exe }]",
+            )
+            .with("https://cfg.test/node.yaml", "extends: core.yaml\napps: [Node]\nrun: [{ command: npm i }]")
+            .with("https://cfg.test/py.yaml", "extends: core.yaml\napps: [Python]\nrun: [{ command: pip i }]")
+            .with("https://cfg.test/me.yaml", "extends: [node.yaml, py.yaml]");
+        let dir = tempfile::tempdir().unwrap();
+        let file = load_with(&f, "https://cfg.test/me.yaml", dir.path()).unwrap().file;
+        let commands: Vec<&str> = file
+            .run
+            .iter()
+            .map(|r| match r {
+                RunAction::Command { command, .. } => command.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(commands, ["git config x", "npm i", "pip i"]);
+        assert_eq!(file.verify.len(), 1);
+        // The shared base's apps stay first.
+        let apps: Vec<&str> = file.apps.iter().map(App::id).collect();
+        assert_eq!(apps, ["Git.Git", "Node", "Python"]);
     }
 
     #[test]

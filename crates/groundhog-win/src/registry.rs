@@ -178,10 +178,15 @@ impl Drop for DefaultUserHive {
 }
 
 fn default_user_hive_path() -> Result<PathBuf> {
+    Ok(default_profile_dir()?.join("NTUSER.DAT"))
+}
+
+/// The Default profile, which new accounts are copied from (`C:\Users\Default`).
+pub fn default_profile_dir() -> Result<PathBuf> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let dir = get_string(&hklm, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList", "Default")
         .unwrap_or_else(|| r"%SystemDrive%\Users\Default".to_owned());
-    Ok(PathBuf::from(crate::env::expand(&dir)?).join("NTUSER.DAT"))
+    Ok(PathBuf::from(crate::env::expand(&dir)?))
 }
 
 #[cfg(test)]

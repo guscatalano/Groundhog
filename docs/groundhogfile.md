@@ -145,6 +145,20 @@ machine that can't reach GitHub can use a copy from your own share by path inste
 | `quiet-windows` | No "finish setting up your device", Microsoft account or backup nags, no tips, suggestions or ads in Start, Settings, Explorer and the lock screen, no widgets, no feedback prompts, no "let your organization manage this device" prompts, no silently installed apps, no web results in Start search. For this user and new ones. Not part of `windows-internals`. |
 | `time-sync` | Windows Time runs at boot, corrects even a large error in one go, and is checked against time.windows.com. Not part of `windows-internals`. Needs outbound NTP (UDP 123). |
 
+**Developer templates.** Each builds on `dev-core`; combine any of them
+(`extends: [groundhog:python, groundhog:node]`) and `dev-core` is set up once.
+
+| Name | What it sets up |
+| --- | --- |
+| `dev-core` | Git, GitHub CLI, VS Code, PowerShell 7, Windows Terminal, 7-Zip, and jq, ripgrep, fd, fzf, bat and delta for every account. Git defaults for this user: `main` for new repositories, delta for diffs. |
+| `dotnet` | .NET SDK 10 (LTS) and 8, telemetry and the first-run banner off, global tools on PATH. |
+| `vs` | `dotnet`, plus Visual Studio 2026 Community with the .NET desktop, ASP.NET and web, and C++ desktop workloads (about 20 GB and half an hour). |
+| `node` | Node.js LTS and pnpm. |
+| `python` | Python 3.13 for every account, first on the machine PATH, and uv; UTF-8 mode on. |
+| `rust` | The Visual Studio C++ build tools, then rustup with the stable toolchain, clippy and rustfmt, for this user. |
+| `containers` | WSL 2 and Docker Desktop (this user in `docker-users`), with kubectl, Helm, k9s and kind. Needs a restart (apply with `--reboot`) and, in a VM, nested virtualization. Docker Desktop needs a subscription in larger organizations. |
+| `ai` | Claude Code, OpenAI Codex and the GitHub Copilot CLI for every account, kept up to date, and Ollama for this user. |
+
 ## Conditions and variables
 
 ```yaml
@@ -616,6 +630,8 @@ desktop:
     pins-for: everyone              # everyone (default) | new-accounts
     clock-seconds: true
   start:
+    pins-from: start2.bin           # the pinned apps, taken from a machine pinned by hand
+    recently-added: false           # "Recently added" apps under Recommended
     recommendations: false          # tips, shortcuts and new apps
     recommended-files: false        # recent files in Start and Explorer, jump lists
     most-used-apps: false
@@ -681,9 +697,22 @@ per program only once it has shown an icon, so one that hasn't yet (installed in
 apply, say) is set by a later apply: these steps run every time, and cost nothing when
 there's nothing to do. They're for the agent's own account only.
 
-**Start's pinned apps can't be set.** Windows 11 takes them only from MDM (Intune and the
-like): it ignores the same pin list written as a policy or into the Default profile, and
-refuses programs that try to pin or unpin. Groundhog sets what Start shows besides the pins.
+**Start's pinned apps** come from a layout file. Windows 11 takes a pin *list* only from MDM
+(Intune and the like): it ignores one written as a policy or into the Default profile, and
+refuses programs that try to pin or unpin. What it does keep is each user's layout file,
+`start2.bin`, in a format of its own but not tied to a machine or user. So pin and unpin by
+hand on one machine, copy that file next to your Groundhogfile, and `pins-from` gives every
+machine the same Start:
+
+```powershell
+# On the machine you pinned by hand, a few seconds after the last change (Start saves it then)
+Copy-Item "$env:LOCALAPPDATA\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState\start2.bin" .
+```
+
+For the agent's own account the pins change at once (Groundhog restarts Start's process to
+load them). `default-user` in `scope` puts the file in the Default profile for accounts
+created later. Install the pinned apps in the same file: `desktop` comes after `apps` and
+`files`.
 
 A later file overrides an earlier one setting by setting: a file that extends a base with
 `theme: light` can say `theme: { windows: dark }` and keep the base's light apps.

@@ -1,0 +1,33 @@
+# Containers and Kubernetes: WSL 2 and Docker Desktop, with kubectl, Helm, k9s and kind. On
+# top of dev-core. Turning on WSL needs a restart, so apply it with --reboot:
+#
+#   groundhog-agent apply groundhog:containers --reboot
+#
+# In a VM, Docker Desktop needs nested virtualization. Docker Desktop is free for personal
+# use, education and small businesses; larger organizations need a subscription.
+
+extends: dev-core.groundhog.yaml
+
+features:
+  - Microsoft-Windows-Subsystem-Linux
+  - VirtualMachinePlatform
+
+apps:
+  - Microsoft.WSL
+  - Docker.DockerDesktop
+  - { id: Kubernetes.kubectl, args: --scope machine }
+  - { id: Helm.Helm, args: --scope machine }
+  - { id: Derailed.k9s, args: --scope machine }
+  - { id: Kubernetes.kind, args: --scope machine }
+
+run:
+  - command: |
+      # this user in docker-users, which Docker Desktop requires
+      $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+      if (-not (Get-LocalGroupMember docker-users -ErrorAction SilentlyContinue | Where-Object Name -eq $me)) {
+        Add-LocalGroupMember -Group docker-users -Member $me
+      }
+
+verify:
+  - file: '%ProgramFiles%\Docker\Docker\Docker Desktop.exe'
+  - command: kubectl version --client; helm version

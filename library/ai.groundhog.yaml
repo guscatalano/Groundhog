@@ -1,0 +1,16 @@
+# AI coding tools: Claude Code, OpenAI Codex and the GitHub Copilot CLI for every account,
+# kept up to date, and Ollama for running models locally (for this user). On top of dev-core.
+# Each CLI signs in on first use.
+#
+#   groundhog-agent apply groundhog:ai
+
+extends: dev-core.groundhog.yaml
+
+apps:
+  - { id: Anthropic.ClaudeCode, args: --scope machine, upgrade: true }
+  - { id: OpenAI.Codex, args: --scope machine, upgrade: true }
+  - { id: GitHub.Copilot, args: --scope machine, upgrade: true }
+  - Ollama.Ollama
+
+verify:
+  - command: claude --version; codex --version

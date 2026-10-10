@@ -1,0 +1,24 @@
+# Visual Studio 2026 Community with the .NET desktop, ASP.NET and web, and C++ desktop
+# workloads, on top of the dotnet template. A big install: about 20 GB and half an hour or
+# more. For Professional or Enterprise, give that id in your own file with the same args.
+#
+#   groundhog-agent apply groundhog:vs
+
+extends: dotnet.groundhog.yaml
+
+apps:
+  - id: Microsoft.VisualStudio.Community
+    # --custom adds to the package's own quiet-install switches (--override would replace them)
+    args: >-
+      --custom "--add Microsoft.VisualStudio.Workload.ManagedDesktop
+      --add Microsoft.VisualStudio.Workload.NetWeb
+      --add Microsoft.VisualStudio.Workload.NativeDesktop
+      --includeRecommended"
+    timeout: 90m
+
+verify:
+  - command: |
+      $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+      $vs = & $vswhere -latest -requires Microsoft.VisualStudio.Workload.ManagedDesktop -property installationPath
+      if (-not $vs) { Write-Error 'Visual Studio with the .NET desktop workload not found'; exit 1 }
+      $vs

@@ -1,0 +1,22 @@
+# .NET development: the .NET 10 SDK (LTS) and 8 SDK, telemetry and the first-run banner off,
+# and global tools (`dotnet tool install -g`) on PATH. On top of dev-core.
+#
+#   groundhog-agent apply groundhog:dotnet
+#
+# Visual Studio as well: groundhog:vs
+
+extends: dev-core.groundhog.yaml
+
+apps:
+  - Microsoft.DotNet.SDK.10
+  - Microsoft.DotNet.SDK.8
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+path:
+  - '%USERPROFILE%\.dotnet\tools'
+
+verify:
+  - command: '& "$env:ProgramFiles\dotnet\dotnet.exe" --list-sdks'

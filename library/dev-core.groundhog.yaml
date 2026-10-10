@@ -1,0 +1,44 @@
+# The everyday developer tools: Git, the GitHub CLI, VS Code, PowerShell 7, Windows Terminal,
+# 7-Zip, and the command-line set (jq, ripgrep, fd, fzf, bat, delta), with Git's defaults
+# set for this user. The dotnet, node, python, rust, containers and ai templates build on it.
+#
+#   groundhog-agent apply groundhog:dev-core
+#
+# Or combine:  extends: [groundhog:python, groundhog:node]  (dev-core comes once)
+
+apps:
+  - id: Git.Git
+    args: --scope machine
+  - GitHub.cli
+  - id: Microsoft.VisualStudioCode
+    args: --scope machine
+  - Microsoft.PowerShell
+  - Microsoft.WindowsTerminal
+  - 7zip.7zip
+  # Command-line tools, for every account (winget links them in Program Files\WinGet\Links)
+  - { id: jqlang.jq, args: --scope machine }
+  - { id: BurntSushi.ripgrep.MSVC, args: --scope machine }
+  - { id: sharkdp.fd, args: --scope machine }
+  - { id: junegunn.fzf, args: --scope machine }
+  - { id: sharkdp.bat, args: --scope machine }
+  - { id: dandavison.delta, args: --scope machine }
+
+path:
+  - dir: '%ProgramFiles%\WinGet\Links'
+    scope: machine
+
+run:
+  - command: |
+      # Git's defaults: main for new repositories, delta for diffs
+      # git.exe by full path: Git was installed by this run, after the agent started.
+      $git = Join-Path $env:ProgramFiles 'Git\cmd\git.exe'
+      & $git config --global init.defaultBranch main
+      & $git config --global core.pager delta
+      & $git config --global interactive.diffFilter 'delta --color-only'
+      & $git config --global delta.navigate true
+      & $git config --global merge.conflictStyle zdiff3
+
+verify:
+  - file: '%ProgramFiles%\Git\cmd\git.exe'
+  - file: '%ProgramFiles%\Microsoft VS Code\Code.exe'
+  - command: rg --version; delta --version; jq --version
