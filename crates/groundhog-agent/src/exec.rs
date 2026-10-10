@@ -10,9 +10,9 @@ use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{Action, Executor, Outcome, Probe, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
-    App, Capability, Certificate, EnvScope, Feature, FileCopy, HiveScope, LockScreen, Password, RegistryData,
-    RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, StartPins, Theme, ThemeMode, User, Wallpaper,
-    WallpaperStyle,
+    App, Capability, Certificate, EnvScope, Feature, FileCopy, HiveScope, LanguageSetting, LockScreen, Password,
+    RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, StartPins, Theme, ThemeMode, User,
+    Wallpaper, WallpaperStyle,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
@@ -140,6 +140,27 @@ impl Executor for WinExecutor<'_> {
                 Ok(Outcome::Done { changed })
             }
             Action::StartPins(p) => self.start_pins(p, false).map(|changed| Outcome::Done { changed }),
+            Action::Language(l) => {
+                if !language_differs(l)? {
+                    return Ok(Outcome::Done { changed: false });
+                }
+                let (_, apply) = language_scripts(l);
+                let out =
+                    powershell(Shell::Powershell, &format!("$ErrorActionPreference = 'Stop'\n{apply}")).run(log)?;
+                if out.code != 0 {
+                    bail!("PowerShell exited with {}", out.code);
+                }
+                Ok(match l {
+                    LanguageSetting::SystemLocale { .. }
+                    | LanguageSetting::Utf8 { .. }
+                    | LanguageSetting::Display { machine: true, .. } => self.restart_later_if(true),
+                    LanguageSetting::Display { .. } => {
+                        log("Windows shows it from the next sign-in");
+                        Outcome::Done { changed: true }
+                    }
+                    _ => Outcome::Done { changed: true },
+                })
+            }
             Action::TrayIcon(t) => {
                 let changed = match desktop::set_tray_icon(&t.program, t.shown, false)? {
                     desktop::TrayIcon::NotSeenYet => {
@@ -214,6 +235,7 @@ impl Executor for WinExecutor<'_> {
             Action::ScreenSaver(s) => would(screen_saver(s, true)?),
             Action::DoNotDisturb { on } => would(desktop::set_do_not_disturb(*on, true)?),
             Action::StartPins(p) => would(self.start_pins(p, true)?),
+            Action::Language(l) => would(language_differs(l)?),
             Action::TrayIcon(t) => match desktop::set_tray_icon(&t.program, t.shown, true)? {
                 desktop::TrayIcon::NotSeenYet => Probe::Unknown,
                 desktop::TrayIcon::AsWanted => Probe::Satisfied,
@@ -1170,6 +1192,96 @@ fn set_registry(r: &RegistryValue) -> Result<Outcome> {
     Ok(Outcome::Done { changed })
 }
 
+/// Whether a language setting differs from what Windows has now.
+fn language_differs(l: &LanguageSetting) -> Result<bool> {
+    let (check, _) = language_scripts(l);
+    let out = Proc { capture_stdout: true, ..powershell(Shell::Powershell, &check) }.run(&mut |_| {})?;
+    if out.code != 0 {
+        bail!("checking the language settings: PowerShell exited with {}", out.code);
+    }
+    Ok(out.stdout.trim() != "same")
+}
+
+/// PowerShell for a language setting (the International and LanguagePackManagement modules,
+/// as Settings uses them): a check that prints `same` when Windows already has it, and the
+/// change. Tags and keyboards were checked to be plain letters, digits and dashes when the
+/// file was loaded, so they're safe in quotes here.
+fn language_scripts(l: &LanguageSetting) -> (String, String) {
+    match l {
+        LanguageSetting::Input { languages } => {
+            // Built with New-WinUserLanguageList, so tags and default keyboards come out as
+            // Windows writes them ('ja-JP' is kept as 'ja') and compare equal.
+            let mut build = format!("$list = New-WinUserLanguageList '{}'\n", languages[0].tag);
+            for l in &languages[1..] {
+                build.push_str(&format!("$list.Add('{}')\n", l.tag));
+            }
+            for (i, l) in languages.iter().enumerate().filter(|(_, l)| !l.keyboards.is_empty()) {
+                build.push_str(&format!("$list[{i}].InputMethodTips.Clear()\n"));
+                for k in &l.keyboards {
+                    build.push_str(&format!("$list[{i}].InputMethodTips.Add('{k}')\n"));
+                }
+            }
+            let show = "$show = { param($l) ($l | ForEach-Object { $_.LanguageTag + '=' + ($_.InputMethodTips -join ',') }) -join ';' }";
+            (
+                format!("{build}{show}\nif ((& $show $list) -eq (& $show (Get-WinUserLanguageList))) {{ 'same' }}"),
+                format!("{build}Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue"),
+            )
+        }
+        LanguageSetting::Display { tag, machine } => {
+            let installed = format!("[bool](Get-InstalledLanguage -Language '{tag}' | Where-Object {{ \"$($_.LanguagePacks)\" -match 'LpCab' }})");
+            let system = if *machine { format!(" -and (Get-SystemPreferredUILanguage) -eq '{tag}'") } else { String::new() };
+            (
+                format!(
+                    "$o = Get-WinUILanguageOverride\n\
+                     $shown = if ($o) {{ $o.Name }} else {{ Get-SystemPreferredUILanguage }}\n\
+                     if ({installed} -and $shown -eq '{tag}'{system}) {{ 'same' }}"
+                ),
+                format!(
+                    "if (-not {installed}) {{ Install-Language '{tag}' | Out-Null }}\n\
+                     Set-WinUILanguageOverride -Language '{tag}'{}",
+                    if *machine { format!("\nSet-SystemPreferredUILanguage '{tag}'") } else { String::new() }
+                ),
+            )
+        }
+        LanguageSetting::Formats { tag } => {
+            (format!("if ((Get-Culture).Name -eq '{tag}') {{ 'same' }}"), format!("Set-Culture '{tag}'"))
+        }
+        LanguageSetting::Location { region } => {
+            let geo = format!("([Globalization.RegionInfo]::new('{region}').GeoId)");
+            (format!("if ((Get-WinHomeLocation).GeoId -eq {geo}) {{ 'same' }}"), format!("Set-WinHomeLocation -GeoId {geo}"))
+        }
+        LanguageSetting::SystemLocale { tag } => {
+            (format!("if ((Get-WinSystemLocale).Name -eq '{tag}') {{ 'same' }}"), format!("Set-WinSystemLocale '{tag}'"))
+        }
+        LanguageSetting::Utf8 { on } => {
+            let want = if *on {
+                "$want = @{ ACP = '65001'; OEMCP = '65001'; MACCP = '65001' }".to_owned()
+            } else {
+                // The system locale's own code pages.
+                "$t = (Get-WinSystemLocale).TextInfo\n\
+                 $want = @{ ACP = \"$($t.ANSICodePage)\"; OEMCP = \"$($t.OEMCodePage)\"; MACCP = \"$($t.MacCodePage)\" }"
+                    .to_owned()
+            };
+            let key = r"HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage";
+            (
+                format!(
+                    "{want}\n$have = Get-ItemProperty '{key}'\n\
+                     if (-not ($want.Keys | Where-Object {{ $have.$_ -ne $want[$_] }})) {{ 'same' }}"
+                ),
+                format!("{want}\nforeach ($k in $want.Keys) {{ Set-ItemProperty '{key}' -Name $k -Value $want[$k] }}"),
+            )
+        }
+        LanguageSetting::CopyToSystem => (
+            "$d = Get-ItemProperty 'Registry::HKEY_USERS\\.DEFAULT\\Control Panel\\International' -ErrorAction SilentlyContinue\n\
+             $dp = Get-ItemProperty 'Registry::HKEY_USERS\\.DEFAULT\\Keyboard Layout\\Preload' -ErrorAction SilentlyContinue\n\
+             $up = Get-ItemProperty 'HKCU:\\Keyboard Layout\\Preload' -ErrorAction SilentlyContinue\n\
+             if ($d.LocaleName -eq (Get-Culture).Name -and $dp.'1' -eq $up.'1') { 'same' }"
+                .to_owned(),
+            "Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true".to_owned(),
+        ),
+    }
+}
+
 fn ps_exe(shell: Shell) -> &'static str {
     if shell == Shell::Pwsh { "pwsh.exe" } else { "powershell.exe" }
 }
@@ -1346,7 +1458,46 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use groundhog_core::model::InputLanguage;
+
     use super::*;
+
+    #[test]
+    fn language_checks_see_this_machines_own_settings_as_the_same() {
+        // Read-only: each check, asked for what this machine already has, finds nothing to do.
+        let ps = |s: &str| {
+            let out = Proc { capture_stdout: true, ..powershell(Shell::Powershell, s) }.run(&mut |_| {}).unwrap();
+            out.stdout.trim().to_owned()
+        };
+        let culture = ps("(Get-Culture).Name");
+        let locale = ps("(Get-WinSystemLocale).Name");
+        let region =
+            ps("$g = (Get-WinHomeLocation).GeoId; [Globalization.CultureInfo]::GetCultures('SpecificCultures') | \
+             ForEach-Object { [Globalization.RegionInfo]::new($_.Name) } | Where-Object GeoId -eq $g | \
+             Select-Object -First 1 -ExpandProperty TwoLetterISORegionName");
+        let first = ps("(Get-WinUserLanguageList)[0].LanguageTag");
+        let utf8 = ps("(Get-ItemProperty HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage).ACP") == "65001";
+        for l in [
+            LanguageSetting::Formats { tag: culture.clone() },
+            LanguageSetting::SystemLocale { tag: locale },
+            LanguageSetting::Location { region },
+            LanguageSetting::Utf8 { on: utf8 },
+        ] {
+            assert!(!language_differs(&l).unwrap(), "{l:?}");
+        }
+        assert!(
+            language_differs(&LanguageSetting::Formats {
+                tag: if culture == "fr-FR" { "de-DE" } else { "fr-FR" }.into()
+            })
+            .unwrap()
+        );
+        // A one-language list differs unless this machine types in exactly that one language.
+        let only = LanguageSetting::Input { languages: vec![InputLanguage { tag: first, keyboards: Vec::new() }] };
+        let count = ps("(Get-WinUserLanguageList).Count");
+        if count == "1" {
+            assert!(!language_differs(&only).unwrap());
+        }
+    }
 
     #[test]
     fn reads_the_installed_version_from_winget_list() {

@@ -16,9 +16,10 @@ use crate::github;
 use crate::library;
 use crate::model::{
     App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, EnvScope, EnvVar,
-    ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, LockScreen, Password,
-    PathEntry, Presence, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState,
-    Shell, SourceRef, StartPins, Theme, ThemeMode, TrayIcon, User, Wallpaper, WallpaperStyle, raw,
+    ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, InputLanguage,
+    LanguageSetting, LockScreen, Password, PathEntry, Presence, RegistryData, RegistryType, RegistryValue, RunAction,
+    ScreenSaver, Service, ServiceState, Shell, SourceRef, StartPins, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    WallpaperStyle, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
@@ -496,6 +497,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         remove_apps,
         desktop,
         uac,
+        language,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -539,6 +541,10 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     if let Some(uac) = uac {
         registry.extend(resolve_uac(uac).context("uac")?);
     }
+    let language = match language {
+        Some(l) => resolve_language(l, &mut registry).context("language")?,
+        None => Vec::new(),
+    };
 
     let run = run
         .into_iter()
@@ -631,6 +637,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         tray_icons,
         do_not_disturb,
         start_pins,
+        language,
         services,
         firewall,
         run,
@@ -1790,6 +1797,95 @@ const UAC_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\
 
 /// `uac:` as the policy values it stands for. A `level` picks the Control Panel slider's
 /// values; `admin-prompt` and `secure-desktop` given alongside it win over the level's.
+/// `language:` as one step per setting; the switch hotkey is plain registry values.
+fn resolve_language(l: raw::Language, registry: &mut Vec<RegistryValue>) -> Result<Vec<LanguageSetting>> {
+    let mut out = Vec::new();
+    if let Some(input) = l.input {
+        if input.is_empty() {
+            bail!("'input' needs at least one language");
+        }
+        let languages = input
+            .into_iter()
+            .map(|i| {
+                let (tag, keyboards) = match i {
+                    raw::StringOr::Short(tag) => (tag, Vec::new()),
+                    raw::StringOr::Full(f) => (f.language, f.keyboards),
+                };
+                for k in &keyboards {
+                    let ok = k.contains(':') && k.chars().all(|c| c.is_ascii_hexdigit() || "{}:-".contains(c));
+                    if !ok {
+                        bail!("keyboard '{k}' should look like 0409:00000409 (as Get-WinUserLanguageList shows them)");
+                    }
+                }
+                Ok(InputLanguage { tag: language_tag(&tag)?, keyboards })
+            })
+            .collect::<Result<_>>()?;
+        out.push(LanguageSetting::Input { languages });
+    }
+    if let Some(keys) = l.switch_hotkey {
+        // Settings > Time & language > Typing > Advanced keyboard settings > Input language hot keys.
+        let value = match keys {
+            raw::SwitchHotkey::AltShift => "1",
+            raw::SwitchHotkey::CtrlShift => "2",
+            raw::SwitchHotkey::None => "3",
+            raw::SwitchHotkey::Grave => "4",
+        };
+        let mut names = vec!["Hotkey", "Language Hotkey"];
+        if keys == raw::SwitchHotkey::None {
+            names.push("Layout Hotkey");
+        }
+        for name in names {
+            registry.push(RegistryValue {
+                key: r"HKCU\Keyboard Layout\Toggle".to_owned(),
+                name: Some(name.to_owned()),
+                kind: RegistryType::String,
+                data: RegistryData::String(value.to_owned()),
+                scope: vec![HiveScope::CurrentUser],
+                state: Presence::Present,
+                group_policy: false,
+            });
+        }
+    }
+    let welcome = l.welcome_screen.unwrap_or(false);
+    if let Some(tag) = l.display {
+        out.push(LanguageSetting::Display { tag: language_tag(&tag)?, machine: welcome });
+    }
+    if let Some(tag) = l.formats {
+        out.push(LanguageSetting::Formats { tag: language_tag(&tag)? });
+    }
+    if let Some(region) = l.location {
+        if region.len() != 2 || !region.bytes().all(|b| b.is_ascii_alphabetic()) {
+            bail!("location '{region}' should be a two-letter country or region code, like US or GB");
+        }
+        out.push(LanguageSetting::Location { region: region.to_ascii_uppercase() });
+    }
+    if let Some(tag) = l.system_locale {
+        out.push(LanguageSetting::SystemLocale { tag: language_tag(&tag)? });
+    }
+    if let Some(on) = l.utf8 {
+        out.push(LanguageSetting::Utf8 { on });
+    }
+    if welcome {
+        out.push(LanguageSetting::CopyToSystem);
+    }
+    if out.is_empty() && l.switch_hotkey.is_none() {
+        bail!("needs at least one setting");
+    }
+    Ok(out)
+}
+
+/// A language tag as Windows takes them (`en-US`, `ja-JP`, `zh-Hans-CN`, `sr-Latn-RS`).
+fn language_tag(tag: &str) -> Result<String> {
+    let parts: Vec<&str> = tag.split('-').collect();
+    let ok = (2..=3).contains(&parts[0].len())
+        && parts[0].bytes().all(|b| b.is_ascii_alphabetic())
+        && parts[1..].iter().all(|p| (2..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()));
+    if !ok {
+        bail!("'{tag}' isn't a language tag like en-US or ja-JP");
+    }
+    Ok(tag.to_owned())
+}
+
 fn resolve_uac(u: raw::Uac) -> Result<Vec<RegistryValue>> {
     let (mut admin, mut secure) = match u.level {
         None => (None, None),
@@ -1956,6 +2052,11 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
     tray_icons.extend(top.tray_icons);
     let do_not_disturb = top.do_not_disturb.or(base.do_not_disturb);
     let start_pins = top.start_pins.or(base.start_pins);
+    // Setting by setting: the top file's display language replaces the base's, and so on.
+    let mut language: Vec<LanguageSetting> =
+        base.language.into_iter().filter(|b| !top.language.iter().any(|t| t.order() == b.order())).collect();
+    language.extend(top.language);
+    language.sort_by_key(LanguageSetting::order);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -1980,6 +2081,7 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         tray_icons,
         do_not_disturb,
         start_pins,
+        language,
         services,
         firewall,
         run,
@@ -2525,6 +2627,37 @@ firewall:
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
             assert!(err.contains(why), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn language_settings_parse_merge_and_order() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/base.yaml",
+                "language:\n  input: [en-US, { language: ja-JP, keyboards: ['0411:{03B5835F-F03C-411B-9CE2-AA23E1171E36}{A76C93D9-5523-4E90-AAFA-4DB112F9AC76}'] }]\n  switch-hotkey: none\n  formats: en-GB\n  utf-8: true\n  welcome-screen: true\n  display: de-DE",
+            )
+            .with("https://cfg.test/top.yaml", "extends: base.yaml\nlanguage: { formats: fr-FR, location: fr }")
+            .with("https://cfg.test/bad.yaml", "language: { display: \"en-US'; rm\" }");
+        let dir = tempfile::tempdir().unwrap();
+
+        let g = load_with(&f, "https://cfg.test/base.yaml", dir.path()).unwrap().file;
+        let LanguageSetting::Input { languages } = &g.language[0] else { panic!("{:?}", g.language) };
+        assert_eq!((languages[0].tag.as_str(), languages[1].keyboards.len()), ("en-US", 1));
+        assert_eq!(g.language[1], LanguageSetting::Display { tag: "de-DE".into(), machine: true });
+        assert_eq!(g.language.last(), Some(&LanguageSetting::CopyToSystem));
+        let toggles: Vec<&str> =
+            g.registry.iter().filter(|r| r.key.ends_with(r"\Toggle")).filter_map(|r| r.name.as_deref()).collect();
+        assert_eq!(toggles, ["Hotkey", "Language Hotkey", "Layout Hotkey"]);
+
+        // The top file replaces formats, adds a location, and the order holds.
+        let top = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let orders: Vec<u8> = top.language.iter().map(LanguageSetting::order).collect();
+        assert_eq!(orders, [0, 1, 2, 3, 5, 6]);
+        assert!(top.language.contains(&LanguageSetting::Formats { tag: "fr-FR".into() }));
+        assert!(top.language.contains(&LanguageSetting::Location { region: "FR".into() }));
+
+        let err = load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("isn't a language tag"), "{err:#}");
     }
 
     #[test]

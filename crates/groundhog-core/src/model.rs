@@ -37,6 +37,7 @@ pub struct Groundhogfile {
     /// Do Not Disturb for the agent's user; Windows applies it at the next sign-in.
     pub do_not_disturb: Option<bool>,
     pub start_pins: Option<StartPins>,
+    pub language: Vec<LanguageSetting>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -270,6 +271,52 @@ pub struct TrayIcon {
     pub program: String,
     /// On the taskbar (`true`) or in the overflow.
     pub shown: bool,
+}
+
+/// One of the `language:` settings; each is its own step.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "setting", rename_all = "kebab-case")]
+pub enum LanguageSetting {
+    /// The languages to type in, in order, each with its keyboards (none: Windows' default).
+    Input { languages: Vec<InputLanguage> },
+    /// Windows' display language for the agent's user, its language pack installed first;
+    /// `machine` also makes it the sign-in screen's and new accounts' (after a restart).
+    Display { tag: String, machine: bool },
+    /// Formats for dates, times, numbers and currency.
+    Formats { tag: String },
+    /// Home location, as a two-letter country or region code.
+    Location { region: String },
+    /// The language for programs that don't use Unicode (after a restart).
+    SystemLocale { tag: String },
+    /// UTF-8 as the code page for programs that don't use Unicode (after a restart).
+    Utf8 { on: bool },
+    /// Copies the agent user's settings to the sign-in screen and to new accounts.
+    CopyToSystem,
+}
+
+impl LanguageSetting {
+    /// The order they're applied in: input before display (setting the list can change the
+    /// display language), the system locale before UTF-8 (it resets the code pages), and the
+    /// copy to the sign-in screen last.
+    pub fn order(&self) -> u8 {
+        match self {
+            LanguageSetting::Input { .. } => 0,
+            LanguageSetting::Display { .. } => 1,
+            LanguageSetting::Formats { .. } => 2,
+            LanguageSetting::Location { .. } => 3,
+            LanguageSetting::SystemLocale { .. } => 4,
+            LanguageSetting::Utf8 { .. } => 5,
+            LanguageSetting::CopyToSystem => 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InputLanguage {
+    /// A language tag: `en-US`, `ja-JP`.
+    pub tag: String,
+    /// Input method tips (`0409:00000409`); empty: the language's default keyboard or IME.
+    pub keyboards: Vec<String>,
 }
 
 /// Start's pinned apps, as a layout file (`start2.bin`) taken from a machine pinned by hand.
@@ -751,6 +798,38 @@ pub(crate) mod raw {
         pub remove_apps: Vec<String>,
         pub desktop: Option<Desktop>,
         pub uac: Option<Uac>,
+        pub language: Option<Language>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct Language {
+        pub input: Option<Vec<StringOr<InputFull>>>,
+        pub switch_hotkey: Option<SwitchHotkey>,
+        pub display: Option<String>,
+        pub formats: Option<String>,
+        pub location: Option<String>,
+        pub system_locale: Option<String>,
+        #[serde(rename = "utf-8")]
+        pub utf8: Option<bool>,
+        pub welcome_screen: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct InputFull {
+        pub language: String,
+        pub keyboards: Vec<String>,
+    }
+
+    /// The keys that switch between input languages (Win+Space always does).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum SwitchHotkey {
+        AltShift,
+        CtrlShift,
+        Grave,
+        None,
     }
 
     /// User Account Control policy. Becomes values under

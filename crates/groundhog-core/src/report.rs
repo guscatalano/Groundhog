@@ -345,6 +345,7 @@ fn label(section: &str) -> &'static str {
         "files" => "Files",
         "environment" => "Environment",
         "registry" => "Settings",
+        "language" => "Language",
         "desktop" => "Desktop",
         "services" => "Services",
         "firewall" => "Firewall",

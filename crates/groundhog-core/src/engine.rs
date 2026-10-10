@@ -16,8 +16,8 @@ use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
     App, Capability, CertScope, Certificate, Check, DefenderExclusion, EnvScope, Feature, FileCopy, FirewallRule,
-    Groundhogfile, LockScreen, Presence, RegistryData, RegistryValue, RunAction, ScreenSaver, Service, ServiceState,
-    StartPins, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    Groundhogfile, LanguageSetting, LockScreen, Presence, RegistryData, RegistryValue, RunAction, ScreenSaver, Service,
+    ServiceState, StartPins, Theme, ThemeMode, TrayIcon, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -71,6 +71,7 @@ pub enum Action {
     },
     /// Start's pinned apps, from a layout file.
     StartPins(StartPins),
+    Language(LanguageSetting),
 }
 
 impl Action {
@@ -192,6 +193,28 @@ fn title(action: &Action) -> String {
             format!("turn Do Not Disturb {} (from the next sign-in)", if *on { "on" } else { "off" })
         }
         Action::StartPins(p) => format!("pin Start's apps as {} has them", file_name(&p.from)),
+        Action::Language(l) => match l {
+            LanguageSetting::Input { languages } => {
+                let tags: Vec<&str> = languages.iter().map(|l| l.tag.as_str()).collect();
+                format!("type in {}", tags.join(", "))
+            }
+            LanguageSetting::Display { tag, machine: false } => {
+                format!("show Windows in {tag} (from the next sign-in)")
+            }
+            LanguageSetting::Display { tag, machine: true } => {
+                format!("show Windows in {tag}, also at sign-in and for new accounts (after a restart)")
+            }
+            LanguageSetting::Formats { tag } => format!("use {tag} formats for dates, times and numbers"),
+            LanguageSetting::Location { region } => format!("set the home location to {region}"),
+            LanguageSetting::SystemLocale { tag } => {
+                format!("use {tag} for programs that don't use Unicode (after a restart)")
+            }
+            LanguageSetting::Utf8 { on } => format!(
+                "turn UTF-8 for programs that don't use Unicode {} (after a restart)",
+                if *on { "on" } else { "off" }
+            ),
+            LanguageSetting::CopyToSystem => "copy these to the sign-in screen and new accounts".to_owned(),
+        },
         Action::TrayIcon(t) if t.shown => format!("show {}'s icon on the taskbar", t.program),
         Action::TrayIcon(t) => format!("move {}'s icon to the overflow", t.program),
         Action::ScreenSaver(s) if !s.enabled => "turn the screen saver off".to_owned(),
@@ -326,6 +349,7 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     }));
     actions.extend(file.path.iter().map(|p| Action::Path { dir: p.dir.clone(), scope: p.scope, state: p.state }));
     actions.extend(file.registry.iter().cloned().map(Action::Registry));
+    actions.extend(file.language.iter().cloned().map(Action::Language));
     actions.extend(file.wallpaper.iter().cloned().map(Action::Wallpaper));
     actions.extend(file.theme.iter().cloned().map(Action::Theme));
     actions.extend(file.lock_screen.iter().cloned().map(Action::LockScreen));
@@ -417,6 +441,7 @@ fn section(action: &Action) -> &'static str {
         Action::File(_) => "files",
         Action::Env { .. } | Action::Path { .. } => "environment",
         Action::Registry(_) => "registry",
+        Action::Language(_) => "language",
         Action::Run(_) => "run",
         Action::Verify(_) => "verify",
     }

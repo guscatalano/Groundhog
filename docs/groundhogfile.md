@@ -751,6 +751,41 @@ it does more than silence prompts: every administrator then runs everything with
 and Store apps and Edge stop working. `never-notify` is almost always what's wanted instead,
 and on a disposable test VM it is what lets automation click through elevation.
 
+## `language`
+
+Languages, keyboards and IMEs, formats and locale, as Settings > Time & language sets them.
+
+```yaml
+language:
+  input: [en-US, ja-JP]          # the languages you type in, in order, each with its
+                                 # default keyboard or IME (Japanese brings Microsoft IME)
+  # input:                       # or choose a language's keyboards
+  #   - { language: de-DE, keyboards: ['0407:00000407', '0409:00000409'] }
+  switch-hotkey: none            # alt-shift | ctrl-shift | grave | none (Win+Space always works)
+  display: de-DE                 # Windows' language: its language pack is downloaded first
+  formats: en-GB                 # dates, times, numbers and currency
+  location: GB                   # home location (two-letter country or region code)
+  system-locale: ja-JP           # for programs that don't use Unicode (after a restart)
+  utf-8: true                    # UTF-8 for those programs, Windows' "beta" option (after a restart)
+  welcome-screen: true           # copy all this to the sign-in screen and new accounts
+```
+
+`input`, `switch-hotkey`, `display`, `formats` and `location` are the agent's own account's,
+like Settings'. `input` replaces the whole list, so a language left out is removed. Keyboards
+are written as `Get-WinUserLanguageList` shows them (`InputMethodTips`); leave them out for the
+language's default.
+
+When each applies: `input`, `switch-hotkey`, `formats` and `location` at once (programs
+already running may keep the old formats); `display` from the next sign-in, after downloading
+its language pack (a few minutes, from Windows Update); `system-locale`, `utf-8`, and
+`display` with `welcome-screen`, after a restart: the run pauses for it like a Windows
+feature does (`--reboot` restarts and continues by itself).
+
+`utf-8: true` makes UTF-8 the code page for programs that don't use Unicode. It fixes text in
+many command-line tools, and breaks some old programs that assume a national code page;
+`false` puts back the system locale's own code pages. A later file overrides an earlier one
+setting by setting.
+
 ## `services`
 
 ```yaml

@@ -4,6 +4,20 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.20.0] - 2026-10-10
+
+### Added
+- **`language:`**, the settings in Settings > Time & language:
+  - `input`: the languages you type in, with their keyboards and IMEs;
+  - `switch-hotkey`: the keys that switch between them;
+  - `display`: Windows' language, with its language pack downloaded;
+  - `formats` and `location`;
+  - `system-locale` and `utf-8` for programs that don't use Unicode;
+  - `welcome-screen`: copies it all to the sign-in screen and new accounts.
+  ```yaml
+  language: { input: [en-US, ja-JP], display: de-DE, formats: en-GB, welcome-screen: true }
+  ```
+
 ## [0.19.1] - 2026-10-10
 
 ### Fixed
