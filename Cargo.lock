@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "groundhog"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "groundhog-agent"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "groundhog-core"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "groundhog-win"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "humantime",

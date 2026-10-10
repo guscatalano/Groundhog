@@ -148,6 +148,17 @@ impl HumanReporter {
         if self.color { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_owned() }
     }
 
+    /// The mark in front of a section: a symbol on a console, ASCII anywhere else (Windows
+    /// PowerShell reads a pipe in the old code page, which garbles anything else).
+    fn mark(&self, m: Mark) -> String {
+        let (color, symbol, ascii) = match m {
+            Mark::Done => ("32", "\u{2714}", "ok"),
+            Mark::Failed => ("31", "\u{2717}", "!!"),
+            Mark::Restart => ("33", "\u{21bb}", "~~"),
+        };
+        self.paint(color, if self.live { symbol } else { ascii })
+    }
+
     fn write(&self, p: &mut Progress, text: &str) {
         let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
         if p.live_len > 0 {
@@ -176,8 +187,15 @@ impl HumanReporter {
         }
         let took =
             took.filter(|d| *d >= Duration::from_secs(1)).map(|d| self.paint("2", &elapsed(d))).unwrap_or_default();
-        format!("  {icon} {label}{detail:<30}{took}").trim_end().to_owned()
+        format!("  {icon} {label}{detail:<28}  {took}").trim_end().to_owned()
     }
+}
+
+#[derive(Clone, Copy)]
+enum Mark {
+    Done,
+    Failed,
+    Restart,
 }
 
 impl Reporter for HumanReporter {
@@ -230,11 +248,7 @@ impl Reporter for HumanReporter {
                 break;
             }
             let took = p.section_started.filter(|(i, _)| *i == p.printed).map(|(_, t)| now - t);
-            let icon = if steps.iter().any(needs_restart) {
-                self.paint("33", "\u{21bb}")
-            } else {
-                self.paint("32", "\u{2714}")
-            };
+            let icon = if steps.iter().any(needs_restart) { self.mark(Mark::Restart) } else { self.mark(Mark::Done) };
             let line = self.section_line(&icon, steps, took);
             self.write(&mut p, &line);
             p.printed += 1;
@@ -263,8 +277,7 @@ impl Reporter for HumanReporter {
         if let Some(range) = sections.get(p.printed) {
             let steps = &state.steps[range.clone()];
             if let Some(failed) = steps.iter().find(|s| s.status == StepStatus::Failed) {
-                let line =
-                    format!("  {} {:<LABEL$}{}", self.paint("31", "\u{2717}"), label(&failed.section), failed.title);
+                let line = format!("  {} {:<LABEL$}{}", self.mark(Mark::Failed), label(&failed.section), failed.title);
                 self.write(&mut p, &line);
                 let message = failed.message.as_deref().unwrap_or_default();
                 let said = |l: &String| message.lines().any(|m| m.trim() == l.trim());
@@ -279,7 +292,7 @@ impl Reporter for HumanReporter {
                 let done = steps.iter().filter(|s| s.status == StepStatus::Done).count();
                 let label = format!("{:<LABEL$}", label(&steps[0].section));
                 let line =
-                    format!("  {} {label}{done} of {} done, restart needed", self.paint("33", "\u{21bb}"), steps.len());
+                    format!("  {} {label}{done} of {} done, restart needed", self.mark(Mark::Restart), steps.len());
                 self.write(&mut p, &line);
             }
         }
@@ -343,6 +356,8 @@ fn label(section: &str) -> &'static str {
 
 /// "2 installed, 1 already installed": what a finished section did, in its own words.
 fn summary(section: &str, steps: &[StepState]) -> String {
+    // Making sure winget is there isn't an app of the file's.
+    let steps: Vec<&StepState> = steps.iter().filter(|s| s.title != "ensure winget is available").collect();
     let n = steps.len();
     let changed = steps.iter().filter(|s| s.changed).count();
     let (did, already) = match section {
@@ -441,9 +456,10 @@ mod tests {
         let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines[0], "  Applying neon.groundhog.yaml (5 steps)");
         assert_eq!(lines[1], "warning: careful");
-        assert_eq!(lines[2], "  \u{2714} Files            1 copied, 1 already there");
-        assert_eq!(lines[3], "  \u{2714} Settings         2 changed");
-        assert_eq!(lines[4], "  \u{2714} Checks           1 passed");
+        // Not a console: ASCII marks.
+        assert_eq!(lines[2], "  ok Files            1 copied, 1 already there");
+        assert_eq!(lines[3], "  ok Settings         2 changed");
+        assert_eq!(lines[4], "  ok Checks           1 passed");
         assert!(
             lines[5].starts_with("  Done in ") && lines[5].ends_with(": 4 changed, 1 already set."),
             "{}",
@@ -475,7 +491,7 @@ mod tests {
         foo.message = Some("winget exited with 1\nno package found".into());
         r.status(&state(RunStatus::Failed, vec![git, foo]));
         let out = buf.text();
-        assert!(out.contains("  \u{2717} Apps             install Foo.Bar (winget)\n"), "{out}");
+        assert!(out.contains("  !! Apps             install Foo.Bar (winget)\n"), "{out}");
         // The last of its output (but not what the error already says), then the error.
         assert!(
             out.contains("\n      c\n      d\n      e\n      f\n      winget exited with 1\n      no package found\n"),
@@ -493,7 +509,7 @@ mod tests {
         wsl.message = Some("reboot required".into());
         r.status(&state(RunStatus::RebootPending, vec![wsl, step("windows features", "enable VMP", Pending, false)]));
         let out = buf.text();
-        assert!(out.contains("  \u{21bb} Windows features 1 of 2 done, restart needed\n"), "{out}");
+        assert!(out.contains("  ~~ Windows features 1 of 2 done, restart needed\n"), "{out}");
         assert!(out.contains("Paused after "), "{out}");
     }
 }

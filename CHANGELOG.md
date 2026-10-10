@@ -4,6 +4,18 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.18.1] - 2026-10-10
+
+### Changed
+- The `neon` example also installs **VS Code**, and its taskbar keeps only FindNeedle and VS
+  Code.
+
+### Fixed
+- `apply` output sent to a file or pipe marks sections with `ok`, `!!` and `~~`. Windows
+  PowerShell garbled the symbols a console shows.
+- A long description no longer runs into the time taken, and the Apps line no longer counts
+  the check that winget is installed as an app.
+
 ## [0.18.0] - 2026-10-10
 
 ### Changed
