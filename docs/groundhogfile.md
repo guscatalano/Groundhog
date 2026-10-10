@@ -648,6 +648,13 @@ desktop:
     show: [SecurityHealthSystray.exe]   # programs whose icons sit on the taskbar
     hide: [OneDrive.exe]                # ... or in the ^ overflow
     touch-keyboard: false           # the touch keyboard button
+  icons:
+    this-pc: true                   # Windows' own: this-pc, recycle-bin, user-files, network, control-panel
+    recycle-bin: true
+    add:                            # shortcuts on the desktop every account shares
+      - { name: VS Code, target: 'C:\Program Files\Microsoft VS Code\Code.exe' }
+      - { name: Logs, target: '%SystemRoot%\explorer.exe', args: 'C:\Logs', icon: '%SystemRoot%\System32\shell32.dll,4' }
+    remove: [Microsoft Edge]        # shortcuts taken off, by name
   scope: [current-user, default-user]
 ```
 
@@ -675,7 +682,9 @@ per-user switch); `widgets: true` lifts that policy, leaving the choice to each 
 - a shortcut: `%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Visual Studio Code.lnk`.
 
 With `pins-for: everyone` they're the Start layout policy: every account gets them at its
-next sign-in (not at once, even for the agent's own account), and existing accounts too.
+next sign-in, existing accounts too, and the agent's own account at once: Explorer reads them
+only when it starts, so the agent restarts it (once, at the end of the run, and only when the
+pins or the desktop's icons changed; open File Explorer windows close).
 `new-accounts` writes them to the Default profile instead: accounts created later start with
 them and may change them, and existing accounts are left alone. `scope` doesn't apply to pins.
 
@@ -696,6 +705,13 @@ name programs by file name (`OneDrive.exe`) or the end of their path. Windows ke
 per program only once it has shown an icon, so one that hasn't yet (installed in the same
 apply, say) is set by a later apply: these steps run every time, and cost nothing when
 there's nothing to do. They're for the agent's own account only.
+
+**Desktop icons.** Windows' own (This PC, Recycle Bin, the user's folder, Network, Control
+Panel) are shown or hidden per user, like the other `desktop` settings. Shortcuts in `add` go
+on the desktop every account shares (`C:\Users\Public\Desktop`), with `%VARS%` in `target` and
+`icon` expanded on the machine; `remove` takes shortcuts off it and off the agent's own
+desktop. Removing `Microsoft Edge` also sets Edge's update policy that otherwise puts the
+shortcut back at each Edge update.
 
 **Start's pinned apps** come from a layout file. Windows 11 takes a pin *list* only from MDM
 (Intune and the like): it ignores one written as a policy or into the Default profile, and

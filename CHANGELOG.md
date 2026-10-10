@@ -4,6 +4,25 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.21.0] - 2026-10-11
+
+### Added
+- **Desktop icons**: `desktop.icons` shows or hides Windows' own icons (This PC, Recycle Bin,
+  user's folder, Network, Control Panel), adds shortcuts to the desktop every account shares,
+  and removes shortcuts by name. Removing `Microsoft Edge` also stops Edge's updates from
+  putting it back.
+  ```yaml
+  desktop:
+    icons: { this-pc: true, add: [{ name: VS Code, target: 'C:\Program Files\Microsoft VS Code\Code.exe' }], remove: [Microsoft Edge] }
+  ```
+
+### Changed
+- **Taskbar pins show at once** for the agent's own account. The agent restarts Explorer
+  once at the end of a run that changed them (or the desktop's icons), instead of leaving
+  them for the next sign-in.
+- The `neon` example puts This PC, the Recycle Bin, FindNeedle and VS Code on the desktop
+  and removes Edge's shortcut; its taskbar and Start show at once.
+
 ## [0.20.0] - 2026-10-10
 
 ### Added

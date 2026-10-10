@@ -15,11 +15,11 @@ use crate::fetch::{self, file_url_to_path};
 use crate::github;
 use crate::library;
 use crate::model::{
-    App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, EnvScope, EnvVar,
-    ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, InputLanguage,
-    LanguageSetting, LockScreen, Password, PathEntry, Presence, RegistryData, RegistryType, RegistryValue, RunAction,
-    ScreenSaver, Service, ServiceState, Shell, SourceRef, StartPins, Theme, ThemeMode, TrayIcon, User, Wallpaper,
-    WallpaperStyle, raw,
+    App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, DesktopShortcut,
+    EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope,
+    InputLanguage, LanguageSetting, LockScreen, Password, PathEntry, Presence, RegistryData, RegistryType,
+    RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell, SourceRef, StartPins, Theme, ThemeMode,
+    TrayIcon, User, Wallpaper, WallpaperStyle, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
@@ -601,6 +601,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         tray_icons,
         do_not_disturb,
         start_pins,
+        shortcuts: desktop_shortcuts,
     } = match desktop {
         Some(d) => resolve_desktop(base, d).context("desktop")?,
         None => DesktopParts {
@@ -613,6 +614,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
             tray_icons: Vec::new(),
             do_not_disturb: None,
             start_pins: None,
+            shortcuts: Vec::new(),
         },
     };
     registry.extend(desktop_registry);
@@ -637,6 +639,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         tray_icons,
         do_not_disturb,
         start_pins,
+        desktop_shortcuts,
         language,
         services,
         firewall,
@@ -897,6 +900,7 @@ struct DesktopParts {
     tray_icons: Vec<TrayIcon>,
     do_not_disturb: Option<bool>,
     start_pins: Option<StartPins>,
+    shortcuts: Vec<DesktopShortcut>,
 }
 
 /// A picture reference (wallpaper, lock screen), checked to look like one.
@@ -1039,6 +1043,10 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<DesktopParts> {
     if let Some(t) = d.tray {
         resolve_tray(t, &scope, &mut registry, &mut tray_icons).context("tray")?;
     }
+    let mut shortcuts = Vec::new();
+    if let Some(i) = d.icons {
+        resolve_icons(i, &scope, &mut registry, &mut shortcuts).context("icons")?;
+    }
 
     Ok(DesktopParts {
         wallpaper,
@@ -1050,6 +1058,7 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<DesktopParts> {
         tray_icons,
         do_not_disturb,
         start_pins,
+        shortcuts,
     })
 }
 
@@ -1069,7 +1078,7 @@ const EXPLORER_ADVANCED: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion
 const EXPLORER_POLICIES: &str = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer";
 /// Where the taskbar pins go for everyone (named by the Start layout policy), next to the
 /// desktop pictures so `clean` leaves it.
-const TASKBAR_POLICY_FILE: &str = r"%ProgramData%\groundhog\desktop\taskbar.xml";
+pub(crate) const TASKBAR_POLICY_FILE: &str = r"%ProgramData%\groundhog\desktop\taskbar.xml";
 /// Read once, when a new profile is created from the Default one.
 const TASKBAR_DEFAULT_PROFILE_FILE: &str =
     r"%SystemDrive%\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml";
@@ -1886,6 +1895,63 @@ fn language_tag(tag: &str) -> Result<String> {
     Ok(tag.to_owned())
 }
 
+/// Where Explorer keeps which of Windows' own icons the desktop shows (0 shown, 1 hidden).
+pub(crate) const DESKTOP_ICONS_KEY: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel";
+
+/// Windows' own desktop icons become registry values; shortcuts, steps of their own.
+fn resolve_icons(
+    i: raw::IconsFull,
+    scope: &[HiveScope],
+    registry: &mut Vec<RegistryValue>,
+    shortcuts: &mut Vec<DesktopShortcut>,
+) -> Result<()> {
+    let builtin = [
+        ("{20D04FE0-3AEA-1069-A2D8-08002B30309D}", i.this_pc),
+        ("{645FF040-5081-101B-9F08-00AA002F954E}", i.recycle_bin),
+        ("{59031a47-3f72-44a7-89c5-5595fe6b30ee}", i.user_files),
+        ("{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", i.network),
+        ("{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}", i.control_panel),
+    ];
+    for (guid, shown) in builtin {
+        if let Some(shown) = shown {
+            registry.push(dword(DESKTOP_ICONS_KEY, guid, u32::from(!shown), scope));
+        }
+    }
+    let name_ok = |n: &str| !n.trim().is_empty() && !n.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']);
+    for s in i.add.unwrap_or_default() {
+        if !name_ok(&s.name) {
+            bail!("'{}' can't be a shortcut's name", s.name);
+        }
+        if s.target.trim().is_empty() {
+            bail!("shortcut '{}' needs a 'target'", s.name);
+        }
+        shortcuts.push(DesktopShortcut {
+            name: s.name,
+            target: Some(s.target),
+            args: s.args,
+            icon: s.icon,
+            state: Presence::Present,
+        });
+    }
+    for name in i.remove.unwrap_or_default() {
+        if !name_ok(&name) {
+            bail!("'{name}' can't be a shortcut's name");
+        }
+        // Edge's updater puts its shortcut back on every update, unless its policy says not to.
+        if name.eq_ignore_ascii_case("Microsoft Edge") {
+            registry.push(dword(
+                r"HKLM\SOFTWARE\Policies\Microsoft\EdgeUpdate",
+                "CreateDesktopShortcutDefault",
+                0,
+                &[HiveScope::CurrentUser],
+            ));
+        }
+        shortcuts.push(DesktopShortcut { name, target: None, args: None, icon: None, state: Presence::Absent });
+    }
+    Ok(())
+}
+
 fn resolve_uac(u: raw::Uac) -> Result<Vec<RegistryValue>> {
     let (mut admin, mut secure) = match u.level {
         None => (None, None),
@@ -2052,6 +2118,12 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
     tray_icons.extend(top.tray_icons);
     let do_not_disturb = top.do_not_disturb.or(base.do_not_disturb);
     let start_pins = top.start_pins.or(base.start_pins);
+    let mut desktop_shortcuts: Vec<DesktopShortcut> = base
+        .desktop_shortcuts
+        .into_iter()
+        .filter(|b| !top.desktop_shortcuts.iter().any(|t| eq(&t.name, &b.name)))
+        .collect();
+    desktop_shortcuts.extend(top.desktop_shortcuts);
     // Setting by setting: the top file's display language replaces the base's, and so on.
     let mut language: Vec<LanguageSetting> =
         base.language.into_iter().filter(|b| !top.language.iter().any(|t| t.order() == b.order())).collect();
@@ -2081,6 +2153,7 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         tray_icons,
         do_not_disturb,
         start_pins,
+        desktop_shortcuts,
         language,
         services,
         firewall,
@@ -2627,6 +2700,40 @@ firewall:
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
             assert!(err.contains(why), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn desktop_icons_and_shortcuts() {
+        let f = MapFetcher::default().with(
+            "https://cfg.test/i.yaml",
+            "desktop:\n  icons:\n    this-pc: true\n    recycle-bin: false\n    add: [{ name: FindNeedle, target: 'C:\\FN\\FindNeedleUX.exe' }]\n    remove: [Microsoft Edge]\n  taskbar: { pins: [file-explorer] }",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/i.yaml", dir.path()).unwrap().file;
+        let icon = |guid: &str| {
+            g.registry
+                .iter()
+                .find(|r| r.key == DESKTOP_ICONS_KEY && r.name.as_deref() == Some(guid))
+                .unwrap()
+                .data
+                .clone()
+        };
+        assert_eq!(icon("{20D04FE0-3AEA-1069-A2D8-08002B30309D}"), RegistryData::Dword(0), "this PC shown");
+        assert_eq!(icon("{645FF040-5081-101B-9F08-00AA002F954E}"), RegistryData::Dword(1), "recycle bin hidden");
+        assert!(g.registry.iter().any(|r| r.name.as_deref() == Some("CreateDesktopShortcutDefault")));
+        let states: Vec<(&str, bool)> =
+            g.desktop_shortcuts.iter().map(|s| (s.name.as_str(), s.state.is_present())).collect();
+        assert_eq!(states, [("FindNeedle", true), ("Microsoft Edge", false)]);
+
+        // One restart of Explorer, after the desktop's other steps, to show pins and icons now.
+        let plan = crate::engine::plan(&g);
+        let titles: Vec<&str> = plan.iter().map(|s| s.title.as_str()).collect();
+        let restart = titles.iter().position(|t| t.starts_with("restart Explorer")).expect("restart step");
+        assert_eq!(titles.iter().filter(|t| t.starts_with("restart Explorer")).count(), 1);
+        assert!(titles.iter().position(|t| t.starts_with("put a FindNeedle")).unwrap() < restart);
+
+        let bad = MapFetcher::default().with("https://cfg.test/b.yaml", "desktop: { icons: { remove: ['a/b'] } }");
+        assert!(load_with(&bad, "https://cfg.test/b.yaml", dir.path()).is_err());
     }
 
     #[test]

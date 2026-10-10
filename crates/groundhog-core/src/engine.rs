@@ -15,9 +15,9 @@ use url::Url;
 use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
-    App, Capability, CertScope, Certificate, Check, DefenderExclusion, EnvScope, Feature, FileCopy, FirewallRule,
-    Groundhogfile, LanguageSetting, LockScreen, Presence, RegistryData, RegistryValue, RunAction, ScreenSaver, Service,
-    ServiceState, StartPins, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    App, Capability, CertScope, Certificate, Check, DefenderExclusion, DesktopShortcut, EnvScope, Feature, FileCopy,
+    FirewallRule, Groundhogfile, LanguageSetting, LockScreen, Presence, RegistryData, RegistryValue, RunAction,
+    ScreenSaver, Service, ServiceState, StartPins, Theme, ThemeMode, TrayIcon, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -71,6 +71,12 @@ pub enum Action {
     },
     /// Start's pinned apps, from a layout file.
     StartPins(StartPins),
+    DesktopShortcut(DesktopShortcut),
+    /// Restarts the agent user's Explorer, which reads the taskbar's pins and the desktop's
+    /// icons only when it starts. `shows` is what changed, so the step runs again only then.
+    RestartExplorer {
+        shows: String,
+    },
     Language(LanguageSetting),
 }
 
@@ -193,6 +199,9 @@ fn title(action: &Action) -> String {
             format!("turn Do Not Disturb {} (from the next sign-in)", if *on { "on" } else { "off" })
         }
         Action::StartPins(p) => format!("pin Start's apps as {} has them", file_name(&p.from)),
+        Action::DesktopShortcut(d) if d.state.is_present() => format!("put a {} shortcut on the desktop", d.name),
+        Action::DesktopShortcut(d) => format!("take the {} shortcut off the desktop", d.name),
+        Action::RestartExplorer { .. } => "restart Explorer to show the taskbar and desktop now".to_owned(),
         Action::Language(l) => match l {
             LanguageSetting::Input { languages } => {
                 let tags: Vec<&str> = languages.iter().map(|l| l.tag.as_str()).collect();
@@ -357,10 +366,24 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     actions.extend(file.tray_icons.iter().cloned().map(Action::TrayIcon));
     actions.extend(file.do_not_disturb.map(|on| Action::DoNotDisturb { on }));
     actions.extend(file.start_pins.iter().cloned().map(Action::StartPins));
+    actions.extend(file.desktop_shortcuts.iter().cloned().map(Action::DesktopShortcut));
     // Services and firewall rules after apps, which often install what they refer to.
     actions.extend(file.services.iter().cloned().map(Action::Service));
     actions.extend(file.firewall.iter().cloned().map(Action::Firewall));
     actions.extend(file.run.iter().cloned().map(Action::Run));
+    // Explorer reads the taskbar's pins and Windows' own desktop icons when it starts: one
+    // restart shows them now instead of at the next sign-in. After the commands, which may
+    // make the shortcuts the pins point at.
+    let mut shows = String::new();
+    for f in file.files.iter().filter(|f| f.to == crate::loader::TASKBAR_POLICY_FILE) {
+        shows.push_str(f.content.as_deref().unwrap_or_default());
+    }
+    for r in file.registry.iter().filter(|r| r.key == crate::loader::DESKTOP_ICONS_KEY) {
+        shows.push_str(&format!("{}={:?};", r.name.as_deref().unwrap_or_default(), r.data));
+    }
+    if !shows.is_empty() {
+        actions.push(Action::RestartExplorer { shows });
+    }
     actions.extend(file.verify.iter().cloned().map(Action::Verify));
 
     let mut chain = String::new();
@@ -434,7 +457,9 @@ fn section(action: &Action) -> &'static str {
         | Action::ScreenSaver(_)
         | Action::TrayIcon(_)
         | Action::DoNotDisturb { .. }
-        | Action::StartPins(_) => "desktop",
+        | Action::StartPins(_)
+        | Action::DesktopShortcut(_)
+        | Action::RestartExplorer { .. } => "desktop",
         Action::Defender(_) => "defender",
         Action::Service(_) => "services",
         Action::Firewall(_) => "firewall",

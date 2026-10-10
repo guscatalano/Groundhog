@@ -37,6 +37,7 @@ pub struct Groundhogfile {
     /// Do Not Disturb for the agent's user; Windows applies it at the next sign-in.
     pub do_not_disturb: Option<bool>,
     pub start_pins: Option<StartPins>,
+    pub desktop_shortcuts: Vec<DesktopShortcut>,
     pub language: Vec<LanguageSetting>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
@@ -271,6 +272,21 @@ pub struct TrayIcon {
     pub program: String,
     /// On the taskbar (`true`) or in the overflow.
     pub shown: bool,
+}
+
+/// A shortcut on the desktop every account shares (`C:\Users\Public\Desktop`), or one taken
+/// off it and this user's desktop.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DesktopShortcut {
+    /// The shortcut's name, as the desktop shows it (the file is `<name>.lnk`).
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    pub state: Presence,
 }
 
 /// One of the `language:` settings; each is its own step.
@@ -815,6 +831,30 @@ pub(crate) mod raw {
         pub welcome_screen: Option<bool>,
     }
 
+    /// The desktop's icons: Windows' own, and shortcuts.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct IconsFull {
+        pub this_pc: Option<bool>,
+        pub recycle_bin: Option<bool>,
+        pub user_files: Option<bool>,
+        pub network: Option<bool>,
+        pub control_panel: Option<bool>,
+        /// Shortcuts to put on the desktop every account shares.
+        pub add: Option<Vec<ShortcutFull>>,
+        /// Shortcuts to take off, by name (`Microsoft Edge`).
+        pub remove: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShortcutFull {
+        pub name: String,
+        pub target: String,
+        pub args: Option<String>,
+        pub icon: Option<String>,
+    }
+
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct InputFull {
@@ -888,6 +928,7 @@ pub(crate) mod raw {
         pub start: Option<StartFull>,
         pub notifications: Option<NotificationsFull>,
         pub tray: Option<TrayFull>,
+        pub icons: Option<IconsFull>,
         pub scope: Option<OneOrMany<HiveScope>>,
     }
 

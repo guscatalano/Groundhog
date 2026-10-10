@@ -10,9 +10,9 @@ use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{Action, Executor, Outcome, Probe, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
-    App, Capability, Certificate, EnvScope, Feature, FileCopy, HiveScope, LanguageSetting, LockScreen, Password,
-    RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, StartPins, Theme, ThemeMode, User,
-    Wallpaper, WallpaperStyle,
+    App, Capability, Certificate, DesktopShortcut, EnvScope, Feature, FileCopy, HiveScope, LanguageSetting, LockScreen,
+    Password, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, StartPins, Theme, ThemeMode,
+    User, Wallpaper, WallpaperStyle,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
@@ -140,6 +140,27 @@ impl Executor for WinExecutor<'_> {
                 Ok(Outcome::Done { changed })
             }
             Action::StartPins(p) => self.start_pins(p, false).map(|changed| Outcome::Done { changed }),
+            Action::DesktopShortcut(d) => {
+                if !shortcut_differs(d)? {
+                    return Ok(Outcome::Done { changed: false });
+                }
+                run_ps(&shortcut_scripts(d).1, log)?;
+                Ok(Outcome::Done { changed: true })
+            }
+            Action::RestartExplorer { .. } => {
+                // Only this session's Explorer: Windows starts it again by itself.
+                let script = "$me = (Get-Process -Id $PID).SessionId\n\
+                     $mine = Get-Process explorer -ErrorAction SilentlyContinue | Where-Object SessionId -eq $me\n\
+                     if (-not $mine) { 'no Explorer running for this account; it shows them at sign-in'; return }\n\
+                     $mine | Stop-Process -Force\n\
+                     foreach ($i in 1..20) {\n\
+                       Start-Sleep -Milliseconds 500\n\
+                       if (Get-Process explorer -ErrorAction SilentlyContinue | Where-Object SessionId -eq $me) { return }\n\
+                     }\n\
+                     Start-Process explorer.exe";
+                run_ps(script, log)?;
+                Ok(Outcome::Done { changed: true })
+            }
             Action::Language(l) => {
                 if !language_differs(l)? {
                     return Ok(Outcome::Done { changed: false });
@@ -236,6 +257,8 @@ impl Executor for WinExecutor<'_> {
             Action::DoNotDisturb { on } => would(desktop::set_do_not_disturb(*on, true)?),
             Action::StartPins(p) => would(self.start_pins(p, true)?),
             Action::Language(l) => would(language_differs(l)?),
+            Action::DesktopShortcut(d) => would(shortcut_differs(d)?),
+            Action::RestartExplorer { .. } => Probe::Unknown,
             Action::TrayIcon(t) => match desktop::set_tray_icon(&t.program, t.shown, true)? {
                 desktop::TrayIcon::NotSeenYet => Probe::Unknown,
                 desktop::TrayIcon::AsWanted => Probe::Satisfied,
@@ -1192,6 +1215,67 @@ fn set_registry(r: &RegistryValue) -> Result<Outcome> {
     Ok(Outcome::Done { changed })
 }
 
+/// Runs a PowerShell script that changes something, stopping at its first error.
+fn run_ps(script: &str, log: &mut dyn FnMut(&str)) -> Result<()> {
+    let out = powershell(Shell::Powershell, &format!("$ErrorActionPreference = 'Stop'\n{script}")).run(log)?;
+    if out.code != 0 {
+        bail!("PowerShell exited with {}", out.code);
+    }
+    Ok(())
+}
+
+/// Text in a PowerShell single-quoted string.
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn shortcut_differs(d: &DesktopShortcut) -> Result<bool> {
+    let (check, _) = shortcut_scripts(d);
+    let out = Proc { capture_stdout: true, ..powershell(Shell::Powershell, &check) }.run(&mut |_| {})?;
+    if out.code != 0 {
+        bail!("checking the {} shortcut: PowerShell exited with {}", d.name, out.code);
+    }
+    Ok(out.stdout.trim() != "same")
+}
+
+/// PowerShell for a desktop shortcut: a check that prints `same` when it's already as wanted,
+/// and the change. Added ones go on the desktop every account shares; removing looks there and
+/// on this user's own desktop.
+fn shortcut_scripts(d: &DesktopShortcut) -> (String, String) {
+    let file = ps_quote(&format!("{}.lnk", d.name));
+    let public = format!("(Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) {file})");
+    if !d.state.is_present() {
+        let both = format!("@({public}, (Join-Path ([Environment]::GetFolderPath('Desktop')) {file}))");
+        return (
+            format!("if (-not ({both} | Where-Object {{ Test-Path -LiteralPath $_ }})) {{ 'same' }}"),
+            format!(
+                "{both} | Where-Object {{ Test-Path -LiteralPath $_ }} | ForEach-Object {{ Remove-Item -LiteralPath $_ -Force }}"
+            ),
+        );
+    }
+    let expand = |s: &str| format!("[Environment]::ExpandEnvironmentVariables({})", ps_quote(s));
+    let target = expand(d.target.as_deref().unwrap_or_default());
+    let args = ps_quote(d.args.as_deref().unwrap_or_default());
+    let icon = d.icon.as_deref().map(|i| format!("$s.IconLocation = {}\n", expand(i))).unwrap_or_default();
+    (
+        format!(
+            "$path = {public}\n\
+             if (Test-Path -LiteralPath $path) {{\n\
+               $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)\n\
+               if ($s.TargetPath -eq {target} -and $s.Arguments -eq {args}) {{ 'same' }}\n\
+             }}"
+        ),
+        format!(
+            "$path = {public}\n\
+             $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)\n\
+             $s.TargetPath = {target}\n\
+             $s.Arguments = {args}\n\
+             $s.WorkingDirectory = Split-Path ({target})\n\
+             {icon}$s.Save()"
+        ),
+    )
+}
+
 /// Whether a language setting differs from what Windows has now.
 fn language_differs(l: &LanguageSetting) -> Result<bool> {
     let (check, _) = language_scripts(l);
@@ -1461,6 +1545,22 @@ mod tests {
     use groundhog_core::model::InputLanguage;
 
     use super::*;
+
+    #[test]
+    fn shortcut_checks_read_the_desktop() {
+        // Read-only: a shortcut nobody has is missing, and removing it is already done.
+        let name = format!("groundhog-test-{}-'quoted'", std::process::id());
+        let mut d = DesktopShortcut {
+            name,
+            target: Some(r"%SystemRoot%\notepad.exe".into()),
+            args: None,
+            icon: None,
+            state: groundhog_core::model::Presence::Present,
+        };
+        assert!(shortcut_differs(&d).unwrap());
+        d.state = groundhog_core::model::Presence::Absent;
+        assert!(!shortcut_differs(&d).unwrap());
+    }
 
     #[test]
     fn language_checks_see_this_machines_own_settings_as_the_same() {
