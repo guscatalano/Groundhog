@@ -162,6 +162,9 @@ impl<'a> Resolver<'a> {
             (Ref::Tag(tag), _) => self.get(&format!("{repo}/tags/{tag}"))?,
             (Ref::Latest, false) => self.get(&format!("{repo}/latest")).map_err(|e| {
                 // GitHub's "latest" skips prereleases, so a repo that only publishes them has none.
+                if !format!("{e:#}").contains("404") {
+                    return e;
+                }
                 e.context(format!(
                     "{}/{} has no latest release; if its releases are prereleases, add 'prerelease: true'",
                     r.owner, r.repo
@@ -181,7 +184,18 @@ impl<'a> Resolver<'a> {
 
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.api.join(path)?;
-        let bytes = self.fetcher.fetch(&url).with_context(|| format!("asking GitHub: {url}"))?;
+        let bytes = self.fetcher.fetch(&url).map_err(|e| {
+            let text = format!("{e:#}");
+            if text.contains("http status: 403") || text.contains("http status: 429") {
+                // What GitHub answers once an address has used up its requests.
+                return e.context(format!(
+                    "asking GitHub: {url}: refused, most likely its limit of 60 requests an hour from one \
+                     address without a token. Wait for it to reset, or pass one: \
+                     --header \"api.github.com=Authorization: Bearer <token>\""
+                ));
+            }
+            e.context(format!("asking GitHub: {url}"))
+        })?;
         serde_json::from_slice(&bytes).with_context(|| format!("unexpected answer from {url}"))
     }
 }
@@ -228,6 +242,24 @@ mod tests {
         for bad in ["github:o/r/release.zip", "github:o@latest/x", "github:o/r@latest", "github:o/r@latest/a/b"] {
             assert!(parse(&gh(bad, false)).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn missing_and_refused_say_which() {
+        // No such release: maybe it only publishes prereleases.
+        let none = Resolver::new(&MapFetcher::default()).resolve(&gh("github:o/r@latest/a.zip", false)).unwrap_err();
+        assert!(format!("{none:#}").contains("add 'prerelease: true'"), "{none:#}");
+
+        // GitHub refusing (its rate limit) is not a missing release.
+        struct Refused;
+        impl crate::fetch::Fetcher for Refused {
+            fn fetch(&self, url: &Url) -> Result<Vec<u8>> {
+                Err(anyhow!("GET {url}: http status: 403"))
+            }
+        }
+        let refused = Resolver::new(&Refused).resolve(&gh("github:o/r@latest/a.zip", false)).unwrap_err();
+        let text = format!("{refused:#}");
+        assert!(text.contains("60 requests an hour") && !text.contains("prerelease"), "{text}");
     }
 
     #[test]

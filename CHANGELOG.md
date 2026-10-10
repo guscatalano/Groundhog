@@ -4,6 +4,13 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.19.1] - 2026-10-10
+
+### Fixed
+- When GitHub refuses a `github:` lookup because its limit of 60 requests an hour from one
+  address without a token is used up, the error says so and how to pass a token. It used to
+  say the repository had no latest release.
+
 ## [0.19.0] - 2026-10-10
 
 ### Added
