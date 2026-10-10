@@ -499,6 +499,9 @@ pub enum StepStatus {
 pub struct StepState {
     pub id: String,
     pub title: String,
+    /// The part of the file it belongs to: `apps`, `files`, `registry`, `desktop`, ...
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub section: String,
     pub status: StepStatus,
     #[serde(default)]
     pub changed: bool,
@@ -570,6 +573,9 @@ impl Reporter for Scrubbed<'_> {
     fn log(&self, line: &str) {
         self.inner.log(&self.redact.scrub(line));
     }
+    fn note(&self, line: &str) {
+        self.inner.note(&self.redact.scrub(line));
+    }
     fn status(&self, state: &RunState) {
         self.inner.status(state);
     }
@@ -598,6 +604,7 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
                 StepState {
                     id: s.id.clone(),
                     title: s.title.clone(),
+                    section: section(&s.action).to_owned(),
                     status: if already { StepStatus::Done } else { StepStatus::Pending },
                     changed: false,
                     message: already.then(|| "already applied".to_owned()),

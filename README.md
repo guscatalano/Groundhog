@@ -156,6 +156,27 @@ verify:
 Each check retries until it passes or its deadline (`within`, default 30s) runs out. See
 [the reference](docs/groundhogfile.md#verify).
 
+## What you see
+
+`apply` shows a line for each part of the file as it finishes, and the step in progress:
+
+```
+  Applying neon.groundhog.yaml (47 steps)
+
+  ✔ Files            2 copied, 1 already there    5.2s
+  ✔ Environment      1 changed
+  ✔ Settings         37 changed                   1.1s
+  ✔ Desktop          3 changed
+  ✔ Commands         1 ran                        1.5s
+  ✔ Checks           2 passed
+
+  Done in 21s: 46 changed, 1 already set.
+```
+
+If a step fails, it shows that step, the last of its output and the error. `--verbose` (`-v`)
+shows every step and what it did instead; the log in `%ProgramData%\groundhog\last-run`
+always has that detail.
+
 ## Resuming, reboots and re-runs
 
 Each step's id is a hash of what it does, including the content it fetches. The agent records

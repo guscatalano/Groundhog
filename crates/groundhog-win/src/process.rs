@@ -136,12 +136,20 @@ impl Proc {
                 stdout.push_str(&line);
                 continue;
             }
-            if let Some(clean) = clean_line(&line) {
-                on_line(clean);
-                if recent.len() == 5 {
-                    recent.pop_front();
+            // PowerShell run with -EncodedCommand writes its error stream as CLIXML.
+            let lines = match line.trim_end() {
+                "#< CLIXML" if !is_stdout => continue,
+                l if !is_stdout && l.starts_with("<Objs") => clixml_text(l),
+                _ => vec![line],
+            };
+            for line in &lines {
+                if let Some(clean) = clean_line(line) {
+                    on_line(clean);
+                    if recent.len() == 5 {
+                        recent.pop_front();
+                    }
+                    recent.push_back(clean.to_owned());
                 }
-                recent.push_back(clean.to_owned());
             }
         }
         let _ = (t1.join(), t2.join());
@@ -223,9 +231,103 @@ fn clean_line(line: &str) -> Option<&str> {
     Some(line)
 }
 
+/// The text of PowerShell's CLIXML error stream, as PowerShell would have printed it, less
+/// what only gets in the way: the echo of the whole script that precedes a script-level
+/// error's message (` : message`), and the CategoryInfo and FullyQualifiedErrorId lines.
+fn clixml_text(xml: &str) -> Vec<String> {
+    let mut text = String::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<S S=\"") {
+        rest = &rest[start + 6..];
+        let Some((stream, after)) = rest.split_once("\">") else { break };
+        let Some((body, after)) = after.split_once("</S>") else { break };
+        let body = unescape_clixml(body);
+        if stream.eq_ignore_ascii_case("warning") {
+            text.push_str("warning: ");
+        }
+        text.push_str(&body);
+        rest = after;
+    }
+    let mut out = Vec::new();
+    // Records end with an empty line.
+    for record in text.split("\r\n\r\n").flat_map(|r| r.split("\n\n")) {
+        let lines: Vec<&str> = record.lines().collect();
+        let from = lines.iter().rposition(|l| l.starts_with(" : ")).unwrap_or(0);
+        for l in &lines[from..] {
+            let t = l.trim_start();
+            if t.starts_with("+ CategoryInfo") || t.starts_with("+ FullyQualifiedErrorId") || t.is_empty() {
+                continue;
+            }
+            out.push(l.strip_prefix(" : ").unwrap_or(l).to_owned());
+        }
+    }
+    out
+}
+
+/// XML entities and CLIXML's `_xHHHH_` escapes (UTF-16 code units, so pairs for emoji).
+fn unescape_clixml(s: &str) -> String {
+    let s = s
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    let mut units: Vec<u16> = Vec::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(i) = rest.find("_x") {
+        let code = rest
+            .get(i + 2..i + 6)
+            .filter(|_| rest.get(i + 6..i + 7) == Some("_"))
+            .and_then(|h| u16::from_str_radix(h, 16).ok());
+        let end = if code.is_some() { i + 7 } else { i + 2 };
+        units.extend(rest[..i].encode_utf16());
+        match code {
+            Some(c) => units.push(c),
+            None => units.extend("_x".encode_utf16()),
+        }
+        rest = &rest[end..];
+    }
+    units.extend(rest.encode_utf16());
+    String::from_utf16_lossy(&units)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_errors_read_as_text() {
+        // What powershell -EncodedCommand wrote for a script ending in Write-Error; exit 3.
+        let xml = r#"<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">$ProgressPreference = 'SilentlyContinue'_x000D__x000A_</S><S S="Error">Write-Error 'the thing is not there'_x000D__x000A_</S><S S="Error">exit 0_x000D__x000A_</S><S S="Error"> : the thing is not there &amp; more_x000D__x000A_</S><S S="Error">    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S><S S="warning">careful_x000D__x000A_</S></Objs>"#;
+        assert_eq!(clixml_text(xml), ["the thing is not there & more", "warning: careful"]);
+
+        let mut lines = Vec::new();
+        let out = Proc::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand"])
+            .args([base64_utf16("Write-Output 'checking'\nWrite-Error 'not there'\nexit 3")])
+            .run(&mut |l| lines.push(l.to_owned()))
+            .unwrap();
+        assert_eq!(out.code, 3);
+        assert!(lines.contains(&"checking".to_owned()), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("not there")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("CLIXML") || l.contains("<Objs") || l.contains("CategoryInfo")),
+            "{lines:?}"
+        );
+    }
+
+    fn base64_utf16(script: &str) -> String {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+            for i in 0..4 {
+                out.push(if i <= chunk.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+            }
+        }
+        out
+    }
 
     #[test]
     fn streams_lines_and_exit_code() {

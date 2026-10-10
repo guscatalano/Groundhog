@@ -4,6 +4,21 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.18.0] - 2026-10-10
+
+### Changed
+- **`apply` is easier to read.** Instead of every step, it shows a line for each part of the
+  file (files, settings, desktop, commands, checks, ...) as it finishes, with what it did
+  ("2 installed, 1 already installed") and how long it took, the step in progress, and a
+  one-line summary. A failure shows the step, the last of its output and the error, and
+  where the full log is. In color in a console; plain text in a file or pipe.
+- **`--verbose`** (`-v`) shows every step as before. The log in
+  `%ProgramData%\groundhog\last-run` always has that detail.
+
+### Fixed
+- Errors from PowerShell commands read as text. They came out as CLIXML (serialized XML),
+  including an echo of the whole script.
+
 ## [0.17.0] - 2026-10-06
 
 ### Added

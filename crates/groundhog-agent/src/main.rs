@@ -10,6 +10,7 @@ mod secrets;
 mod update;
 
 use std::collections::BTreeSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -20,11 +21,13 @@ use groundhog_core::engine::{self, RunOptions, RunState, RunStatus, StepState, n
 use groundhog_core::fetch::{DefaultFetcher, HeaderRule};
 use groundhog_core::loader::{Loaded, Loader, NeedsAgent, required_secrets, source_ref};
 use groundhog_core::pending::{PENDING_FILE, Pending, default_home};
-use groundhog_core::report::{ConsoleReporter, FolderReporter, MultiReporter, Reporter, parse_report_sink};
+use groundhog_core::report::{
+    ConsoleReporter, FolderReporter, HumanReporter, LOG_FILE, MultiReporter, Reporter, parse_report_sink,
+};
 use groundhog_core::secret::Redactor;
 use groundhog_core::update::{Policy, Version};
 use groundhog_win::process::Proc;
-use groundhog_win::{tasks, token};
+use groundhog_win::{console, tasks, token};
 
 use crate::exec::WinExecutor;
 
@@ -133,6 +136,10 @@ struct ApplyArgs {
     /// come from GROUNDHOG_SECRET_<NAME> environment variables.
     #[arg(long, value_name = "FILE")]
     secrets_file: Option<PathBuf>,
+    /// Show every step and what it did (what the log file in <home>\last-run always has),
+    /// instead of a line for each part of the file.
+    #[arg(long, short)]
+    verbose: bool,
 }
 
 fn main() {
@@ -157,7 +164,7 @@ fn run(home: &Path, command: Command) -> Result<i32> {
             if let Some(file) = &args.secrets_file {
                 pending.secrets = secrets::read_file(file)?;
             }
-            let state = match apply(home, &pending, args.fresh)? {
+            let state = match apply(home, &pending, args.fresh, args.verbose)? {
                 Applied::Ran(state) => *state,
                 Applied::HandedOver(code) => return Ok(code),
             };
@@ -201,7 +208,7 @@ fn run(home: &Path, command: Command) -> Result<i32> {
         }
         Command::Update { to, from } => {
             let settings = update::Settings { policy: Policy::parse(&to)?, from };
-            let session = Session::new(home, &Pending { source: String::new(), ..Pending::default() })?;
+            let session = Session::new(home, &Pending { source: String::new(), ..Pending::default() }, false)?;
             let content = ContentStore { fetcher: &session.fetcher, cache: &session.cache };
             match update::update_now(&settings, home, &content, &session.reporter)? {
                 Some(path) => println!("installed {}", path.display()),
@@ -260,7 +267,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(home: &Path, p: &Pending) -> Result<Self> {
+    fn new(home: &Path, p: &Pending, verbose: bool) -> Result<Self> {
         // A local object store comes first: content fetched while loading (to resolve "latest"
         // URLs) is reused when the step runs instead of being downloaded twice.
         let mut sources: Vec<Box<dyn CacheSource>> = vec![Box::new(FolderCache { root: home.join("objects") })];
@@ -285,8 +292,9 @@ impl Session {
         } else {
             p.headers.clone()
         };
+        let console: Box<dyn Reporter> = if verbose { Box::new(ConsoleReporter) } else { Box::new(human(home)) };
         let mut reporters: Vec<Box<dyn Reporter>> =
-            vec![Box::new(ConsoleReporter), Box::new(FolderReporter { dir: home.join("last-run") })];
+            vec![console, Box::new(FolderReporter { dir: home.join("last-run") })];
         for sink in &p.report {
             reporters.push(parse_report_sink(sink, &headers)?);
         }
@@ -312,15 +320,24 @@ enum Applied {
     HandedOver(i32),
 }
 
-fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<Applied> {
-    let session = Session::new(home, p)?;
+/// The console as a person reads it: a line for each part of the file, redrawn in place and
+/// in color when stdout is a console.
+fn human(home: &Path) -> HumanReporter {
+    let live = std::io::stdout().is_terminal();
+    let color = live && std::env::var_os("NO_COLOR").is_none() && console::enable_colors();
+    let width = console::width().unwrap_or(80);
+    HumanReporter::new(Box::new(std::io::stdout()), live, color, width, Some(home.join("last-run").join(LOG_FILE)))
+}
+
+fn apply(home: &Path, p: &Pending, fresh: bool, verbose: bool) -> Result<Applied> {
+    let session = Session::new(home, p, verbose)?;
     let reporter = &session.reporter;
     reporter.log(&format!("groundhog-agent {} applying {}", env!("CARGO_PKG_VERSION"), p.source));
     if !p.cache.is_empty() {
         reporter.log(&format!("cache: {}", p.cache.join(", ")));
     }
     if !token::is_elevated() {
-        reporter.log("warning: not running elevated; machine-wide installs and HKLM changes will fail");
+        reporter.note("warning: not running elevated; machine-wide installs and HKLM changes will fail");
     }
 
     // Keep a template's frozen agent current before it reads a file written for a newer one.
@@ -349,7 +366,7 @@ fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<Applied> {
             };
             // Tell anyone watching, or a host would wait forever for a run that never starts.
             let state = failed_before_start(p, &e);
-            reporter.log(&format!("failed: {e:#}"));
+            reporter.note(&format!("failed: {e:#}"));
             reporter.status(&state);
             return Ok(Applied::Ran(Box::new(state)));
         }
@@ -386,7 +403,7 @@ fn apply(home: &Path, p: &Pending, fresh: bool) -> Result<Applied> {
     if let Some(problem) = problem {
         let e = anyhow::anyhow!(problem);
         let state = failed_before_start(p, &e);
-        reporter.log(&format!("failed: {e:#}"));
+        reporter.note(&format!("failed: {e:#}"));
         reporter.status(&state);
         return Ok(Applied::Ran(Box::new(state)));
     }
@@ -424,7 +441,7 @@ fn warn_about_clock_skew(reporter: &dyn Reporter) {
     }
     let by = humantime::format_duration(std::time::Duration::from_secs(skew.unsigned_abs() / 60 * 60));
     let direction = if skew > 0 { "behind" } else { "ahead of" };
-    reporter.log(&format!(
+    reporter.note(&format!(
         "warning: this machine's clock is {by} {direction} {host}'s; certificates and timestamps can go wrong. \
          Turn on time sync (groundhog:time-sync), or fix the VM's clock setting"
     ));
@@ -458,7 +475,7 @@ fn run_pending(home: &Path) -> Result<i32> {
         secrets::save_store(home, &stored)?;
         engine::write_json_atomic(&path, &pending)?;
     }
-    let state = match apply(home, &pending, false)? {
+    let state = match apply(home, &pending, false, false)? {
         Applied::Ran(state) => *state,
         // The newer agent handled the pending file, reboots included.
         Applied::HandedOver(code) => return Ok(code),
@@ -523,7 +540,7 @@ fn exit_code(status: RunStatus) -> i32 {
 }
 
 fn print_plan(home: &Path, p: &Pending, check: bool) -> Result<()> {
-    let session = Session::new(home, &Pending { report: Vec::new(), ..p.clone() })?;
+    let session = Session::new(home, &Pending { report: Vec::new(), ..p.clone() }, true)?;
     println!("groundhog-agent {}", Version::current());
     let (_, loaded) = session.load(home, p)?;
     for s in &loaded.sources {

@@ -46,7 +46,7 @@ pub fn run(settings: &Settings, home: &Path, content: &ContentStore, reporter: &
         Ok(Some(code)) => Outcome::HandedOver(code),
         Ok(None) => Outcome::Continue,
         Err(e) => {
-            reporter.log(&format!("warning: agent update skipped: {e:#}"));
+            reporter.note(&format!("warning: agent update skipped: {e:#}"));
             Outcome::Continue
         }
     }
@@ -83,7 +83,7 @@ pub fn update_now(
     let Some(candidate) = update::find_update(content, &manifest, &settings.policy, &current)? else {
         return Ok(None);
     };
-    reporter.log(&format!("updating groundhog-agent {current} -> {} from {}", candidate.version, candidate.url));
+    reporter.note(&format!("updating groundhog-agent {current} -> {} from {}", candidate.version, candidate.url));
     install(&candidate, home, content, reporter).map(Some)
 }
 
