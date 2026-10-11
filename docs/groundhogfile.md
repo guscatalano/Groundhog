@@ -31,6 +31,60 @@ always run), `done` a step an earlier `apply` recorded (it's skipped), and `?` t
 tell without doing it (a direct installer, a zip to unpack over an existing folder). Steps that
 use secrets show as `?` unless the check is given them (`--secrets-file`).
 
+## Drift: `drift`
+
+`groundhog-agent drift <file>` checks every step again, including the ones earlier applies
+recorded as done (which `apply` skips), and lists what no longer matches this machine:
+
+```
+  Drifted from dev.groundhog.yaml:
+    Defender         set Defender's pua to on
+    SSH              set PasswordAuthentication no in sshd_config
+    Scheduled tasks  create scheduled task \Groundhog\Nightly backup
+
+  3 of 35 checked steps drifted.
+```
+
+It exits 0 when nothing drifted and 2 when something did (or couldn't be checked). `--json`
+prints the same as JSON, for a monitoring job. `--fix` then runs just the drifted steps again.
+Commands and checks are left out: they always run, so there's nothing to compare.
+
+## Undo: `undo`
+
+`groundhog-agent undo <file>` puts back what applying that file changed, newest change first.
+As it applies, the agent notes how each thing it's about to change was, only for what actually
+changes, and keeps the earliest state, so undo goes back to before the first apply however many
+there were. `--dry-run` lists what it would do.
+
+Put back as they were:
+- registry values (and keys Groundhog made, once empty), environment variables, PATH entries;
+- files, including Windows Terminal's settings, PowerShell profiles, `sshd_config`, SSH keys
+  and known hosts, and the hosts file (a file Groundhog made is deleted);
+- services' startup type and state, Windows features and capabilities, firewall rules
+  Groundhog made, Defender exclusions and settings, the execution policy;
+- winget apps and PowerShell modules Groundhog installed (an upgrade isn't rolled back);
+- scheduled tasks: ones it made are deleted (or a replaced one restored), and ones it turned
+  off, on or deleted are put back; startup entries it switched.
+
+Not undone, and listed as such: commands (`run`), accounts, BitLocker, removed apps, unpacked
+folders, values in the Default profile, Group Policy values, and the desktop and language
+settings that aren't plain registry values. The notes live in `<home>\undo` (cleared by
+`clean`). After an undo, the next `apply` runs every step again.
+
+## Starting from a machine: `capture machine`
+
+`groundhog-agent capture machine [out.yaml]` writes a Groundhogfile from this machine as it is:
+the winget apps (not the ones that come with Windows), notable Windows features, time zone,
+power plan and Remote Desktop, the developer switches, WSL distributions and VS Code extensions,
+the light or dark mode and taskbar, PowerShell's execution policy and Gallery modules, the SSH
+server, this account's own PATH entries, and the Start layout (saved as `start2.bin` next to
+it). Only settings that have been changed from Windows' defaults are written, so
+`plan --check` on the result says everything is `ok`. Environment variables are only named,
+since their values can be secrets. Run it elevated to include features.
+
+It's a starting point: read it through, drop what you don't want carried over, and add what
+can't be read back (secrets, files, settings inside apps).
+
 ## When steps run again
 
 The agent records every step it finishes. On the next `apply` it runs only steps that are new

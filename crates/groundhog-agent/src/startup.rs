@@ -77,6 +77,17 @@ function Test-On($e) {
 }
 $todo = @($found | Where-Object { (Test-On $_) -ne $Enable })
 if ($Mode -eq 'check') { if (-not $todo) { 'same' }; return }
+if ($Mode -eq 'undo') {
+  # PowerShell that puts each entry about to change back as it is now.
+  foreach ($e in $todo) {
+    $k = $e.Key -replace "'", "''"; $n = $e.Name -replace "'", "''"
+    $v = (Get-ItemProperty -LiteralPath $e.Key -ErrorAction SilentlyContinue).($e.Name)
+    if ($null -eq $v) { "Remove-ItemProperty -LiteralPath '$k' -Name '$n' -ErrorAction SilentlyContinue" }
+    elseif ($e.Kind -eq 'packaged') { "Set-ItemProperty -LiteralPath '$k' -Name '$n' -Value $v -Type DWord" }
+    else { "Set-ItemProperty -LiteralPath '$k' -Name '$n' -Value ([byte[]]($(@($v) -join ','))) -Type Binary" }
+  }
+  return
+}
 if (-not $found) { "nothing starting at sign-in matches $($Patterns -join ', ')" }
 foreach ($e in $todo) {
   if ($e.Kind -eq 'packaged') {
@@ -105,6 +116,21 @@ $todo = @($tasks | Where-Object {
   switch ($Want) { 'absent' { $true } 'disabled' { $state -ne 'Disabled' } 'enabled' { $state -eq 'Disabled' } }
 })
 if ($Mode -eq 'check') { if (-not $todo) { 'same' }; return }
+if ($Mode -eq 'undo') {
+  # PowerShell that puts each task about to change back as it is now.
+  foreach ($t in $todo) {
+    $p = $t.TaskPath -replace "'", "''"; $n = $t.TaskName -replace "'", "''"
+    switch ($Want) {
+      'absent' {
+        $xml = (Export-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath) -replace "'", "''"
+        "Register-ScheduledTask -TaskPath '$p' -TaskName '$n' -Xml '$xml' -Force | Out-Null"
+      }
+      'disabled' { "Enable-ScheduledTask -TaskPath '$p' -TaskName '$n' | Out-Null" }
+      'enabled' { "Disable-ScheduledTask -TaskPath '$p' -TaskName '$n' | Out-Null" }
+    }
+  }
+  return
+}
 if (-not $tasks) { "no scheduled task matches $($Patterns -join ', ')" }
 $failed = @()
 foreach ($t in $todo) {
@@ -122,7 +148,10 @@ if ($failed) { throw "Windows refused: $($failed -join '; ')" }
 "#;
 
 fn script(body: &str, vars: &str, check: bool) -> String {
-    let mode = if check { "check" } else { "apply" };
+    script_in(body, vars, if check { "check" } else { "apply" })
+}
+
+fn script_in(body: &str, vars: &str, mode: &str) -> String {
     format!("$ErrorActionPreference = 'Stop'\n$Mode = '{mode}'\n{vars}\n{body}")
 }
 
@@ -172,6 +201,31 @@ pub fn set_startup(s: &StartupItem, log: &mut dyn FnMut(&str)) -> Result<bool> {
     }
     apply(&startup_script(s, false), log)?;
     Ok(true)
+}
+
+/// What a script prints, run without changing anything.
+fn printed(script: &str) -> Result<String> {
+    let out = Proc { capture_stdout: true, ..powershell(Shell::Powershell, script) }.run(&mut |_| {})?;
+    if out.code != 0 {
+        bail!("PowerShell exited with {}", out.code);
+    }
+    Ok(out.stdout.trim_end().to_owned())
+}
+
+/// PowerShell that puts back the startup entries `s` is about to change.
+pub fn startup_undo_script(s: &StartupItem) -> Result<String> {
+    let enable = if s.enabled { "$true" } else { "$false" };
+    printed(&script_in(STARTUP, &format!("{}\n$Enable = {enable}", patterns(std::slice::from_ref(&s.name))), "undo"))
+}
+
+/// PowerShell that puts back the scheduled tasks `t` is about to change.
+pub fn task_undo_script(t: &TaskRule) -> Result<String> {
+    let want = match t.state {
+        TaskState::Enabled => "enabled",
+        TaskState::Disabled => "disabled",
+        TaskState::Absent => "absent",
+    };
+    printed(&script_in(TASKS, &format!("{}\n$Want = '{want}'", patterns(std::slice::from_ref(&t.name))), "undo"))
 }
 
 pub fn task_differs(t: &TaskRule) -> Result<bool> {

@@ -4,6 +4,34 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.30.0] - 2026-10-11
+
+### Added
+- **`groundhog-agent drift <file>`**: checks every step again, including the ones earlier runs
+  recorded as done, and lists what no longer matches. It exits 2 when something drifted.
+  `--json` is there for monitoring, and `--fix` runs just the drifted steps again.
+- **`groundhog-agent undo <file>`**: puts back what applying a file changed, newest first, to
+  how it was before the first apply.
+  - Covers registry values, environment variables and PATH, files (including Terminal
+    settings, PowerShell profiles, SSH config and keys, the hosts file), services, features
+    and capabilities, firewall rules, Defender, winget apps, PowerShell modules, and scheduled
+    tasks and startup entries.
+  - What it can't undo (commands, accounts, BitLocker, removed apps) it lists. `--dry-run`
+    shows what it would do.
+  - Changes are noted from this version on.
+  - Tested: a file touching 21 kinds of change, applied and undone, left the machine as it
+    was.
+- **`groundhog-agent capture machine`**: writes this machine as a starting Groundhogfile.
+  - It covers winget apps, features, system, developer and desktop settings, PowerShell, the
+    SSH server, this account's PATH, and the Start layout.
+  - Only settings changed from Windows' defaults are written, so `plan --check` on the result
+    finds nothing to change (seen on a fresh VM and on a long-used PC).
+
+### Fixed
+- PATH entries written with `%VARS%`, or with the stray quotes and doubled backslashes some
+  installers leave, are recognised as the folder they name, rather than added again.
+- Windows Terminal font sizes are written as whole numbers (`11`, not `11.0`).
+
 ## [0.29.0] - 2026-10-11
 
 ### Added

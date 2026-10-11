@@ -54,6 +54,8 @@ pub struct WinExecutor<'a> {
     /// A servicing step in this run finished "after a restart", so Windows now reports a
     /// pending restart of our own making. The rest of the section carries on regardless.
     deferred_restart: bool,
+    /// Where to note how to undo each change (`apply` sets it; previews don't).
+    pub undo: Option<crate::undo::Store>,
 }
 
 impl<'a> WinExecutor<'a> {
@@ -66,7 +68,19 @@ impl<'a> WinExecutor<'a> {
             secrets,
             dism: None,
             deferred_restart: false,
+            undo: None,
         }
+    }
+
+    /// Whether winget has the package installed.
+    pub(crate) fn winget_installed(&mut self, id: &str) -> Result<bool> {
+        let winget = self.winget()?.to_path_buf();
+        Ok(installed_version(&winget, id)?.is_some())
+    }
+
+    pub(crate) fn winget_uninstall(&mut self, id: &str, log: &mut dyn FnMut(&str)) -> Result<()> {
+        let want = WingetWant { version: None, upgrade: false, present: false };
+        self.winget_app(id, want, None, None, log).map(|_| ())
     }
 }
 
@@ -76,6 +90,40 @@ impl Executor for WinExecutor<'_> {
     }
 
     fn execute(&mut self, step: &Step, reporter: &dyn Reporter) -> Result<Outcome> {
+        // How to undo it, found before it changes anything, kept once it has.
+        let undo = match self.undo.clone() {
+            Some(store) => {
+                let entries = crate::undo::before(self, step, &store).unwrap_or_else(|e| {
+                    vec![crate::undo::Entry {
+                        target: format!("step {}", step.id),
+                        step: step.title.clone(),
+                        op: crate::undo::Op::Not { why: format!("couldn't note how to undo it: {e:#}") },
+                    }]
+                });
+                Some((store, entries))
+            }
+            None => None,
+        };
+        let result = self.execute_action(step, reporter);
+        let changed =
+            !matches!(result, Ok(Outcome::Done { changed: false }) | Ok(Outcome::DoneRestartLater { changed: false }));
+        if let Some((store, entries)) = undo
+            && changed
+            && !entries.is_empty()
+            && let Err(e) = store.record(entries)
+        {
+            reporter.log(&format!("    couldn't note how to undo this: {e:#}"));
+        }
+        result
+    }
+
+    fn check(&mut self, step: &Step) -> Result<Probe> {
+        self.check_action(step)
+    }
+}
+
+impl WinExecutor<'_> {
+    fn execute_action(&mut self, step: &Step, reporter: &dyn Reporter) -> Result<Outcome> {
         let log = &mut |line: &str| reporter.log(&format!("    {line}"));
         // Pick up PATH changes earlier steps' installers made (they change the registry only).
         env::refresh_process_path();
@@ -249,7 +297,7 @@ impl Executor for WinExecutor<'_> {
         }
     }
 
-    fn check(&mut self, step: &Step) -> Result<Probe> {
+    fn check_action(&mut self, step: &Step) -> Result<Probe> {
         let quiet = &mut |_: &str| {};
         let would = |changes: bool| if changes { Probe::WouldChange } else { Probe::Satisfied };
         Ok(match &step.action {

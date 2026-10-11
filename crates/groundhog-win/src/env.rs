@@ -80,8 +80,7 @@ pub fn add_path(scope: Scope, dir: &str) -> Result<bool> {
         // which would write back a PATH holding only `dir`.
         (None, Scope::Machine) => bail!("can't read the machine PATH ({MACHINE_ENV_KEY}); not changing it"),
     };
-    let norm = |p: &str| p.trim().trim_end_matches('\\').to_ascii_lowercase();
-    let present = current.split(';').any(|p| norm(p) == norm(dir));
+    let present = current.split(';').any(|p| same_dir(p, dir));
 
     let changed = if present {
         false
@@ -94,7 +93,7 @@ pub fn add_path(scope: Scope, dir: &str) -> Result<bool> {
     };
 
     let process_path = std::env::var("PATH").unwrap_or_default();
-    if !process_path.split(';').any(|p| norm(p) == norm(dir)) {
+    if !process_path.split(';').any(|p| same_dir(p, dir)) {
         set_process_var("PATH", &format!("{process_path};{}", expand(dir)?));
     }
     Ok(changed)
@@ -105,6 +104,12 @@ pub fn var_matches(scope: Scope, name: &str, value: &str) -> bool {
     let (root, key) = scope.key();
     let data = if value.contains('%') { Data::ExpandString(value) } else { Data::String(value) };
     registry::value_matches(&root, key, Some(name), &data)
+}
+
+/// A persistent variable's value as stored (`%VARS%` unexpanded), if it's set.
+pub fn get_var(scope: Scope, name: &str) -> Option<String> {
+    let (root, key) = scope.key();
+    registry::get_string(&root, key, name)
 }
 
 pub fn var_exists(scope: Scope, name: &str) -> bool {
@@ -133,9 +138,21 @@ fn path_entries(scope: Scope) -> Result<Option<String>> {
     })
 }
 
+/// Whether two PATH entries are the same folder, as written or once `%VARS%` are expanded
+/// (`%USERPROFILE%\.cargo\bin` is `C:\Users\me\.cargo\bin`).
 fn same_dir(a: &str, b: &str) -> bool {
-    let norm = |p: &str| p.trim().trim_end_matches('\\').to_ascii_lowercase();
+    // Some installers leave quotes around an entry or doubled backslashes in it; Windows
+    // finds programs there all the same.
+    let norm = |p: &str| {
+        let mut p = p.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+        while p.contains(r"\\") {
+            p = p.replace(r"\\", r"\");
+        }
+        p.trim_end_matches('\\').to_owned()
+    };
     norm(a) == norm(b)
+        || ((a.contains('%') || b.contains('%'))
+            && expand(a).is_ok_and(|x| expand(b).is_ok_and(|y| norm(&x) == norm(&y))))
 }
 
 /// Whether the PATH (user or machine) has this folder.

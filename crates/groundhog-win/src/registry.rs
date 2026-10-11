@@ -79,6 +79,41 @@ pub fn set_value(root: &RegKey, subkey: &str, name: Option<&str>, data: &Data) -
     Ok(true)
 }
 
+/// A value's type number and bytes as stored, if it's there (to put it back later with
+/// `set_raw`).
+pub fn get_raw(root: &RegKey, subkey: &str, name: Option<&str>) -> Option<(u32, Vec<u8>)> {
+    let v = root.open_subkey_with_flags(subkey, KEY_READ).ok()?.get_raw_value(name.unwrap_or("")).ok()?;
+    Some((v.vtype as u32, v.bytes.into_owned()))
+}
+
+/// Writes a value from its type number and bytes, as `get_raw` read them. Returns whether
+/// anything changed.
+pub fn set_raw(root: &RegKey, subkey: &str, name: Option<&str>, vtype: u32, bytes: &[u8]) -> Result<bool> {
+    use winreg::enums::{REG_NONE, RegType};
+    let vtype: RegType = match vtype {
+        0 => REG_NONE,
+        1 => REG_SZ,
+        2 => REG_EXPAND_SZ,
+        3 => REG_BINARY,
+        4 => REG_DWORD,
+        7 => REG_MULTI_SZ,
+        11 => REG_QWORD,
+        other => bail!("registry type {other} isn't one Groundhog writes back"),
+    };
+    let name = name.unwrap_or("");
+    if let Ok(key) = root.open_subkey_with_flags(subkey, KEY_READ)
+        && let Ok(current) = key.get_raw_value(name)
+        && current.vtype == vtype
+        && current.bytes.as_ref() == bytes
+    {
+        return Ok(false);
+    }
+    let (key, _) = root.create_subkey(subkey).with_context(|| format!("creating key {subkey}"))?;
+    key.set_raw_value(name, &RegValue { bytes: bytes.to_vec().into(), vtype })
+        .with_context(|| format!("writing {subkey}\\{name}"))?;
+    Ok(true)
+}
+
 /// `HKEY_CURRENT_USER`: the account this process runs as.
 pub fn hkcu() -> RegKey {
     RegKey::predef(HKEY_CURRENT_USER)
@@ -99,6 +134,13 @@ pub fn value_matches(root: &RegKey, subkey: &str, name: Option<&str>, data: &Dat
 
 pub fn value_exists(root: &RegKey, subkey: &str, name: Option<&str>) -> bool {
     root.open_subkey_with_flags(subkey, KEY_READ).and_then(|k| k.get_raw_value(name.unwrap_or(""))).is_ok()
+}
+
+/// Whether `root\subkey` is there and holds no values and no keys.
+pub fn key_is_empty(root: &RegKey, subkey: &str) -> bool {
+    root.open_subkey_with_flags(subkey, KEY_READ)
+        .and_then(|k| k.query_info())
+        .is_ok_and(|i| i.values == 0 && i.sub_keys == 0)
 }
 
 pub fn key_exists(root: &RegKey, subkey: &str) -> bool {

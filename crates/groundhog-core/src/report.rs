@@ -335,7 +335,7 @@ fn sections(steps: &[StepState]) -> Vec<Range<usize>> {
     out
 }
 
-fn label(section: &str) -> &'static str {
+pub fn label(section: &str) -> &'static str {
     match section {
         "users" => "Accounts",
         "certificates" => "Certificates",

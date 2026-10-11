@@ -202,6 +202,22 @@ Pin a download with `sha256` to lock it to one build; leave the pin off to follo
 When a step needs a restart, `apply` exits with **3010**. With `--reboot`, it restarts and
 continues by itself at the next logon.
 
+## Drift, undo and capture
+
+```powershell
+groundhog-agent drift dev.groundhog.yaml          # what no longer matches (exit 2 if anything)
+groundhog-agent drift dev.groundhog.yaml --fix    # put just those back
+groundhog-agent undo dev.groundhog.yaml           # put back what applying it changed
+groundhog-agent capture machine                   # this machine as a starting Groundhogfile
+```
+
+`drift` checks every step again, whatever earlier runs recorded, and `--json` makes it easy to
+monitor. `undo` works from notes the agent keeps as it applies: registry values, files,
+services, features, apps, Defender, scheduled tasks and more go back to how they were before the
+first apply; what it can't undo (commands, accounts, BitLocker) it says. See
+[drift](docs/groundhogfile.md#drift-drift), [undo](docs/groundhogfile.md#undo-undo) and
+[capture](docs/groundhogfile.md#starting-from-a-machine-capture-machine).
+
 ## Templated VMs (Hyper-V, Proxmox, anything)
 
 Install the agent in the template once (`groundhog-agent install-task` plus autologon). Each clone

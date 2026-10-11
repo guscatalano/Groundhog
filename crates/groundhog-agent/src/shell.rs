@@ -41,7 +41,7 @@ if ($pwsh) { & $pwsh.Source -NoProfile -NonInteractive -Command 'Get-ExecutionPo
 const SET_POLICY: &str = "try { Set-ExecutionPolicy -ExecutionPolicy $policy -Scope LocalMachine -Force } catch [System.Security.SecurityException] { }";
 
 /// Windows Terminal's settings file, from the Store or winget's package.
-fn terminal_settings_path() -> Result<PathBuf> {
+pub(crate) fn terminal_settings_path() -> Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA isn't set")?;
     let package = PathBuf::from(local).join(r"Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe");
     if !package.is_dir() {
@@ -104,7 +104,7 @@ fn merge_terminal(
 }
 
 /// The profile both PowerShells run for this account in every host.
-fn profile_paths() -> Result<Vec<PathBuf>> {
+pub(crate) fn profile_paths() -> Result<Vec<PathBuf>> {
     let docs = ps("[Environment]::GetFolderPath('MyDocuments')", &mut |_| {})?;
     if docs.is_empty() {
         bail!("this account has no Documents folder");
@@ -135,6 +135,22 @@ fn profile_differs(block: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// PowerShell that sets each PowerShell's machine policy back to what it is now.
+pub(crate) fn policy_undo_script() -> Result<String> {
+    let now = ps(READ_POLICY, &mut |_| {})?;
+    let mut lines = now.lines().map(str::trim);
+    let windows = lines.next().unwrap_or("Undefined");
+    let mut script = SET_POLICY.replace("$policy", windows);
+    if let Some(seven) = lines.next() {
+        script += &format!(
+            "\n$pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue\n\
+             if ($pwsh) {{ & $pwsh.Source -NoProfile -NonInteractive -Command '{}' }} else {{ $null = 0 }}",
+            SET_POLICY.replace("$policy", seven)
+        );
+    }
+    Ok(script)
 }
 
 fn module_script(name: &str) -> (String, String) {

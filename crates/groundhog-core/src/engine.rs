@@ -592,7 +592,7 @@ pub enum Outcome {
 }
 
 /// Steps that share a section can share one deferred restart.
-fn section(action: &Action) -> &'static str {
+pub fn section(action: &Action) -> &'static str {
     match action {
         Action::Feature(_) | Action::Capability(_) => "windows features",
         Action::System(_) => "system",

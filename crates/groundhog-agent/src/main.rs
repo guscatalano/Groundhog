@@ -3,6 +3,7 @@
 //! It works on its own, with no host: copy it onto any Windows machine and point it at a
 //! path, URL or zip bundle. Hosts (Sandbox, Hyper-V, Proxmox, ...) only start it and watch.
 
+mod capture;
 mod checks;
 mod defaults;
 mod dev;
@@ -15,6 +16,7 @@ mod shell;
 mod ssh;
 mod startup;
 mod system;
+mod undo;
 mod update;
 
 use std::collections::BTreeSet;
@@ -81,6 +83,35 @@ enum Command {
     /// Save part of this machine's setup to a file a Groundhogfile can use.
     #[command(subcommand)]
     Capture(Capture),
+    /// Look at every step of a Groundhogfile again and say what no longer matches this machine.
+    /// Exits 2 when something drifted. Changes nothing, unless given --fix.
+    Drift(DriftArgs),
+    /// Put back what applying a Groundhogfile changed on this machine, newest change first.
+    Undo(UndoArgs),
+}
+
+#[derive(Args)]
+struct DriftArgs {
+    #[command(flatten)]
+    source: SourceArgs,
+    /// Put back what drifted: run just those steps again.
+    #[arg(long)]
+    fix: bool,
+    /// Print the result as JSON, for monitoring.
+    #[arg(long)]
+    json: bool,
+    /// Secrets for the check (and the fix), as `apply --secrets-file` takes them.
+    #[arg(long, value_name = "FILE")]
+    secrets_file: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct UndoArgs {
+    /// The Groundhogfile, as it was given to `apply` (path or URL).
+    source: String,
+    /// Only list what would be put back.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Subcommand)]
@@ -91,6 +122,12 @@ enum Capture {
         /// Where to write it, next to your Groundhogfile.
         #[arg(default_value = "start2.bin")]
         out: PathBuf,
+    },
+    /// This machine as a starting Groundhogfile: winget apps, features, system, developer and
+    /// desktop settings, PowerShell, PATH, and the Start layout (saved next to it).
+    Machine {
+        /// Where to write it (default: <computer name>.groundhog.yaml here).
+        out: Option<PathBuf>,
     },
 }
 
@@ -228,8 +265,20 @@ fn run(home: &Path, command: Command) -> Result<i32> {
             clean(home)?;
             Ok(0)
         }
+        Command::Drift(args) => {
+            let mut pending = to_pending(&args.source, Vec::new(), false)?;
+            if let Some(file) = &args.secrets_file {
+                pending.secrets = secrets::read_file(file)?;
+            }
+            drift(home, &pending, args.fix, args.json)
+        }
+        Command::Undo(args) => undo(home, &args.source, args.dry_run),
         Command::Capture(Capture::StartPins { out }) => {
             capture_start_pins(&out)?;
+            Ok(0)
+        }
+        Command::Capture(Capture::Machine { out }) => {
+            capture_machine(home, out)?;
             Ok(0)
         }
         Command::Update { to, from } => {
@@ -438,6 +487,7 @@ fn apply(home: &Path, p: &Pending, fresh: bool, verbose: bool) -> Result<Applied
     let steps = engine::plan_with_secrets(&loaded.file, &|name| prints.get(name).cloned());
     let redact = Redactor::new(secrets.values());
     let mut exec = WinExecutor::new(&content, home.join("work"), secrets.clone());
+    exec.undo = Some(undo::Store::for_source(home, &url));
     let state = engine::run(
         &steps,
         &mut exec,
@@ -492,6 +542,55 @@ fn failed_before_start(p: &Pending, e: &anyhow::Error) -> RunState {
 /// Copies this account's Start layout. Start writes it a few seconds after a change, so a file
 /// changed just now is given a moment to settle first.
 fn capture_start_pins(out: &Path) -> Result<()> {
+    let size = copy_start_pins(out)?;
+    let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    println!("Saved this account's Start pins to {} ({size} bytes). In your Groundhogfile:", out.display());
+    println!();
+    println!("desktop:");
+    println!("  start:");
+    println!("    pins-from: {name}");
+    Ok(())
+}
+
+fn capture_machine(home: &Path, out: Option<PathBuf>) -> Result<()> {
+    let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "this-machine".to_owned()).to_ascii_lowercase();
+    let out = out.unwrap_or_else(|| PathBuf::from(format!("{computer}.groundhog.yaml")));
+    let dir = out.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+    println!("Reading this machine's setup (winget can take a minute)...");
+    let pins = match copy_start_pins(&dir.join("start2.bin")) {
+        Ok(_) => Some("start2.bin"),
+        Err(e) => {
+            println!("  Start pins not saved: {e:#}");
+            None
+        }
+    };
+    let text = capture::machine(&home.join("work"), pins)?;
+    std::fs::write(&out, &text).with_context(|| format!("writing {}", out.display()))?;
+    // Read it back the way apply would, so what's written is known to load.
+    let url = source_ref(&out.display().to_string(), None, &std::env::current_dir()?)?.url;
+    let pending = Pending { source: url.to_string(), ..Pending::default() };
+    let session = Session::new(home, &pending, false)?;
+    match session.load(home, &pending) {
+        Ok((_, loaded)) => {
+            println!(
+                "Wrote {} ({} steps{}).",
+                out.display(),
+                plan(&loaded.file).len(),
+                if pins.is_some() { ", with start2.bin" } else { "" }
+            );
+            println!(
+                "Read it through before using it: `groundhog-agent plan --check {}` shows what it would change here (nothing, if it's right).",
+                out.display()
+            );
+        }
+        Err(e) => println!("Wrote {}, but it doesn't load as it is: {e:#}", out.display()),
+    }
+    Ok(())
+}
+
+/// Copies this account's Start layout to `out`, once Start has finished saving it. Returns its
+/// size.
+fn copy_start_pins(out: &Path) -> Result<usize> {
     let from = groundhog_win::desktop::start_layout_path(groundhog_win::desktop::Profile::Current)?;
     let modified = || std::fs::metadata(&from).and_then(|m| m.modified()).ok();
     let fresh =
@@ -501,13 +600,7 @@ fn capture_start_pins(out: &Path) -> Result<()> {
     }
     let bytes = std::fs::read(&from).with_context(|| format!("reading {}", from.display()))?;
     std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
-    let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    println!("Saved this account's Start pins to {} ({} bytes). In your Groundhogfile:", out.display(), bytes.len());
-    println!();
-    println!("desktop:");
-    println!("  start:");
-    println!("    pins-from: {name}");
-    Ok(())
+    Ok(bytes.len())
 }
 
 fn run_pending(home: &Path) -> Result<i32> {
@@ -646,6 +739,172 @@ fn print_plan(home: &Path, p: &Pending, check: bool) -> Result<()> {
     Ok(())
 }
 
+/// What `drift` found, for `--json`.
+#[derive(serde::Serialize)]
+struct DriftReport {
+    source: String,
+    checked: usize,
+    /// Steps that can't be checked without running them (commands, installers from a URL).
+    unchecked: usize,
+    drifted: Vec<DriftedStep>,
+    errors: Vec<DriftedStep>,
+}
+
+#[derive(serde::Serialize)]
+struct DriftedStep {
+    id: String,
+    section: String,
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Checks every step again, whatever earlier runs recorded, and reports what no longer matches.
+fn drift(home: &Path, p: &Pending, fix: bool, json: bool) -> Result<i32> {
+    let session = Session::new(home, &Pending { report: Vec::new(), ..p.clone() }, false)?;
+    let (url, loaded) = session.load(home, p)?;
+    if let Some(required) = &loaded.file.requires_agent
+        && *required > Version::current()
+    {
+        bail!("this Groundhogfile needs groundhog-agent {required} or newer, and this is {}", Version::current());
+    }
+    let secrets = secrets::gather(home, &p.secrets)?;
+    let prints = secrets::fingerprints(home, &secrets)?;
+    let steps = engine::plan_with_secrets(&loaded.file, &|name| prints.get(name).cloned());
+    let content = ContentStore { fetcher: &session.fetcher, cache: &session.cache };
+    let mut exec = WinExecutor::new(&content, home.join("work"), secrets.clone());
+    let mut report =
+        DriftReport { source: url.to_string(), checked: 0, unchecked: 0, drifted: Vec::new(), errors: Vec::new() };
+    let mut drifted = Vec::new();
+    let entry = |s: &engine::Step, error: Option<String>| DriftedStep {
+        id: s.id.clone(),
+        section: groundhog_core::report::label(engine::section(&s.action)).to_owned(),
+        title: s.title.clone(),
+        error,
+    };
+    for step in &steps {
+        use groundhog_core::engine::{Action, Executor as _, Probe};
+        if matches!(
+            step.action,
+            Action::Run(_) | Action::Verify(_) | Action::EnsureWinget | Action::RestartExplorer { .. }
+        ) {
+            continue;
+        }
+        match exec.check(step) {
+            Ok(Probe::Satisfied) => report.checked += 1,
+            Ok(Probe::WouldChange) => {
+                report.checked += 1;
+                report.drifted.push(entry(step, None));
+                drifted.push(step.clone());
+            }
+            Ok(_) => report.unchecked += 1,
+            Err(e) => report.errors.push(entry(step, Some(format!("{e:#}")))),
+        }
+    }
+    let name = url.path_segments().and_then(|mut s| s.next_back()).unwrap_or(url.as_str()).to_owned();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!();
+        if report.drifted.is_empty() {
+            println!("  No drift: the {} steps of {name} that can be checked all still match.", report.checked);
+        } else {
+            println!("  Drifted from {name}:");
+            for d in &report.drifted {
+                println!("    {:<16} {}", d.section, d.title);
+            }
+            println!();
+            println!("  {} of {} checked steps drifted.", report.drifted.len(), report.checked);
+        }
+        for e in &report.errors {
+            println!("  couldn't check: {} ({})", e.title, e.error.as_deref().unwrap_or_default());
+        }
+        if report.unchecked > 0 {
+            println!("  {} steps (commands, some installers) can't be checked without running them.", report.unchecked);
+        }
+        if !report.drifted.is_empty() && !fix {
+            println!("  Put them back with: groundhog-agent drift --fix {}", p.source);
+        }
+        println!();
+    }
+    if !fix || drifted.is_empty() {
+        return Ok(if report.drifted.is_empty() && report.errors.is_empty() { 0 } else { 2 });
+    }
+    // Only the drifted steps, recorded apart from the file's own runs; undo covers them too.
+    exec.undo = Some(undo::Store::for_source(home, &url));
+    let redact = Redactor::new(secrets.values());
+    let state = engine::run(
+        &drifted,
+        &mut exec,
+        &session.reporter,
+        RunOptions {
+            source: &url,
+            sources: loaded.sources,
+            state_path: &state_file(home, &url).with_extension("drift.json"),
+            fresh: true,
+            redact,
+        },
+    )?;
+    Ok(exit_code(state.status))
+}
+
+/// Puts back what applies of `source` changed, from its undo journal.
+fn undo(home: &Path, source: &str, dry_run: bool) -> Result<i32> {
+    let url = source_ref(source, None, &std::env::current_dir()?)?.url;
+    let store = undo::Store::for_source(home, &url);
+    let journal = store.load()?;
+    if journal.entries.is_empty() {
+        println!("Nothing to undo for {source}: no changes from it are noted on this machine.");
+        return Ok(0);
+    }
+    let width = console::width().unwrap_or(100);
+    let line = |mark: &str, step: &str, note: &str| {
+        let text = if note.is_empty() { step.to_owned() } else { format!("{step} ({note})") };
+        let text: String = text.chars().take(width.saturating_sub(12).max(40)).collect();
+        println!("  {mark:<8} {text}");
+    };
+    if dry_run {
+        let mut last = String::new();
+        for e in journal.entries.iter().rev() {
+            // A step that changed several things is one line.
+            if std::mem::replace(&mut last, e.step.clone()) == e.step {
+                continue;
+            }
+            match &e.op {
+                undo::Op::Not { why } => line("keep", &e.step, why),
+                _ => line("undo", &e.step, ""),
+            }
+        }
+        return Ok(0);
+    }
+    if !token::is_elevated() {
+        println!("warning: not running elevated; machine-wide settings can't be put back");
+    }
+    let session = Session::new(home, &Pending { source: url.to_string(), ..Pending::default() }, false)?;
+    let content = ContentStore { fetcher: &session.fetcher, cache: &session.cache };
+    let mut exec = WinExecutor::new(&content, home.join("work"), Default::default());
+    println!();
+    let mut last = (String::new(), String::new());
+    let done = undo::undo(&mut exec, &store, &mut |mark, step, note| {
+        let this = (mark.to_owned(), step.to_owned());
+        if std::mem::replace(&mut last, this.clone()) != this || !note.is_empty() {
+            line(mark, step, note);
+        }
+    })?;
+    // Its steps aren't applied any more: the next apply runs them all.
+    let _ = std::fs::remove_file(state_file(home, &url));
+    println!();
+    let mut summary = format!("  Put back {} change{}", done.undone, if done.undone == 1 { "" } else { "s" });
+    if !done.kept.is_empty() {
+        summary += &format!("; {} can't be undone", done.kept.len());
+    }
+    if !done.failed.is_empty() {
+        summary += &format!("; {} failed (run undo again to retry them)", done.failed.len());
+    }
+    println!("{summary}.");
+    Ok(if done.failed.is_empty() { 0 } else { 1 })
+}
+
 /// What a run leaves in the home folder. `bin` (the installed agent) is kept.
 const RUN_LEFTOVERS: &[&str] = &[
     PENDING_FILE,
@@ -655,6 +914,7 @@ const RUN_LEFTOVERS: &[&str] = &[
     secrets::SALT,
     "last-run",
     "runs",
+    "undo",
     "objects",
     "work",
     "bundles",

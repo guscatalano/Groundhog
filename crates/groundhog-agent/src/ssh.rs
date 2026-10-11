@@ -11,12 +11,12 @@ use crate::exec::powershell;
 
 const OPENSSH: &str = r"C:\Windows\System32\OpenSSH";
 
-fn program_data_ssh() -> PathBuf {
+pub(crate) fn program_data_ssh() -> PathBuf {
     let pd = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
     PathBuf::from(pd).join("ssh")
 }
 
-fn home_ssh() -> Result<PathBuf> {
+pub(crate) fn home_ssh() -> Result<PathBuf> {
     let home = std::env::var_os("USERPROFILE").context("USERPROFILE isn't set")?;
     Ok(PathBuf::from(home).join(".ssh"))
 }
@@ -106,7 +106,7 @@ fn append(path: &PathBuf, lines: &[String]) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
 
-fn key_path(kind: &str) -> Result<PathBuf> {
+pub(crate) fn key_path(kind: &str) -> Result<PathBuf> {
     Ok(home_ssh()?.join(format!("id_{kind}")))
 }
 
