@@ -150,7 +150,7 @@ machine that can't reach GitHub can use a copy from your own share by path inste
 
 | Name | What it sets up |
 | --- | --- |
-| `dev-core` | Git, GitHub CLI, VS Code, PowerShell 7, Windows Terminal, 7-Zip, and jq, ripgrep, fd, fzf, bat and delta for every account. Git defaults for this user: `main` for new repositories, delta for diffs. |
+| `dev-core` | Git, GitHub CLI, VS Code, PowerShell 7, Windows Terminal, 7-Zip, and jq, ripgrep, fd, fzf, bat and delta for every account. Developer Mode, long paths, inline `sudo` and End task on. Git defaults for this user: `main` for new repositories, delta for diffs. |
 | `dotnet` | .NET SDK 10 (LTS) and 8, telemetry and the first-run banner off, global tools on PATH. |
 | `vs` | `dotnet`, plus Visual Studio 2026 Community with the .NET desktop, ASP.NET and web, and C++ desktop workloads (about 20 GB and half an hour). |
 | `node` | Node.js LTS and pnpm. |
@@ -817,6 +817,37 @@ a setting (no lid on a desktop or VM) is left as it is. A plan Windows hides (Ul
 Performance, usually) is copied from its template first. `windows-update` is Group Policy
 values; deferring updates works on Pro, Enterprise and Education. A later file overrides an
 earlier one setting by setting.
+
+## `developer`
+
+```yaml
+developer:
+  developer-mode: true             # Settings > System > For developers
+  long-paths: true                 # paths longer than 260 characters
+  sudo: inline                     # inline | new-window | input-closed | off (Windows 11 24H2 and later)
+  end-task: true                   # "End task" when right-clicking a taskbar button
+  wsl:
+    distros: [Ubuntu-24.04, Debian] # as `wsl --list --online` names them
+    default: Debian
+    config: { memory: 8GB, processors: 4, networkingMode: mirrored }   # .wslconfig's [wsl2] settings
+  vscode:
+    extensions: [ms-python.python, rust-lang.rust-analyzer]            # marketplace ids
+    settings: { editor.fontSize: 14, files.autoSave: afterDelay }      # merged into settings.json
+```
+
+The four switches are machine settings, except End task, which is the agent's own account's
+and shows when Explorer restarts (the run restarts it once at the end).
+
+**WSL**, for the agent's account: listing distributions brings WSL along (its two Windows
+features, which take a restart, and the `Microsoft.WSL` package). Each distribution is
+installed without questions; it starts with only `root`, so make your user on first use
+(`adduser`, then `[user] default=<name>` in its `/etc/wsl.conf`). `config` replaces
+`%USERPROFILE%\.wslconfig`.
+
+**VS Code**, for the agent's account (VS Code itself in `apps`): extensions are installed if
+missing, and `settings` are set key by key in your `settings.json`, keeping every other setting.
+Comments in that file are not kept once it changes. A later file adds settings and overrides
+the ones it names.
 
 ## `language`
 

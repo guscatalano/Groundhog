@@ -148,6 +148,7 @@ impl Executor for WinExecutor<'_> {
                 Ok(Outcome::Done { changed: true })
             }
             Action::Startup(st) => crate::startup::set_startup(st, log).map(|changed| Outcome::Done { changed }),
+            Action::Developer(d) => crate::dev::apply(d, log).map(|changed| Outcome::Done { changed }),
             Action::System(sys) => {
                 let changed = crate::system::apply(sys, log)?;
                 // A new name is the machine's only after a restart.
@@ -281,6 +282,7 @@ impl Executor for WinExecutor<'_> {
             Action::RestartExplorer { .. } => Probe::Unknown,
             Action::Startup(st) => would(crate::startup::startup_differs(st)?),
             Action::System(sys) => would(crate::system::differs(sys)?),
+            Action::Developer(d) => would(crate::dev::differs(d)?),
             Action::FirefoxExtension(e) => {
                 let mut probe = Probe::Satisfied;
                 for r in e.registry() {

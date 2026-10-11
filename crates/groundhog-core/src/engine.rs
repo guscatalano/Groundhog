@@ -15,10 +15,10 @@ use url::Url;
 use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
-    App, Capability, CertScope, Certificate, Check, DefenderExclusion, DesktopShortcut, EnvScope, Feature, FileCopy,
-    FirefoxExtension, FirewallRule, Groundhogfile, LanguageSetting, LockScreen, PowerKnob, Presence, RegistryData,
-    RegistryValue, RunAction, ScreenSaver, Service, ServiceState, StartPins, StartupItem, SystemSetting, TaskRule,
-    TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    App, Capability, CertScope, Certificate, Check, DefenderExclusion, DesktopShortcut, DevSetting, EnvScope, Feature,
+    FileCopy, FirefoxExtension, FirewallRule, Groundhogfile, LanguageSetting, LockScreen, PowerKnob, Presence,
+    RegistryData, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, StartPins, StartupItem, SystemSetting,
+    TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -83,6 +83,7 @@ pub enum Action {
     ScheduledTask(TaskRule),
     FirefoxExtension(FirefoxExtension),
     System(SystemSetting),
+    Developer(DevSetting),
 }
 
 impl Action {
@@ -210,6 +211,15 @@ fn title(action: &Action) -> String {
         Action::DesktopShortcut(d) => format!("take the {} shortcut off the desktop", d.name),
         Action::RestartExplorer { .. } => "restart Explorer to show the taskbar and desktop now".to_owned(),
         Action::System(s) => system_title(s),
+        Action::Developer(d) => match d {
+            DevSetting::WslDistro { name } => format!("install the {name} WSL distribution"),
+            DevSetting::WslDefault { name } => format!("make {name} the default WSL distribution"),
+            DevSetting::VsCodeExtension { id } => format!("add the {id} VS Code extension"),
+            DevSetting::VsCodeSettings { values } => {
+                let keys: Vec<&str> = values.keys().map(String::as_str).collect();
+                format!("set VS Code's {}", keys.join(", "))
+            }
+        },
         Action::FirefoxExtension(e) if e.state.is_present() => {
             format!("add {} to Firefox{}", e.name, if e.locked { " (locked)" } else { "" })
         }
@@ -372,6 +382,8 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     }
     actions.extend(file.apps.iter().cloned().map(Action::App));
     actions.extend(file.files.iter().cloned().map(Action::File));
+    // After apps, which install WSL and VS Code.
+    actions.extend(file.developer.iter().cloned().map(Action::Developer));
     actions.extend(file.env.iter().map(|(name, v)| Action::Env {
         name: name.clone(),
         value: v.value.clone(),
@@ -401,7 +413,11 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     for f in file.files.iter().filter(|f| f.to == crate::loader::TASKBAR_POLICY_FILE) {
         shows.push_str(f.content.as_deref().unwrap_or_default());
     }
-    let desktop = |k: &str| k == crate::loader::DESKTOP_ICONS_KEY || k == crate::loader::DESKTOP_VIEW_KEY;
+    let desktop = |k: &str| {
+        k == crate::loader::DESKTOP_ICONS_KEY
+            || k == crate::loader::DESKTOP_VIEW_KEY
+            || k == crate::loader::TASKBAR_DEVELOPER_KEY
+    };
     for r in file.registry.iter().filter(|r| desktop(&r.key)) {
         shows.push_str(&format!("{}={:?};", r.name.as_deref().unwrap_or_default(), r.data));
     }
@@ -505,6 +521,7 @@ fn section(action: &Action) -> &'static str {
     match action {
         Action::Feature(_) | Action::Capability(_) => "windows features",
         Action::System(_) => "system",
+        Action::Developer(_) => "developer",
         Action::User(_) => "users",
         Action::RemoveApp { .. } => "remove apps",
         Action::EnsureWinget | Action::App(_) => "apps",

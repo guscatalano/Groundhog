@@ -4,6 +4,25 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.26.0] - 2026-10-11
+
+### Added
+- **`developer:`**:
+  - Developer Mode, long paths, `sudo` (inline, new window, input closed or off) and End task
+    on the taskbar.
+  - **WSL** distributions installed without questions, the default distribution, and
+    `.wslconfig`. Listing distributions brings WSL itself (its features and package).
+  - **VS Code** extensions, and settings merged into your `settings.json`.
+  ```yaml
+  developer:
+    developer-mode: true
+    wsl: { distros: [Ubuntu-24.04], config: { memory: 8GB } }
+    vscode: { extensions: [ms-python.python], settings: { editor.fontSize: 14 } }
+  ```
+
+### Changed
+- `groundhog:dev-core` turns on Developer Mode, long paths, inline `sudo` and End task.
+
 ## [0.25.0] - 2026-10-11
 
 ### Added

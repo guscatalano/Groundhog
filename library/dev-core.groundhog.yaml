@@ -6,6 +6,16 @@
 #
 # Or combine:  extends: [groundhog:python, groundhog:node]  (dev-core comes once)
 
+agent: ">=0.26.0"
+
+# Settings > System > For developers: Developer Mode (symlinks and sideloading without
+# elevation), paths longer than 260 characters, sudo in the same window, End task on the taskbar.
+developer:
+  developer-mode: true
+  long-paths: true
+  sudo: inline
+  end-task: true
+
 apps:
   - id: Git.Git
     args: --scope machine

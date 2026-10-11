@@ -16,7 +16,7 @@ use crate::github;
 use crate::library;
 use crate::model::{
     App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, DesktopShortcut,
-    EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirefoxExtension, FirewallProtocol, FirewallRule,
+    DevSetting, EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirefoxExtension, FirewallProtocol, FirewallRule,
     Groundhogfile, HiveScope, InputLanguage, LanguageSetting, LockScreen, Password, PathEntry, PowerKnob, Presence,
     RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell, SourceRef,
     StartPins, StartupItem, SystemSetting, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
@@ -507,10 +507,11 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         scheduled_tasks,
         firefox,
         system,
+        developer,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
-    let apps = apps.into_iter().map(|a| resolve_app(base, a)).collect::<Result<_>>()?;
+    let mut apps: Vec<App> = apps.into_iter().map(|a| resolve_app(base, a)).collect::<Result<_>>()?;
     let mut files: Vec<FileCopy> = files.into_iter().map(|f| resolve_file(base, f)).collect::<Result<_>>()?;
 
     if let Some(bad) = env.keys().find(|k| k.is_empty() || k.contains('=')) {
@@ -587,11 +588,17 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         .map(|(i, u)| resolve_user(u).with_context(|| format!("users[{i}]")))
         .collect::<Result<_>>()?;
 
-    let features = features
+    let mut features: Vec<Feature> = features
         .into_iter()
         .enumerate()
         .map(|(i, f)| resolve_feature(base, f).with_context(|| format!("features[{i}]")))
         .collect::<Result<_>>()?;
+    let developer = match developer {
+        Some(d) => {
+            resolve_developer(base, d, &mut registry, &mut files, &mut features, &mut apps).context("developer")?
+        }
+        None => Vec::new(),
+    };
     let capabilities = capabilities
         .into_iter()
         .enumerate()
@@ -663,6 +670,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         scheduled_tasks,
         firefox_extensions,
         system,
+        developer,
         services,
         firewall,
         run,
@@ -1917,6 +1925,117 @@ fn language_tag(tag: &str) -> Result<String> {
     Ok(tag.to_owned())
 }
 
+/// `developer:`: switches as registry values; WSL brings what it needs (its two Windows
+/// features and package) and its `.wslconfig`; distributions and VS Code are steps.
+fn resolve_developer(
+    base: &Url,
+    d: raw::DeveloperFull,
+    registry: &mut Vec<RegistryValue>,
+    files: &mut Vec<FileCopy>,
+    features: &mut Vec<Feature>,
+    apps: &mut Vec<App>,
+) -> Result<Vec<DevSetting>> {
+    let machine = [HiveScope::CurrentUser];
+    if let Some(on) = d.developer_mode {
+        registry.push(dword(
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock",
+            "AllowDevelopmentWithoutDevLicense",
+            u32::from(on),
+            &machine,
+        ));
+    }
+    if let Some(on) = d.long_paths {
+        registry.push(dword(
+            r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem",
+            "LongPathsEnabled",
+            u32::from(on),
+            &machine,
+        ));
+    }
+    if let Some(mode) = d.sudo {
+        let value = match mode {
+            raw::SudoMode::Off => 0,
+            raw::SudoMode::NewWindow => 1,
+            raw::SudoMode::InputClosed => 2,
+            raw::SudoMode::Inline => 3,
+        };
+        registry.push(dword(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo", "Enabled", value, &machine));
+    }
+    if let Some(on) = d.end_task {
+        registry.push(dword(TASKBAR_DEVELOPER_KEY, "TaskbarEndTask", u32::from(on), &machine));
+    }
+
+    let mut out = Vec::new();
+    let plain = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c));
+    if let Some(w) = d.wsl {
+        let distros = w.distros.unwrap_or_default();
+        for name in &distros {
+            if !plain(name) {
+                bail!("wsl distro '{name}' should be a name `wsl --list --online` shows, like Ubuntu-24.04");
+            }
+            out.push(DevSetting::WslDistro { name: name.clone() });
+        }
+        if let Some(name) = w.default {
+            if !plain(&name) {
+                bail!("wsl default '{name}' should be a distribution's name");
+            }
+            out.push(DevSetting::WslDefault { name });
+        }
+        if let Some(config) = w.config {
+            let mut text = String::from("# Written by Groundhog (developer.wsl.config)\n[wsl2]\n");
+            for (key, value) in config {
+                if !plain(&key) {
+                    bail!("wsl config '{key}' isn't a .wslconfig setting's name");
+                }
+                let value = match value {
+                    serde_json::Value::String(s) => s,
+                    serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.to_string(),
+                    _ => bail!("wsl config {key}: a word, number or true/false"),
+                };
+                text.push_str(&format!("{key}={value}\n"));
+            }
+            files.push(FileCopy {
+                from: None,
+                content: Some(text),
+                to: r"%USERPROFILE%\.wslconfig".to_owned(),
+                sha256: None,
+                resolved: None,
+                extract: false,
+                strip: 0,
+                release: None,
+                state: Presence::Present,
+            });
+        }
+        // WSL itself: its features (a restart) and its package.
+        if !distros.is_empty() {
+            for name in ["Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform"] {
+                if !features.iter().any(|f| f.name.eq_ignore_ascii_case(name)) {
+                    features.push(resolve_feature(base, raw::StringOr::Short(name.to_owned()))?);
+                }
+            }
+            if !apps.iter().any(|a| a.id().eq_ignore_ascii_case("Microsoft.WSL")) {
+                apps.push(resolve_app(base, raw::App::Short("Microsoft.WSL".to_owned()))?);
+            }
+        }
+    }
+    if let Some(v) = d.vscode {
+        for id in v.extensions.unwrap_or_default() {
+            if !id.contains('.') || !plain(&id) {
+                bail!("VS Code extension '{id}' should be its marketplace id, like ms-python.python");
+            }
+            out.push(DevSetting::VsCodeExtension { id });
+        }
+        if let Some(values) = v.settings.filter(|s| !s.is_empty()) {
+            out.push(DevSetting::VsCodeSettings { values });
+        }
+    }
+    Ok(out)
+}
+
+/// Settings > System > For developers, the taskbar's part.
+pub(crate) const TASKBAR_DEVELOPER_KEY: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings";
+
 /// `system:` as one step per setting; Windows Update's are policy values.
 fn resolve_system(s: raw::SystemFull, registry: &mut Vec<RegistryValue>) -> Result<Vec<SystemSetting>> {
     let mut out = Vec::new();
@@ -2365,6 +2484,23 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         base.system.into_iter().filter(|b| !top.system.iter().any(|t| t.key() == b.key())).collect();
     system.extend(top.system);
     system.sort_by_key(SystemSetting::order);
+    // VS Code settings add up, key by key, the top file's value winning; the rest by setting.
+    let mut top_developer = top.developer;
+    if let Some(mut merged) = base.developer.iter().find_map(|d| match d {
+        DevSetting::VsCodeSettings { values } => Some(values.clone()),
+        _ => None,
+    }) {
+        for d in &mut top_developer {
+            if let DevSetting::VsCodeSettings { values } = d {
+                merged.append(values);
+                *values = merged.clone();
+            }
+        }
+    }
+    let mut developer: Vec<DevSetting> =
+        base.developer.into_iter().filter(|b| !top_developer.iter().any(|t| t.key() == b.key())).collect();
+    developer.extend(top_developer);
+    developer.sort_by_key(DevSetting::order);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -2395,6 +2531,7 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         scheduled_tasks,
         firefox_extensions,
         system,
+        developer,
         services,
         firewall,
         run,
@@ -2940,6 +3077,40 @@ firewall:
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
             assert!(err.contains(why), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn developer_settings() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/base.yaml",
+                "developer:\n  developer-mode: true\n  long-paths: true\n  sudo: inline\n  end-task: true\n  wsl: { distros: [Ubuntu-24.04], default: Ubuntu-24.04, config: { memory: 4GB, processors: 2, networkingMode: mirrored } }\n  vscode: { extensions: [ms-python.python], settings: { editor.fontSize: 14, files.autoSave: afterDelay } }",
+            )
+            .with("https://cfg.test/top.yaml", "extends: base.yaml\ndeveloper: { vscode: { settings: { editor.fontSize: 16 } } }")
+            .with("https://cfg.test/bad.yaml", "developer: { vscode: { extensions: ['not an id'] } }");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let value = |name: &str| g.registry.iter().find(|r| r.name.as_deref() == Some(name)).map(|r| r.data.clone());
+        assert_eq!(value("AllowDevelopmentWithoutDevLicense"), Some(RegistryData::Dword(1)));
+        assert_eq!(value("LongPathsEnabled"), Some(RegistryData::Dword(1)));
+        assert_eq!(value("Enabled"), Some(RegistryData::Dword(3)), "sudo inline");
+        assert_eq!(value("TaskbarEndTask"), Some(RegistryData::Dword(1)));
+        // WSL brings its features and package; its config is a file.
+        assert!(g.features.iter().any(|f| f.name == "VirtualMachinePlatform"));
+        assert!(g.apps.iter().any(|a| a.id() == "Microsoft.WSL"));
+        let config = g.files.iter().find(|f| f.to.ends_with(".wslconfig")).unwrap();
+        assert!(
+            config.content.as_deref().unwrap().contains("[wsl2]\nmemory=4GB\nnetworkingMode=mirrored\nprocessors=2\n")
+        );
+        // VS Code settings add up, the top file's value winning.
+        let settings = g.developer.iter().find_map(|d| match d {
+            DevSetting::VsCodeSettings { values } => Some(values.clone()),
+            _ => None,
+        });
+        let settings = settings.unwrap();
+        assert_eq!(settings["editor.fontSize"], serde_json::json!(16));
+        assert_eq!(settings["files.autoSave"], serde_json::json!("afterDelay"));
+        assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
     }
 
     #[test]

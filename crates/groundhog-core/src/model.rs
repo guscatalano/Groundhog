@@ -43,6 +43,7 @@ pub struct Groundhogfile {
     pub scheduled_tasks: Vec<TaskRule>,
     pub firefox_extensions: Vec<FirefoxExtension>,
     pub system: Vec<SystemSetting>,
+    pub developer: Vec<DevSetting>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -276,6 +277,42 @@ pub struct TrayIcon {
     pub program: String,
     /// On the taskbar (`true`) or in the overflow.
     pub shown: bool,
+}
+
+/// One of the `developer:` settings that isn't a plain registry value; each is its own step.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "setting", rename_all = "kebab-case")]
+pub enum DevSetting {
+    /// A WSL distribution installed for the agent's account (`wsl --install <name>`).
+    WslDistro { name: String },
+    /// The distribution `wsl` starts with no `-d`.
+    WslDefault { name: String },
+    /// A VS Code extension, by its marketplace id (`ms-python.python`), for the agent's account.
+    VsCodeExtension { id: String },
+    /// Settings merged into the agent's account's VS Code `settings.json`.
+    VsCodeSettings { values: BTreeMap<String, serde_json::Value> },
+}
+
+impl DevSetting {
+    /// What a later file replaces.
+    pub fn key(&self) -> String {
+        match self {
+            DevSetting::WslDistro { name } => format!("wsl {}", name.to_ascii_lowercase()),
+            DevSetting::WslDefault { .. } => "wsl default".to_owned(),
+            DevSetting::VsCodeExtension { id } => format!("vscode {}", id.to_ascii_lowercase()),
+            DevSetting::VsCodeSettings { .. } => "vscode settings".to_owned(),
+        }
+    }
+
+    /// Distributions before the default; extensions before settings.
+    pub fn order(&self) -> u8 {
+        match self {
+            DevSetting::WslDistro { .. } => 0,
+            DevSetting::WslDefault { .. } => 1,
+            DevSetting::VsCodeExtension { .. } => 2,
+            DevSetting::VsCodeSettings { .. } => 3,
+        }
+    }
 }
 
 /// One of the machine settings under `system:`; each is its own step.
@@ -992,6 +1029,43 @@ pub(crate) mod raw {
         pub scheduled_tasks: Option<TasksFull>,
         pub firefox: Option<FirefoxFull>,
         pub system: Option<SystemFull>,
+        pub developer: Option<DeveloperFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct DeveloperFull {
+        pub developer_mode: Option<bool>,
+        pub long_paths: Option<bool>,
+        pub sudo: Option<SudoMode>,
+        pub end_task: Option<bool>,
+        pub wsl: Option<WslFull>,
+        pub vscode: Option<VsCodeFull>,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum SudoMode {
+        Inline,
+        NewWindow,
+        InputClosed,
+        Off,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct WslFull {
+        pub distros: Option<Vec<String>>,
+        pub default: Option<String>,
+        /// `.wslconfig`'s `[wsl2]` settings, by their own names (`memory`, `networkingMode`).
+        pub config: Option<BTreeMap<String, serde_json::Value>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct VsCodeFull {
+        pub extensions: Option<Vec<String>>,
+        pub settings: Option<BTreeMap<String, serde_json::Value>>,
     }
 
     #[derive(Debug, Deserialize)]
