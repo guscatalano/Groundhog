@@ -4,6 +4,19 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.24.0] - 2026-10-11
+
+### Changed
+- **`remove-apps` takes the names you see**, such as `OneDrive`, `Microsoft Teams`,
+  `Game Bar` or `Xbox`, as well as package names. It now also removes classic programs:
+  - each one is uninstalled silently with its own uninstaller;
+  - one without a silent uninstaller says so;
+  - OneDrive is also taken out of the Default profile, so new accounts don't get it.
+
+  Parts of Windows that can't be removed are skipped. Removals get their own line in
+  `apply`'s output ("Removed apps"), and their steps read "remove app X".
+- The `neon` example removes OneDrive, Teams, the Xbox app and Game Bar.
+
 ## [0.23.0] - 2026-10-11
 
 ### Added

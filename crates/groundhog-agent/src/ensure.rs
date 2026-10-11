@@ -259,27 +259,80 @@ pub fn defender(e: &DefenderExclusion, check: bool, log: &mut dyn FnMut(&str)) -
     run("Defender exclusion", DEFENDER, &params, check, log)
 }
 
-/// Built-in Store apps: removed for every existing user and unprovisioned, so new profiles
-/// don't get them either.
+/// Apps out, by package name, by the name Start shows, or (classic programs) by the name in
+/// Settings > Apps, with or without "Microsoft " in front:
+/// - Store apps: removed for every existing user and unprovisioned, so new profiles don't get
+///   them either. Parts of Windows that can't be removed are skipped.
+/// - Classic programs: their own uninstaller, run silently (its quiet command, or msiexec /x),
+///   for programs installed for everyone and for the agent's own account.
+/// - OneDrive also comes off the Default profile, which installs it for each new account.
 const REMOVE_APP: &str = r##"
 $pattern = $env:GH_NAME
-$provisioned = @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like $pattern })
-$installed = @(Get-AppxPackage -AllUsers | Where-Object { $_.Name -like $pattern })
-if ($provisioned.Count -or $installed.Count) {
-    if ($env:GH_CHECK) {
-        'GROUNDHOG:WOULD-CHANGE'
-    } else {
-        foreach ($p in $provisioned) {
-            Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -AllUsers | Out-Null
-            "unprovisioned $($p.DisplayName)"
-        }
-        foreach ($a in $installed) {
-            try { Remove-AppxPackage -Package $a.PackageFullName -AllUsers; "removed $($a.PackageFullName)" }
-            catch { "couldn't remove $($a.PackageFullName): $($_.Exception.Message)" }
-        }
-        'GROUNDHOG:CHANGED'
-    }
+$failed = @()
+$like = { param($name) $name -and ($name -like $pattern -or $name -like "Microsoft $pattern") }
+$startMenu = @{}
+Get-StartApps | ForEach-Object { $startMenu[($_.AppID -split '!')[0]] = $_.Name }
+$byStart = { param($family) $n = $startMenu[$family]; $n -and $n -like $pattern }
+
+$provisioned = @(Get-AppxProvisionedPackage -Online | Where-Object {
+    $_.DisplayName -like $pattern -or (& $byStart (($_.PackageName -split '_')[0] + '_' + ($_.PackageName -split '_')[-1]))
+})
+$installed = @(Get-AppxPackage -AllUsers | Where-Object {
+    -not $_.NonRemovable -and ($_.Name -like $pattern -or (& $byStart $_.PackageFamilyName))
+})
+$keys = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+$programs = @(foreach ($k in $keys) {
+    Get-ChildItem $k -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } |
+        Where-Object { (& $like $_.DisplayName) -and -not $_.SystemComponent -and ($_.QuietUninstallString -or $_.UninstallString) }
+})
+# New accounts get OneDrive from the Default profile's Run key, at their first sign-in.
+$oneDrive = & $like 'OneDrive'
+$defaultRun = $null
+$loaded = $false
+if ($oneDrive) {
+    # Through cmd, so reg's messages never reach PowerShell's error stream.
+    cmd.exe /d /c "reg load HKU\GroundhogDefault `"$env:SystemDrive\Users\Default\NTUSER.DAT`" >nul 2>&1"
+    $loaded = $LASTEXITCODE -eq 0
+    $defaultRun = 'Registry::HKEY_USERS\GroundhogDefault\Software\Microsoft\Windows\CurrentVersion\Run'
+    if (-not (Get-ItemProperty $defaultRun -ErrorAction SilentlyContinue).OneDriveSetup) { $defaultRun = $null }
 }
+try {
+    if (-not ($provisioned.Count -or $installed.Count -or $programs.Count -or $defaultRun)) { return }
+    if ($env:GH_CHECK) { 'GROUNDHOG:WOULD-CHANGE'; return }
+    foreach ($p in $provisioned) {
+        Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -AllUsers | Out-Null
+        "unprovisioned $($p.DisplayName)"
+    }
+    foreach ($a in $installed) {
+        try { Remove-AppxPackage -Package $a.PackageFullName -AllUsers; "removed $($a.PackageFullName)" }
+        catch { "couldn't remove $($a.PackageFullName): $($_.Exception.Message)" }
+    }
+    foreach ($p in $programs) {
+        $command = $p.QuietUninstallString
+        if (-not $command -and $p.UninstallString -match '(?i)msiexec(\.exe)?\s+/[IX]\s*(\{[0-9A-F-]+\})') {
+            $command = "msiexec.exe /x $($Matches[2]) /qn /norestart"
+        } elseif (-not $command -and $p.UninstallString -match '(?i)OneDriveSetup\.exe"?\s+/uninstall') {
+            $command = $p.UninstallString   # already silent
+        }
+        if (-not $command) {
+            $failed += "$($p.DisplayName) has no silent uninstaller; uninstall it with apps: { id: <winget id>, state: absent }"
+            continue
+        }
+        "uninstalling $($p.DisplayName)"
+        $code = (Start-Process cmd.exe -ArgumentList "/d /c `"$command`"" -Wait -PassThru -WindowStyle Hidden).ExitCode
+        if ($code -notin 0, 3010, 1605) { $failed += "$($p.DisplayName)'s uninstaller exited with $code" }
+    }
+    if ($defaultRun) {
+        Remove-ItemProperty $defaultRun -Name OneDriveSetup
+        'new accounts no longer get OneDrive'
+    }
+    if (-not $failed) { 'GROUNDHOG:CHANGED' }
+} finally {
+    if ($loaded) { [gc]::Collect(); cmd.exe /d /c "reg unload HKU\GroundhogDefault >nul 2>&1" }
+}
+if ($failed) { $failed; exit 1 }
 "##;
 
 pub fn remove_app(name: &str, check: bool, log: &mut dyn FnMut(&str)) -> Result<bool> {

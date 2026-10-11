@@ -180,7 +180,7 @@ fn title(action: &Action) -> String {
                 format!("stop excluding {kind} {} from Defender", e.value)
             }
         }
-        Action::RemoveApp { name } => format!("remove built-in app {name}"),
+        Action::RemoveApp { name } => format!("remove app {name}"),
         Action::Wallpaper(w) => {
             let mut parts = Vec::new();
             if let Some(from) = &w.from {
@@ -472,7 +472,8 @@ fn section(action: &Action) -> &'static str {
     match action {
         Action::Feature(_) | Action::Capability(_) => "windows features",
         Action::User(_) => "users",
-        Action::EnsureWinget | Action::App(_) | Action::RemoveApp { .. } => "apps",
+        Action::RemoveApp { .. } => "remove apps",
+        Action::EnsureWinget | Action::App(_) => "apps",
         Action::Certificate(_) => "certificates",
         Action::Wallpaper(_)
         | Action::Theme(_)
@@ -907,7 +908,7 @@ mod tests {
             [
                 "add root.cer to machine Root certificates",
                 "exclude path C:\\src from Defender",
-                "remove built-in app Microsoft.BingNews",
+                "remove app Microsoft.BingNews",
                 "ensure winget is available",
                 "install or upgrade Git.Git (winget)",
                 "service Spooler: stopped",

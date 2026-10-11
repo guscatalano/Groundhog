@@ -407,12 +407,27 @@ Details are in `%ProgramData%\groundhog\work\dism.log` and `C:\Windows\Logs\CBS\
 
 ```yaml
 remove-apps:
-  - Microsoft.BingNews              # package names, as Get-AppxPackage shows them
+  - OneDrive                        # by the name Start or Settings > Apps shows
+  - Microsoft Teams
+  - Game Bar                        # Xbox Game Bar
+  - Xbox                            # the Xbox app
+  - Microsoft.BingNews              # or by package name, as Get-AppxPackage shows them
   - Clipchamp.*                     # wildcards work
 ```
 
-Built-in Store apps are removed for every existing user and unprovisioned, so profiles created
-later don't get them either. Removal runs before `apps`.
+Each name is matched against a Store app's package name and its name in Start, and against
+the name of a classic program in Settings > Apps, with or without "Microsoft " in front.
+
+- **Store apps** are removed for every existing user and unprovisioned, so accounts created
+  later don't get them either. Parts of Windows that can't be removed are skipped.
+- **Classic programs** are uninstalled silently with their own uninstaller: its quiet
+  command, `msiexec /x` for an MSI, or OneDrive's. One with no silent uninstaller fails the
+  step; remove it with `apps: { id: <winget id>, state: absent }` instead. A program
+  installed per account (OneDrive) comes off the agent's own account.
+- **OneDrive** also comes off the Default profile, which would otherwise install it for each
+  new account at its first sign-in.
+
+Removal runs before `apps`.
 
 ## `apps`
 

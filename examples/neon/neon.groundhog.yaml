@@ -6,10 +6,13 @@
 #
 # Everything shows at once (Explorer restarts once at the end, for the taskbar and desktop).
 
-agent: ">=0.22.0"
+agent: ">=0.24.0"
 
 # No setup nags, tips, ads, widgets or web results in search.
 extends: groundhog:quiet-windows
+
+# Not on this machine: OneDrive (and its backup nags), Teams, Xbox and its Game Bar.
+remove-apps: [OneDrive, Microsoft Teams, Game Bar, Xbox]
 
 apps:
   - id: Microsoft.VisualStudioCode
@@ -57,13 +60,7 @@ desktop:
     remove: [Microsoft Edge]
   notifications:
     sounds: false
-  tray:
-    hide: [OneDrive.exe]
   scope: [current-user, default-user]
-
-# Teams stays installed, but doesn't start with Windows.
-startup:
-  disable: [Microsoft Teams]
 
 run:
   - command: |
