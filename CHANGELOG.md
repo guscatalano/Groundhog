@@ -4,6 +4,14 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.31.1] - 2026-10-11
+
+### Fixed
+- The same code as 0.31.0, built again. Microsoft Defender flagged 0.31.0's agent download as
+  `Trojan:Win32/Bearfoos.B!ml`, a machine-learning false positive, and stopped it mid-run.
+  Builds that differ from it only in their timestamp run clean, so 0.31.0 is better avoided:
+  `apply.ps1` now fetches this one.
+
 ## [0.31.0] - 2026-10-11
 
 ### Added
