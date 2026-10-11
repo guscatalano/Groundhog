@@ -8,8 +8,13 @@
 # CloudContent policies at the end only take effect on Enterprise and Education (and are
 # harmless elsewhere); the per-user values cover Home and Pro.
 
-# Widgets is a policy only Group Policy itself may write.
-agent: ">=0.16.0"
+# Widgets is a policy only Group Policy itself may write (0.16.0); scheduled-tasks (0.22.0).
+agent: ">=0.22.0"
+
+# The tasks behind Windows' tips and "suggested" content. Disabled, not deleted: Explorer
+# recreates them when they're missing, but leaves a disabled one alone.
+scheduled-tasks:
+  disable: ['\SoftLanding\*']
 
 desktop:
   taskbar:

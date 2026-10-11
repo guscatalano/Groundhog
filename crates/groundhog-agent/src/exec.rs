@@ -147,6 +147,8 @@ impl Executor for WinExecutor<'_> {
                 run_ps(&shortcut_scripts(d).1, log)?;
                 Ok(Outcome::Done { changed: true })
             }
+            Action::Startup(st) => crate::startup::set_startup(st, log).map(|changed| Outcome::Done { changed }),
+            Action::ScheduledTask(t) => crate::startup::set_task(t, log).map(|changed| Outcome::Done { changed }),
             Action::RestartExplorer { .. } => {
                 // Only this session's Explorer: Windows starts it again by itself.
                 let script = "$me = (Get-Process -Id $PID).SessionId\n\
@@ -259,6 +261,8 @@ impl Executor for WinExecutor<'_> {
             Action::Language(l) => would(language_differs(l)?),
             Action::DesktopShortcut(d) => would(shortcut_differs(d)?),
             Action::RestartExplorer { .. } => Probe::Unknown,
+            Action::Startup(st) => would(crate::startup::startup_differs(st)?),
+            Action::ScheduledTask(t) => would(crate::startup::task_differs(t)?),
             Action::TrayIcon(t) => match desktop::set_tray_icon(&t.program, t.shown, true)? {
                 desktop::TrayIcon::NotSeenYet => Probe::Unknown,
                 desktop::TrayIcon::AsWanted => Probe::Satisfied,

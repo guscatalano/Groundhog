@@ -7,6 +7,7 @@ mod checks;
 mod ensure;
 mod exec;
 mod secrets;
+mod startup;
 mod update;
 
 use std::collections::BTreeSet;

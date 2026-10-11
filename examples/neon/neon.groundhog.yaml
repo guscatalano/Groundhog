@@ -6,7 +6,7 @@
 #
 # Everything shows at once (Explorer restarts once at the end, for the taskbar and desktop).
 
-agent: ">=0.21.0"
+agent: ">=0.22.0"
 
 # No setup nags, tips, ads, widgets or web results in search.
 extends: groundhog:quiet-windows
@@ -60,6 +60,10 @@ desktop:
   tray:
     hide: [OneDrive.exe]
   scope: [current-user, default-user]
+
+# Teams stays installed, but doesn't start with Windows.
+startup:
+  disable: [Microsoft Teams]
 
 run:
   - command: |

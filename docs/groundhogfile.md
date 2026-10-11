@@ -655,6 +655,7 @@ desktop:
       - { name: VS Code, target: 'C:\Program Files\Microsoft VS Code\Code.exe' }
       - { name: Logs, target: '%SystemRoot%\explorer.exe', args: 'C:\Logs', icon: '%SystemRoot%\System32\shell32.dll,4' }
     remove: [Microsoft Edge]        # shortcuts taken off, by name
+    auto-arrange: true              # the default when icons are set here
   scope: [current-user, default-user]
 ```
 
@@ -711,7 +712,8 @@ Panel) are shown or hidden per user, like the other `desktop` settings. Shortcut
 on the desktop every account shares (`C:\Users\Public\Desktop`), with `%VARS%` in `target` and
 `icon` expanded on the machine; `remove` takes shortcuts off it and off the agent's own
 desktop. Removing `Microsoft Edge` also sets Edge's update policy that otherwise puts the
-shortcut back at each Edge update.
+shortcut back at each Edge update. With icons coming and going, the desktop is set to
+auto-arrange them in order (`auto-arrange: false` to keep them where they are).
 
 **Start's pinned apps** come from a layout file. Windows 11 takes a pin *list* only from MDM
 (Intune and the like): it ignores one written as a policy or into the Default profile, and
@@ -801,6 +803,38 @@ feature does (`--reboot` restarts and continues by itself).
 many command-line tools, and breaks some old programs that assume a national code page;
 `false` puts back the system locale's own code pages. A later file overrides an earlier one
 setting by setting.
+
+## `startup` and `scheduled-tasks`
+
+What starts when you sign in, and scheduled tasks: turned off, back on, or (tasks) deleted.
+
+```yaml
+startup:
+  disable: [OneDrive, Microsoft Teams]       # as Task Manager's Startup apps lists them
+  enable: [Windows Security notification icon]
+scheduled-tasks:
+  disable:
+    - 'OneDrive Reporting Task-*'            # by name; * and ? are wildcards
+    - '\Microsoft\XblGameSave\*'             # \Folder\Name: by the whole path
+  remove: ['\Vendor\Updater']
+  # enable: [...]
+```
+
+**Startup** entries are matched by any of their names: a Run value's name (`OneDrive`), the
+program's description, which is what Task Manager shows (`Microsoft OneDrive`), a Startup folder
+shortcut's name, or a packaged app's name (`MSTeams`) or Start menu name (`Microsoft Teams`).
+They're switched off the way Task Manager does it, so they show there as disabled and can be
+switched back on there; nothing is deleted. A packaged app whose startup is set by a policy is
+left alone.
+
+**Scheduled tasks** are matched by name, or by their whole path when the pattern starts with
+`\`. `disable` is usually the better choice: some tasks are recreated when missing (Windows'
+SoftLanding tips tasks, each time Explorer starts), but a disabled one stays disabled. A few of
+Windows' own tasks refuse changes even from administrators; the step fails and names them.
+
+Both are checked again on every apply, since programs put their entries and tasks back when
+they update, and both run after `apps` and `run`, which create them. A name that matches
+nothing is fine (the program isn't installed); `--verbose` says so.
 
 ## `services`
 

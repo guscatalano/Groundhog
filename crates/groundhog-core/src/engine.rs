@@ -17,7 +17,8 @@ use crate::loader::LoadedSource;
 use crate::model::{
     App, Capability, CertScope, Certificate, Check, DefenderExclusion, DesktopShortcut, EnvScope, Feature, FileCopy,
     FirewallRule, Groundhogfile, LanguageSetting, LockScreen, Presence, RegistryData, RegistryValue, RunAction,
-    ScreenSaver, Service, ServiceState, StartPins, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    ScreenSaver, Service, ServiceState, StartPins, StartupItem, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User,
+    Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -78,6 +79,8 @@ pub enum Action {
         shows: String,
     },
     Language(LanguageSetting),
+    Startup(StartupItem),
+    ScheduledTask(TaskRule),
 }
 
 impl Action {
@@ -92,6 +95,8 @@ impl Action {
             // Windows makes a program's tray entry only once it shows an icon, maybe after
             // this apply; looking again each time is cheap and catches it then.
             Action::TrayIcon(_) => true,
+            // Programs put their startup entries and tasks back when they update.
+            Action::Startup(_) | Action::ScheduledTask(_) => true,
             _ => false,
         }
     }
@@ -202,6 +207,13 @@ fn title(action: &Action) -> String {
         Action::DesktopShortcut(d) if d.state.is_present() => format!("put a {} shortcut on the desktop", d.name),
         Action::DesktopShortcut(d) => format!("take the {} shortcut off the desktop", d.name),
         Action::RestartExplorer { .. } => "restart Explorer to show the taskbar and desktop now".to_owned(),
+        Action::Startup(s) if s.enabled => format!("let {} start at sign-in", s.name),
+        Action::Startup(s) => format!("stop {} starting at sign-in", s.name),
+        Action::ScheduledTask(t) => match t.state {
+            TaskState::Enabled => format!("enable scheduled tasks {}", t.name),
+            TaskState::Disabled => format!("disable scheduled tasks {}", t.name),
+            TaskState::Absent => format!("delete scheduled tasks {}", t.name),
+        },
         Action::Language(l) => match l {
             LanguageSetting::Input { languages } => {
                 let tags: Vec<&str> = languages.iter().map(|l| l.tag.as_str()).collect();
@@ -378,12 +390,17 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     for f in file.files.iter().filter(|f| f.to == crate::loader::TASKBAR_POLICY_FILE) {
         shows.push_str(f.content.as_deref().unwrap_or_default());
     }
-    for r in file.registry.iter().filter(|r| r.key == crate::loader::DESKTOP_ICONS_KEY) {
+    let desktop = |k: &str| k == crate::loader::DESKTOP_ICONS_KEY || k == crate::loader::DESKTOP_VIEW_KEY;
+    for r in file.registry.iter().filter(|r| desktop(&r.key)) {
         shows.push_str(&format!("{}={:?};", r.name.as_deref().unwrap_or_default(), r.data));
     }
     if !shows.is_empty() {
         actions.push(Action::RestartExplorer { shows });
     }
+    // After apps and commands, which add startup entries and tasks of their own, and after
+    // Explorer's restart, which recreates some of Windows' tasks.
+    actions.extend(file.startup.iter().cloned().map(Action::Startup));
+    actions.extend(file.scheduled_tasks.iter().cloned().map(Action::ScheduledTask));
     actions.extend(file.verify.iter().cloned().map(Action::Verify));
 
     let mut chain = String::new();
@@ -467,6 +484,8 @@ fn section(action: &Action) -> &'static str {
         Action::Env { .. } | Action::Path { .. } => "environment",
         Action::Registry(_) => "registry",
         Action::Language(_) => "language",
+        Action::Startup(_) => "startup",
+        Action::ScheduledTask(_) => "scheduled tasks",
         Action::Run(_) => "run",
         Action::Verify(_) => "verify",
     }

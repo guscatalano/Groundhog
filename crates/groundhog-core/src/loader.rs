@@ -18,8 +18,8 @@ use crate::model::{
     App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, DesktopShortcut,
     EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope,
     InputLanguage, LanguageSetting, LockScreen, Password, PathEntry, Presence, RegistryData, RegistryType,
-    RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell, SourceRef, StartPins, Theme, ThemeMode,
-    TrayIcon, User, Wallpaper, WallpaperStyle, raw,
+    RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell, SourceRef, StartPins, StartupItem, TaskRule,
+    TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper, WallpaperStyle, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
@@ -498,6 +498,8 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         desktop,
         uac,
         language,
+        startup,
+        scheduled_tasks,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -545,6 +547,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         Some(l) => resolve_language(l, &mut registry).context("language")?,
         None => Vec::new(),
     };
+    let (startup, scheduled_tasks) = resolve_startup(startup, scheduled_tasks)?;
 
     let run = run
         .into_iter()
@@ -641,6 +644,8 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         start_pins,
         desktop_shortcuts,
         language,
+        startup,
+        scheduled_tasks,
         services,
         firewall,
         run,
@@ -1895,9 +1900,43 @@ fn language_tag(tag: &str) -> Result<String> {
     Ok(tag.to_owned())
 }
 
+/// `startup` and `scheduled-tasks`: one rule per name.
+fn resolve_startup(
+    startup: Option<raw::StartupFull>,
+    tasks: Option<raw::TasksFull>,
+) -> Result<(Vec<StartupItem>, Vec<TaskRule>)> {
+    let check = |names: &[String], what: &str| -> Result<()> {
+        if names.iter().any(|n| n.trim().is_empty()) {
+            bail!("{what}: a name is empty");
+        }
+        Ok(())
+    };
+    let mut items = Vec::new();
+    if let Some(s) = startup {
+        for (list, enabled) in [(s.disable, false), (s.enable, true)] {
+            let list = list.unwrap_or_default();
+            check(&list, "startup")?;
+            items.extend(list.into_iter().map(|name| StartupItem { name, enabled }));
+        }
+    }
+    let mut rules = Vec::new();
+    if let Some(t) = tasks {
+        for (list, state) in
+            [(t.disable, TaskState::Disabled), (t.enable, TaskState::Enabled), (t.remove, TaskState::Absent)]
+        {
+            let list = list.unwrap_or_default();
+            check(&list, "scheduled-tasks")?;
+            rules.extend(list.into_iter().map(|name| TaskRule { name, state }));
+        }
+    }
+    Ok((items, rules))
+}
+
 /// Where Explorer keeps which of Windows' own icons the desktop shows (0 shown, 1 hidden).
 pub(crate) const DESKTOP_ICONS_KEY: &str =
     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel";
+/// The desktop's view settings (auto-arrange, align to grid), read when Explorer starts.
+pub(crate) const DESKTOP_VIEW_KEY: &str = r"HKCU\Software\Microsoft\Windows\Shell\Bags\1\Desktop";
 
 /// Windows' own desktop icons become registry values; shortcuts, steps of their own.
 fn resolve_icons(
@@ -1918,6 +1957,10 @@ fn resolve_icons(
             registry.push(dword(DESKTOP_ICONS_KEY, guid, u32::from(!shown), scope));
         }
     }
+    // The desktop's view flags as Windows starts them (icons aligned to the grid), with or
+    // without auto-arrange (the lowest bit): with icons coming and going, arranged looks tidy.
+    let arrange = i.auto_arrange.unwrap_or(true);
+    registry.push(dword(DESKTOP_VIEW_KEY, "FFlags", 0x4020_0224 | u32::from(arrange), scope));
     let name_ok = |n: &str| !n.trim().is_empty() && !n.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']);
     for s in i.add.unwrap_or_default() {
         if !name_ok(&s.name) {
@@ -2129,6 +2172,16 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         base.language.into_iter().filter(|b| !top.language.iter().any(|t| t.order() == b.order())).collect();
     language.extend(top.language);
     language.sort_by_key(LanguageSetting::order);
+    // A name the top file mentions is the top file's, whatever the base said about it.
+    let mut startup: Vec<StartupItem> =
+        base.startup.into_iter().filter(|b| !top.startup.iter().any(|t| eq(&t.name, &b.name))).collect();
+    startup.extend(top.startup);
+    let mut scheduled_tasks: Vec<TaskRule> = base
+        .scheduled_tasks
+        .into_iter()
+        .filter(|b| !top.scheduled_tasks.iter().any(|t| eq(&t.name, &b.name)))
+        .collect();
+    scheduled_tasks.extend(top.scheduled_tasks);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -2155,6 +2208,8 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         start_pins,
         desktop_shortcuts,
         language,
+        startup,
+        scheduled_tasks,
         services,
         firewall,
         run,
@@ -2703,6 +2758,25 @@ firewall:
     }
 
     #[test]
+    fn startup_and_scheduled_task_rules_parse_and_merge() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/base.yaml",
+                "startup: { disable: [OneDrive, Microsoft Teams] }\nscheduled-tasks: { disable: ['OneDrive Reporting Task-*'], remove: ['\\SoftLanding\\*'] }",
+            )
+            .with("https://cfg.test/top.yaml", "extends: base.yaml\nstartup: { enable: [onedrive] }");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let startup: Vec<(&str, bool)> = g.startup.iter().map(|s| (s.name.as_str(), s.enabled)).collect();
+        assert_eq!(startup, [("Microsoft Teams", false), ("onedrive", true)], "the top file's word on OneDrive wins");
+        let tasks: Vec<(&str, TaskState)> = g.scheduled_tasks.iter().map(|t| (t.name.as_str(), t.state)).collect();
+        assert_eq!(tasks, [("OneDrive Reporting Task-*", TaskState::Disabled), (r"\SoftLanding\*", TaskState::Absent)]);
+        let plan = crate::engine::plan(&g);
+        assert!(plan.iter().any(|s| s.title == "stop Microsoft Teams starting at sign-in"));
+        assert!(plan.iter().any(|s| s.title == r"delete scheduled tasks \SoftLanding\*"));
+    }
+
+    #[test]
     fn desktop_icons_and_shortcuts() {
         let f = MapFetcher::default().with(
             "https://cfg.test/i.yaml",
@@ -2721,6 +2795,8 @@ firewall:
         assert_eq!(icon("{20D04FE0-3AEA-1069-A2D8-08002B30309D}"), RegistryData::Dword(0), "this PC shown");
         assert_eq!(icon("{645FF040-5081-101B-9F08-00AA002F954E}"), RegistryData::Dword(1), "recycle bin hidden");
         assert!(g.registry.iter().any(|r| r.name.as_deref() == Some("CreateDesktopShortcutDefault")));
+        let flags = g.registry.iter().find(|r| r.key == DESKTOP_VIEW_KEY).unwrap();
+        assert_eq!(flags.data, RegistryData::Dword(0x4020_0225), "auto-arrange on by default");
         let states: Vec<(&str, bool)> =
             g.desktop_shortcuts.iter().map(|s| (s.name.as_str(), s.state.is_present())).collect();
         assert_eq!(states, [("FindNeedle", true), ("Microsoft Edge", false)]);

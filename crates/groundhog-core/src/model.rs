@@ -39,6 +39,8 @@ pub struct Groundhogfile {
     pub start_pins: Option<StartPins>,
     pub desktop_shortcuts: Vec<DesktopShortcut>,
     pub language: Vec<LanguageSetting>,
+    pub startup: Vec<StartupItem>,
+    pub scheduled_tasks: Vec<TaskRule>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -272,6 +274,28 @@ pub struct TrayIcon {
     pub program: String,
     /// On the taskbar (`true`) or in the overflow.
     pub shown: bool,
+}
+
+/// Something that starts at sign-in, by name (wildcards allowed), turned off or on.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StartupItem {
+    pub name: String,
+    pub enabled: bool,
+}
+
+/// Scheduled tasks by name (`\Folder\Name` for the whole path; wildcards allowed).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TaskRule {
+    pub name: String,
+    pub state: TaskState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskState {
+    Enabled,
+    Disabled,
+    Absent,
 }
 
 /// A shortcut on the desktop every account shares (`C:\Users\Public\Desktop`), or one taken
@@ -815,6 +839,23 @@ pub(crate) mod raw {
         pub desktop: Option<Desktop>,
         pub uac: Option<Uac>,
         pub language: Option<Language>,
+        pub startup: Option<StartupFull>,
+        pub scheduled_tasks: Option<TasksFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct StartupFull {
+        pub disable: Option<Vec<String>>,
+        pub enable: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TasksFull {
+        pub disable: Option<Vec<String>>,
+        pub enable: Option<Vec<String>>,
+        pub remove: Option<Vec<String>>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -844,6 +885,8 @@ pub(crate) mod raw {
         pub add: Option<Vec<ShortcutFull>>,
         /// Shortcuts to take off, by name (`Microsoft Edge`).
         pub remove: Option<Vec<String>>,
+        /// Keep the icons arranged in order (default: on, when icons are set here).
+        pub auto_arrange: Option<bool>,
     }
 
     #[derive(Debug, Deserialize)]

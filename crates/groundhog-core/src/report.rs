@@ -346,6 +346,8 @@ fn label(section: &str) -> &'static str {
         "environment" => "Environment",
         "registry" => "Settings",
         "language" => "Language",
+        "startup" => "Startup",
+        "scheduled tasks" => "Scheduled tasks",
         "desktop" => "Desktop",
         "services" => "Services",
         "firewall" => "Firewall",
@@ -364,6 +366,7 @@ fn summary(section: &str, steps: &[StepState]) -> String {
     let (did, already) = match section {
         "verify" => return format!("{n} passed"),
         "run" => ("ran", "already ran"),
+        "startup" | "scheduled tasks" => ("changed", "already as wanted"),
         "apps" => ("installed", "already installed"),
         "files" => ("copied", "already there"),
         "users" => ("set up", "already set up"),

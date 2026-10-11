@@ -4,6 +4,27 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.22.0] - 2026-10-11
+
+### Added
+- **`startup`**: turn off (or back on) what starts when you sign in, by the name Task
+  Manager shows or the entry's own name. It works the way Task Manager does, so it can be
+  undone there.
+- **`scheduled-tasks`**: disable, enable or delete scheduled tasks by name or path, with
+  wildcards.
+  ```yaml
+  startup: { disable: [OneDrive, Microsoft Teams] }
+  scheduled-tasks: { disable: ['OneDrive Reporting Task-*', '\Microsoft\XblGameSave\*'] }
+  ```
+  Both are checked on every apply, since programs put their entries back when they update.
+- `desktop.icons.auto-arrange`: on by default when a file sets the desktop's icons, so they
+  line up in order.
+
+### Changed
+- `groundhog:quiet-windows` also disables Windows' SoftLanding tasks, which drive the tips and
+  suggestions.
+- The `neon` example stops Teams starting at sign-in.
+
 ## [0.21.0] - 2026-10-11
 
 ### Added
