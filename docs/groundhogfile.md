@@ -158,7 +158,7 @@ machine that can't reach GitHub can use a copy from your own share by path inste
 | `rust` | The Visual Studio C++ build tools, then rustup with the stable toolchain, clippy and rustfmt, for this user. |
 | `containers` | WSL 2 and Docker Desktop (this user in `docker-users`), with kubectl, Helm, k9s and kind. Needs a restart (apply with `--reboot`) and, in a VM, nested virtualization. Docker Desktop needs a subscription in larger organizations. |
 | `ai` | Claude Code, OpenAI Codex and the GitHub Copilot CLI for every account, kept up to date, and Ollama for this user. |
-| `firefox` | Firefox for every account with uBlock Origin and Bitwarden, as enterprise policies: no terms screen, tour, default-browser prompt, sponsored shortcuts, recommendations, telemetry or studies. Add extensions in your own file, one registry key each (the file shows how). Doesn't build on `dev-core`. |
+| `firefox` | Firefox for every account with uBlock Origin and Bitwarden, as enterprise policies: no terms screen, tour, default-browser prompt, sponsored shortcuts, recommendations, telemetry or studies. Add or remove extensions in your own file with [`firefox.extensions`](#firefox). Doesn't build on `dev-core`. |
 
 ## Conditions and variables
 
@@ -836,6 +836,31 @@ Windows' own tasks refuse changes even from administrators; the step fails and n
 Both are checked again on every apply, since programs put their entries and tasks back when
 they update, and both run after `apps` and `run`, which create them. A name that matches
 nothing is fine (the program isn't installed); `--verbose` says so.
+
+## `firefox`
+
+Firefox extensions for every account, installed through Firefox's enterprise policy. Install
+Firefox itself in `apps` (`Mozilla.Firefox`), or start from `groundhog:firefox`, which does
+that and turns off its first-run prompts.
+
+```yaml
+firefox:
+  extensions:
+    add:
+      - ublock-origin                          # its name on addons.mozilla.org: the end of
+      - darkreader                             # addons.mozilla.org/firefox/addon/<name>
+      - { name: bitwarden-password-manager, locked: true }   # can't be disabled or removed
+      - { id: tool@corp.example, url: 'https://files.corp.example/tool.xpi' }   # not on AMO
+    remove: [darkreader]                       # take one a base file adds back out
+```
+
+Groundhog looks up each add-on's id on addons.mozilla.org when it loads the file, since
+Firefox's policy is keyed by it, and installs the latest version from there. Firefox picks
+them up when it next starts and keeps them updated. People can disable an add-on but not
+remove it; with `locked: true` they can do neither. `remove` deletes an add-on's policy, so
+Firefox stops installing it (a copy already installed stays until removed in Firefox). A file
+that extends another adds, removes or replaces add-ons by name, and about:policies in Firefox
+shows what it got.
 
 ## `services`
 

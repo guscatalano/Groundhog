@@ -4,6 +4,22 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.23.0] - 2026-10-11
+
+### Added
+- **`firefox.extensions`**: Firefox add-ons by their name on addons.mozilla.org. Groundhog
+  looks up their ids itself, and they install when Firefox next starts.
+  - `add` and `remove` let a file that extends `groundhog:firefox` choose its own set.
+  - `locked: true` stops people disabling or removing an add-on.
+  - Add-ons from elsewhere take an `id` and a `url`.
+  ```yaml
+  extends: groundhog:firefox
+  firefox: { extensions: { add: [darkreader, react-devtools], remove: [bitwarden-password-manager] } }
+  ```
+
+### Changed
+- `groundhog:firefox` lists its add-ons this way.
+
 ## [0.22.1] - 2026-10-11
 
 ### Added

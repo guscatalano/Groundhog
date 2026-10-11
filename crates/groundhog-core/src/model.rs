@@ -41,6 +41,7 @@ pub struct Groundhogfile {
     pub language: Vec<LanguageSetting>,
     pub startup: Vec<StartupItem>,
     pub scheduled_tasks: Vec<TaskRule>,
+    pub firefox_extensions: Vec<FirefoxExtension>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -274,6 +275,60 @@ pub struct TrayIcon {
     pub program: String,
     /// On the taskbar (`true`) or in the overflow.
     pub shown: bool,
+}
+
+/// A Firefox extension, installed for every account through Firefox's enterprise policy
+/// (`ExtensionSettings`), or taken out of it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FirefoxExtension {
+    /// Its name on addons.mozilla.org (`ublock-origin`, the end of its page's address), or
+    /// its id for one from elsewhere.
+    pub name: String,
+    /// Firefox's id for it (`uBlock0@raymondhill.net`); looked up on addons.mozilla.org when
+    /// the file is loaded, unless given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Where it's installed from: addons.mozilla.org's latest build unless given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// People can't disable or remove it (`force_installed`); otherwise they can disable it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+    pub state: Presence,
+}
+
+/// Where Firefox reads its enterprise policies from.
+pub const FIREFOX_POLICIES: &str = r"HKLM\SOFTWARE\Policies\Mozilla\Firefox";
+
+impl FirefoxExtension {
+    /// The policy as registry values: a key per extension, named by its id. Taking one out
+    /// deletes its key (Firefox leaves an installed copy alone).
+    pub fn registry(&self) -> Vec<RegistryValue> {
+        let key = format!(r"{FIREFOX_POLICIES}\ExtensionSettings\{}", self.id.as_deref().unwrap_or(&self.name));
+        let value = |name: &str, data: &str| RegistryValue {
+            key: key.clone(),
+            name: Some(name.to_owned()),
+            kind: RegistryType::String,
+            data: RegistryData::String(data.to_owned()),
+            scope: vec![HiveScope::CurrentUser],
+            state: Presence::Present,
+            group_policy: false,
+        };
+        if !self.state.is_present() {
+            return vec![RegistryValue {
+                name: None,
+                data: RegistryData::String(String::new()),
+                state: Presence::Absent,
+                ..value("", "")
+            }];
+        }
+        let url = self
+            .url
+            .clone()
+            .unwrap_or_else(|| format!("https://addons.mozilla.org/firefox/downloads/latest/{}/latest.xpi", self.name));
+        let mode = if self.locked { "force_installed" } else { "normal_installed" };
+        vec![value("installation_mode", mode), value("install_url", &url)]
+    }
 }
 
 /// Something that starts at sign-in, by name (wildcards allowed), turned off or on.
@@ -841,6 +896,29 @@ pub(crate) mod raw {
         pub language: Option<Language>,
         pub startup: Option<StartupFull>,
         pub scheduled_tasks: Option<TasksFull>,
+        pub firefox: Option<FirefoxFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct FirefoxFull {
+        pub extensions: Option<FirefoxExtensionsFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct FirefoxExtensionsFull {
+        pub add: Option<Vec<StringOr<FirefoxExtensionFull>>>,
+        pub remove: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct FirefoxExtensionFull {
+        pub name: Option<String>,
+        pub id: Option<String>,
+        pub url: Option<String>,
+        pub locked: Option<bool>,
     }
 
     #[derive(Debug, Deserialize)]

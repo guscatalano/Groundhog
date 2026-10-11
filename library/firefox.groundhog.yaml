@@ -7,20 +7,26 @@
 #
 #   groundhog-agent apply groundhog:firefox
 #
-# More extensions: one key each, named by the extension's id (the AMO page's "Add to Firefox"
-# link ends in its slug; its id is in about:support once installed). In your own file:
+# Your own add-ons, by the name at the end of their addons.mozilla.org page's address
+# (addons.mozilla.org/firefox/addon/darkreader): extend this and add or remove some.
 #
 #   extends: groundhog:firefox
-#   registry:
-#     - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\@react-devtools', name: installation_mode, value: normal_installed }
-#     - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\@react-devtools', name: install_url, value: 'https://addons.mozilla.org/firefox/downloads/latest/react-devtools/latest.xpi' }
-#
-# And to leave one of these out, `state: absent` on its two values. `normal_installed` lets
-# people disable an extension but not remove it; `force_installed` locks it on.
+#   firefox:
+#     extensions:
+#       add: [darkreader, react-devtools]
+#       remove: [bitwarden-password-manager]
+
+agent: ">=0.23.0"
 
 apps:
   - id: Mozilla.Firefox
     args: --scope machine
+
+firefox:
+  extensions:
+    add:
+      - ublock-origin                  # blocks ads and trackers
+      - bitwarden-password-manager     # the password manager
 
 registry:
   # Quiet: no terms screen, tour, default-browser prompt, telemetry or studies.
@@ -35,18 +41,10 @@ registry:
   - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\UserMessaging', name: ExtensionRecommendations, type: dword, value: 0 }
   - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\UserMessaging', name: FeatureRecommendations, type: dword, value: 0 }
   - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\UserMessaging', name: MoreFromMozilla, type: dword, value: 0 }
-
   # A plain new tab: no sponsored shortcuts or stories.
   - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\FirefoxHome', name: SponsoredTopSites, type: dword, value: 0 }
   - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\FirefoxHome', name: SponsoredPocket, type: dword, value: 0 }
   - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\FirefoxHome', name: Pocket, type: dword, value: 0 }
-
-  # uBlock Origin: blocks ads and trackers.
-  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\uBlock0@raymondhill.net', name: installation_mode, value: normal_installed }
-  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\uBlock0@raymondhill.net', name: install_url, value: 'https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi' }
-  # Bitwarden: the password manager.
-  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\{446900e4-71c2-419f-a6a7-df9c091e268b}', name: installation_mode, value: normal_installed }
-  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\{446900e4-71c2-419f-a6a7-df9c091e268b}', name: install_url, value: 'https://addons.mozilla.org/firefox/downloads/latest/bitwarden-password-manager/latest.xpi' }
 
 verify:
   - file: '%ProgramFiles%\Mozilla Firefox\firefox.exe'

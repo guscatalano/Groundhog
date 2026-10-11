@@ -347,6 +347,7 @@ fn label(section: &str) -> &'static str {
         "registry" => "Settings",
         "language" => "Language",
         "startup" => "Startup",
+        "firefox" => "Firefox",
         "scheduled tasks" => "Scheduled tasks",
         "desktop" => "Desktop",
         "services" => "Services",

@@ -148,6 +148,15 @@ impl Executor for WinExecutor<'_> {
                 Ok(Outcome::Done { changed: true })
             }
             Action::Startup(st) => crate::startup::set_startup(st, log).map(|changed| Outcome::Done { changed }),
+            Action::FirefoxExtension(e) => {
+                // Its policy values; Firefox installs (or stops installing) it when it next starts.
+                let mut changed = false;
+                for r in e.registry() {
+                    let done = if r.state.is_present() { set_registry(&r)? } else { delete_registry(&r)? };
+                    changed |= matches!(done, Outcome::Done { changed: true });
+                }
+                Ok(Outcome::Done { changed })
+            }
             Action::ScheduledTask(t) => crate::startup::set_task(t, log).map(|changed| Outcome::Done { changed }),
             Action::RestartExplorer { .. } => {
                 // Only this session's Explorer: Windows starts it again by itself.
@@ -262,6 +271,16 @@ impl Executor for WinExecutor<'_> {
             Action::DesktopShortcut(d) => would(shortcut_differs(d)?),
             Action::RestartExplorer { .. } => Probe::Unknown,
             Action::Startup(st) => would(crate::startup::startup_differs(st)?),
+            Action::FirefoxExtension(e) => {
+                let mut probe = Probe::Satisfied;
+                for r in e.registry() {
+                    match check_registry(&r, &self.secrets)? {
+                        Probe::Satisfied => {}
+                        other => probe = other,
+                    }
+                }
+                probe
+            }
             Action::ScheduledTask(t) => would(crate::startup::task_differs(t)?),
             Action::TrayIcon(t) => match desktop::set_tray_icon(&t.program, t.shown, true)? {
                 desktop::TrayIcon::NotSeenYet => Probe::Unknown,

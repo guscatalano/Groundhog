@@ -16,10 +16,10 @@ use crate::github;
 use crate::library;
 use crate::model::{
     App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, DesktopShortcut,
-    EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope,
-    InputLanguage, LanguageSetting, LockScreen, Password, PathEntry, Presence, RegistryData, RegistryType,
-    RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell, SourceRef, StartPins, StartupItem, TaskRule,
-    TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper, WallpaperStyle, raw,
+    EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirefoxExtension, FirewallProtocol, FirewallRule,
+    Groundhogfile, HiveScope, InputLanguage, LanguageSetting, LockScreen, Password, PathEntry, Presence, RegistryData,
+    RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell, SourceRef, StartPins,
+    StartupItem, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper, WallpaperStyle, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
@@ -214,6 +214,10 @@ impl<'a> Loader<'a> {
         }
         if let Some(Wallpaper { from: Some(from), sha256, .. }) = &mut file.wallpaper {
             from_github(from, sha256, &mut None)?;
+        }
+        // Add-ons named by their addons.mozilla.org page: Firefox's policy wants their ids.
+        for e in file.firefox_extensions.iter_mut().filter(|e| e.id.is_none()) {
+            e.id = Some(amo_id(self.content.fetcher, &e.name)?);
         }
         if let Some(StartPins { from, sha256, .. }) = &mut file.start_pins {
             from_github(from, sha256, &mut None)?;
@@ -500,6 +504,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         language,
         startup,
         scheduled_tasks,
+        firefox,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -548,6 +553,10 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         None => Vec::new(),
     };
     let (startup, scheduled_tasks) = resolve_startup(startup, scheduled_tasks)?;
+    let firefox_extensions = match firefox.and_then(|f| f.extensions) {
+        Some(e) => resolve_firefox_extensions(e).context("firefox")?,
+        None => Vec::new(),
+    };
 
     let run = run
         .into_iter()
@@ -646,6 +655,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         language,
         startup,
         scheduled_tasks,
+        firefox_extensions,
         services,
         firewall,
         run,
@@ -1900,6 +1910,46 @@ fn language_tag(tag: &str) -> Result<String> {
     Ok(tag.to_owned())
 }
 
+/// `firefox.extensions`: by addons.mozilla.org name, or by id and address for others.
+fn resolve_firefox_extensions(e: raw::FirefoxExtensionsFull) -> Result<Vec<FirefoxExtension>> {
+    let plain = |s: &str| !s.is_empty() && !s.contains(['\\', '/', ' ']);
+    let mut out = Vec::new();
+    for a in e.add.unwrap_or_default() {
+        let (name, id, url, locked) = match a {
+            raw::StringOr::Short(name) => (Some(name), None, None, false),
+            raw::StringOr::Full(f) => (f.name, f.id, f.url, f.locked.unwrap_or(false)),
+        };
+        if url.is_some() && id.is_none() {
+            bail!("an extension from its own address needs its 'id' (Firefox's id for it)");
+        }
+        let Some(name) = name.or_else(|| id.clone()) else { bail!("an extension needs a 'name' (or an 'id')") };
+        if !plain(&name) || id.as_deref().is_some_and(|i| !plain(i)) {
+            bail!("'{name}' isn't an add-on's name on addons.mozilla.org (the end of its page's address)");
+        }
+        out.push(FirefoxExtension { name, id, url, locked, state: Presence::Present });
+    }
+    for name in e.remove.unwrap_or_default() {
+        if !plain(&name) {
+            bail!("'{name}' isn't an add-on's name on addons.mozilla.org");
+        }
+        out.push(FirefoxExtension { name, id: None, url: None, locked: false, state: Presence::Absent });
+    }
+    Ok(out)
+}
+
+/// Firefox's id for an add-on, from addons.mozilla.org: the policy is keyed by it.
+fn amo_id(fetcher: &dyn crate::fetch::Fetcher, name: &str) -> Result<String> {
+    let url = Url::parse(&format!("https://addons.mozilla.org/api/v5/addons/addon/{name}/"))?;
+    let body =
+        fetcher.fetch(&url).with_context(|| format!("looking up Firefox add-on '{name}' on addons.mozilla.org"))?;
+    let addon: serde_json::Value =
+        serde_json::from_slice(&body).with_context(|| format!("unexpected answer from {url}"))?;
+    match addon["guid"].as_str() {
+        Some(id) if !id.is_empty() => Ok(id.to_owned()),
+        _ => bail!("addons.mozilla.org has no id for '{name}'"),
+    }
+}
+
 /// `startup` and `scheduled-tasks`: one rule per name.
 fn resolve_startup(
     startup: Option<raw::StartupFull>,
@@ -2182,6 +2232,15 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         .filter(|b| !top.scheduled_tasks.iter().any(|t| eq(&t.name, &b.name)))
         .collect();
     scheduled_tasks.extend(top.scheduled_tasks);
+    let same_extension = |a: &FirefoxExtension, b: &FirefoxExtension| {
+        eq(&a.name, &b.name) || a.id.as_deref().zip(b.id.as_deref()).is_some_and(|(x, y)| eq(x, y))
+    };
+    let mut firefox_extensions: Vec<FirefoxExtension> = base
+        .firefox_extensions
+        .into_iter()
+        .filter(|b| !top.firefox_extensions.iter().any(|t| same_extension(t, b)))
+        .collect();
+    firefox_extensions.extend(top.firefox_extensions);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -2210,6 +2269,7 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         language,
         startup,
         scheduled_tasks,
+        firefox_extensions,
         services,
         firewall,
         run,
@@ -2755,6 +2815,48 @@ firewall:
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
             assert!(err.contains(why), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn firefox_extensions_by_name_with_ids_looked_up() {
+        let amo = "https://addons.mozilla.org/api/v5/addons/addon";
+        let f = MapFetcher::default()
+            .with(&format!("{amo}/ublock-origin/"), r#"{"guid": "uBlock0@raymondhill.net", "slug": "ublock-origin"}"#)
+            .with(&format!("{amo}/bitwarden-password-manager/"), r#"{"guid": "{446900e4-71c2-419f-a6a7-df9c091e268b}"}"#)
+            .with(&format!("{amo}/darkreader/"), r#"{"guid": "addon@darkreader.org"}"#)
+            .with("https://cfg.test/base.yaml", "firefox: { extensions: { add: [ublock-origin, bitwarden-password-manager] } }")
+            .with(
+                "https://cfg.test/top.yaml",
+                "extends: base.yaml\nfirefox:\n  extensions:\n    add: [{ name: darkreader, locked: true }, { id: me@corp, url: 'https://corp/me.xpi' }]\n    remove: [bitwarden-password-manager]",
+            );
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let got: Vec<(&str, Option<&str>, bool)> =
+            g.firefox_extensions.iter().map(|e| (e.name.as_str(), e.id.as_deref(), e.state.is_present())).collect();
+        assert_eq!(
+            got,
+            [
+                ("ublock-origin", Some("uBlock0@raymondhill.net"), true),
+                ("darkreader", Some("addon@darkreader.org"), true),
+                ("me@corp", Some("me@corp"), true),
+                ("bitwarden-password-manager", Some("{446900e4-71c2-419f-a6a7-df9c091e268b}"), false),
+            ]
+        );
+        // As policy: a key per id; a locked one force-installed; a removed one's key deleted.
+        let dark = g.firefox_extensions[1].registry();
+        assert_eq!(dark[0].key, r"HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\addon@darkreader.org");
+        assert_eq!(dark[0].data, RegistryData::String("force_installed".into()));
+        assert_eq!(
+            dark[1].data,
+            RegistryData::String("https://addons.mozilla.org/firefox/downloads/latest/darkreader/latest.xpi".into())
+        );
+        assert_eq!(g.firefox_extensions[2].registry()[1].data, RegistryData::String("https://corp/me.xpi".into()));
+        let gone = g.firefox_extensions[3].registry();
+        assert_eq!((gone.len(), gone[0].name.is_none(), gone[0].state.is_present()), (1, true, false));
+
+        let bad = MapFetcher::default()
+            .with("https://cfg.test/b.yaml", "firefox: { extensions: { add: [{ url: 'https://x/y.xpi' }] } }");
+        assert!(load_with(&bad, "https://cfg.test/b.yaml", dir.path()).is_err(), "a URL needs an id");
     }
 
     #[test]

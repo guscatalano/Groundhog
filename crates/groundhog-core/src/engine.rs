@@ -16,9 +16,9 @@ use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
     App, Capability, CertScope, Certificate, Check, DefenderExclusion, DesktopShortcut, EnvScope, Feature, FileCopy,
-    FirewallRule, Groundhogfile, LanguageSetting, LockScreen, Presence, RegistryData, RegistryValue, RunAction,
-    ScreenSaver, Service, ServiceState, StartPins, StartupItem, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User,
-    Wallpaper,
+    FirefoxExtension, FirewallRule, Groundhogfile, LanguageSetting, LockScreen, Presence, RegistryData, RegistryValue,
+    RunAction, ScreenSaver, Service, ServiceState, StartPins, StartupItem, TaskRule, TaskState, Theme, ThemeMode,
+    TrayIcon, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -81,6 +81,7 @@ pub enum Action {
     Language(LanguageSetting),
     Startup(StartupItem),
     ScheduledTask(TaskRule),
+    FirefoxExtension(FirefoxExtension),
 }
 
 impl Action {
@@ -207,6 +208,10 @@ fn title(action: &Action) -> String {
         Action::DesktopShortcut(d) if d.state.is_present() => format!("put a {} shortcut on the desktop", d.name),
         Action::DesktopShortcut(d) => format!("take the {} shortcut off the desktop", d.name),
         Action::RestartExplorer { .. } => "restart Explorer to show the taskbar and desktop now".to_owned(),
+        Action::FirefoxExtension(e) if e.state.is_present() => {
+            format!("add {} to Firefox{}", e.name, if e.locked { " (locked)" } else { "" })
+        }
+        Action::FirefoxExtension(e) => format!("stop adding {} to Firefox", e.name),
         Action::Startup(s) if s.enabled => format!("let {} start at sign-in", s.name),
         Action::Startup(s) => format!("stop {} starting at sign-in", s.name),
         Action::ScheduledTask(t) => match t.state {
@@ -371,6 +376,7 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     actions.extend(file.path.iter().map(|p| Action::Path { dir: p.dir.clone(), scope: p.scope, state: p.state }));
     actions.extend(file.registry.iter().cloned().map(Action::Registry));
     actions.extend(file.language.iter().cloned().map(Action::Language));
+    actions.extend(file.firefox_extensions.iter().cloned().map(Action::FirefoxExtension));
     actions.extend(file.wallpaper.iter().cloned().map(Action::Wallpaper));
     actions.extend(file.theme.iter().cloned().map(Action::Theme));
     actions.extend(file.lock_screen.iter().cloned().map(Action::LockScreen));
@@ -485,6 +491,7 @@ fn section(action: &Action) -> &'static str {
         Action::Registry(_) => "registry",
         Action::Language(_) => "language",
         Action::Startup(_) => "startup",
+        Action::FirefoxExtension(_) => "firefox",
         Action::ScheduledTask(_) => "scheduled tasks",
         Action::Run(_) => "run",
         Action::Verify(_) => "verify",
