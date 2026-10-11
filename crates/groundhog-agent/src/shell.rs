@@ -204,8 +204,8 @@ pub fn apply(s: &ShellSetting, log: &mut dyn FnMut(&str)) -> Result<bool> {
                     "{set}\n\
                      $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue\n\
                      if ($pwsh) {{\n\
-                         & $pwsh.Source -NoProfile -NonInteractive -Command '{set}'\n\
-                         if ($LASTEXITCODE -ne 0) {{ throw \"PowerShell 7 couldn't set it (exit $LASTEXITCODE)\" }}\n\
+                         & $pwsh.Source -NoProfile -NonInteractive -Command \"if ((Get-ExecutionPolicy -Scope LocalMachine) -ne '{policy}') {{ {set} }}\"\n\
+                         if ($LASTEXITCODE -ne 0) {{ throw \"PowerShell 7 couldn't set it (exit $LASTEXITCODE); one installed from the Store keeps its policy in its read-only package\" }}\n\
                      }} else {{ $null = 0 }}"
                 ),
                 log,

@@ -322,6 +322,12 @@ try {
         }
         "uninstalling $($p.DisplayName)"
         $code = (Start-Process cmd.exe -ArgumentList "/d /c `"$command`"" -Wait -PassThru -WindowStyle Hidden).ExitCode
+        # OneDrive refuses (0x8004069B) while it's still setting itself up after a first sign-in.
+        for ($try = 1; $code -eq -2147219813 -and $try -le 9; $try++) {
+            "$($p.DisplayName) is busy setting itself up; trying again in 20 seconds"
+            Start-Sleep 20
+            $code = (Start-Process cmd.exe -ArgumentList "/d /c `"$command`"" -Wait -PassThru -WindowStyle Hidden).ExitCode
+        }
         if ($code -notin 0, 3010, 1605) { $failed += "$($p.DisplayName)'s uninstaller exited with $code" }
     }
     if ($defaultRun) {

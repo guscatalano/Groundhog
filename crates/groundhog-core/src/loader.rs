@@ -2275,7 +2275,7 @@ fn resolve_shell(
         if let Some(theme) = t.theme {
             top.insert("theme".to_owned(), serde_json::Value::String(theme));
         }
-        let mut defaults = BTreeMap::new();
+        let mut defaults = t.profile_defaults.unwrap_or_default();
         if let Some(f) = t.font {
             let mut font = serde_json::Map::new();
             if let Some(face) = f.face {

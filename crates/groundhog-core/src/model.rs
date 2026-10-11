@@ -1246,6 +1246,7 @@ pub(crate) mod raw {
         pub theme: Option<String>,
         pub font: Option<TerminalFont>,
         pub color_scheme: Option<String>,
+        pub profile_defaults: Option<BTreeMap<String, serde_json::Value>>,
         pub settings: Option<BTreeMap<String, serde_json::Value>>,
     }
 

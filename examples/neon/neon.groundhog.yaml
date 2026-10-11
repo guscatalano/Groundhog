@@ -1,12 +1,13 @@
-# A quiet, dark Windows with a neon city on the desktop, VS Code, and two tools: Heisenberg
-# (an MCP server for debugging Windows) and FindNeedle (fast log search). Small on purpose: no
-# SDKs, no runtimes (the tools are self-contained), nothing that needs a restart.
+# A quiet, dark Windows with a neon city on the desktop, VS Code, PowerShell 7 in a Terminal
+# dressed to match, and two tools: Heisenberg (an MCP server for debugging Windows) and
+# FindNeedle (fast log search). Small on purpose: no SDKs, no runtimes (the tools are
+# self-contained), nothing that needs a restart.
 #
 #   & ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) https://raw.githubusercontent.com/guscatalano/Groundhog/main/examples/neon/neon.groundhog.yaml
 #
 # Everything shows at once (Explorer restarts once at the end, for the taskbar and desktop).
 
-agent: ">=0.24.0"
+agent: ">=0.31.0"
 
 # No setup nags, tips, ads, widgets or web results in search.
 extends: groundhog:quiet-windows
@@ -17,6 +18,7 @@ remove-apps: [OneDrive, Microsoft Teams, Game Bar, Xbox]
 apps:
   - id: Microsoft.VisualStudioCode
     args: --scope machine           # for every account, with a Start menu entry for all
+  - Microsoft.PowerShell              # PowerShell 7
 
 files:
   - from: github:guscatalano/Heisenberg@latest/heisenberg.exe
@@ -41,11 +43,12 @@ desktop:
     widgets: false
     # Only these: Windows' own pins (Edge, Store, Outlook, ...) go.
     pins:
+      - terminal
       - '%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\FindNeedle.lnk'
       - '%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk'
   start:
-    # Settings, File Explorer, FindNeedle and VS Code, pinned by hand on a sandbox and saved
-    # from %LOCALAPPDATA%\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState
+    # Terminal, PowerShell 7, VS Code, FindNeedle, File Explorer and Settings, pinned by hand on
+    # a sandbox and saved with `groundhog-agent capture start-pins`
     pins-from: start2.bin
     recently-added: false
     recommendations: false
@@ -61,6 +64,49 @@ desktop:
   notifications:
     sounds: false
   scope: [current-user, default-user]
+
+# Terminal opens PowerShell 7, in the wallpaper's colours, over the desktop.
+terminal:
+  default-terminal: terminal          # console programs open in Terminal too
+  default-profile: PowerShell         # PowerShell 7's profile
+  theme: dark
+  font: { face: Cascadia Code, size: 12 }
+  color-scheme: Neon City
+  profile-defaults: { opacity: 82, useAcrylic: false, cursorShape: filledBox, padding: '12' }
+  settings:
+    schemes:
+      - name: Neon City
+        background: '#0C0418'
+        foreground: '#E8E0FF'
+        cursorColor: '#FF2A6D'
+        selectionBackground: '#823CFF'
+        black: '#0C0418'
+        red: '#FF2A6D'
+        green: '#05D9E8'
+        yellow: '#FFBE3C'
+        blue: '#823CFF'
+        purple: '#D14BFF'
+        cyan: '#05D9E8'
+        white: '#E8E0FF'
+        brightBlack: '#4A3A6A'
+        brightRed: '#FF5C8F'
+        brightGreen: '#6FF3FF'
+        brightYellow: '#FFD580'
+        brightBlue: '#A67CFF'
+        brightPurple: '#E58CFF'
+        brightCyan: '#6FF3FF'
+        brightWhite: '#FFFFFF'
+
+# A prompt in the same colours, for both PowerShells.
+powershell:
+  execution-policy: RemoteSigned      # so PowerShell runs the profile
+  profile: |
+    function prompt {
+      $e = [char]27
+      $where = (Get-Location).Path.Replace($HOME, '~')
+      "$e[38;2;5;217;232m$env:USERNAME$e[0m $e[38;2;130;60;255m$where$e[0m`n$e[38;2;255;42;109m$([char]0x276F)$e[0m "
+    }
+    Set-PSReadLineOption -Colors @{ Command = '#05D9E8'; Parameter = '#823CFF'; String = '#FFBE3C'; Operator = '#FF2A6D' }
 
 run:
   - command: |

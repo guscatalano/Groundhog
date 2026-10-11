@@ -4,6 +4,24 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.31.0] - 2026-10-11
+
+### Added
+- **`terminal.profile-defaults`**: any setting every Windows Terminal profile gets, such as
+  opacity, cursor shape or padding.
+- **The neon example** now has PowerShell 7 in a Terminal dressed to match the wallpaper:
+  - a Neon City colour scheme, 82% opacity and Cascadia Code;
+  - a prompt in the same colours;
+  - Terminal on the taskbar, and Terminal and PowerShell 7 pinned in Start.
+
+### Fixed
+- `powershell.execution-policy` no longer fails on a PowerShell 7 installed from the Store, as
+  winget now installs it. Its policy can't be changed, and it already ships with RemoteSigned.
+  PowerShell 7's policy is now only set when it differs, and the error says why when it can't
+  be.
+- Removing OneDrive right after an account's first sign-in no longer fails: OneDrive refuses
+  while it's still setting itself up, so the uninstall waits and tries again.
+
 ## [0.30.0] - 2026-10-11
 
 ### Added

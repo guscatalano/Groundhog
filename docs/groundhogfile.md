@@ -953,6 +953,7 @@ terminal:
   theme: dark
   font: { face: Cascadia Mono, size: 11 }
   color-scheme: One Half Dark
+  profile-defaults: { opacity: 85, useAcrylic: true }   # any setting every profile gets
   settings: { copyOnSelect: true }    # any of settings.json's top-level settings
 powershell:
   execution-policy: RemoteSigned      # for the machine, in Windows PowerShell and PowerShell 7
@@ -963,8 +964,9 @@ powershell:
 ```
 
 **Windows Terminal**, for the agent's account (install `Microsoft.WindowsTerminal` in `apps` on
-Windows 10): `font` and `color-scheme` go in the defaults every profile gets; the rest are
-top-level settings. Everything else in `settings.json` is kept, but not its comments. A later
+Windows 10): `font`, `color-scheme` and `profile-defaults` go in the defaults every profile gets
+(`profiles.defaults`); the rest are top-level settings, `schemes` among them for a colour
+scheme of your own. Everything else in `settings.json` is kept, but not its comments. A later
 file adds settings and overrides the ones it names. `default-terminal` is the account's
 Settings > System > For developers > Terminal.
 
