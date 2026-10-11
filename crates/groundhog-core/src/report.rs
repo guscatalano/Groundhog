@@ -345,6 +345,9 @@ fn label(section: &str) -> &'static str {
         "developer" => "Developer",
         "network" => "Network",
         "default apps" => "Default apps",
+        "terminal" => "Terminal",
+        "ssh" => "SSH",
+        "bitlocker" => "BitLocker",
         "remove apps" => "Removed apps",
         "apps" => "Apps",
         "files" => "Files",
@@ -433,6 +436,8 @@ mod tests {
             steps,
             sources: Vec::new(),
             agent: "0.0.0".into(),
+            restart_owed: Vec::new(),
+            boot: None,
         }
     }
 

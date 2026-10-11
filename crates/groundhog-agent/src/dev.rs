@@ -27,7 +27,7 @@ fn scripts(d: &DevSetting) -> Option<(String, String)> {
         DevSetting::WslDistro { name } => (
             format!(
                 "$names = @(Get-ChildItem '{LXSS}' -ErrorAction SilentlyContinue | ForEach-Object {{ (Get-ItemProperty $_.PSPath).DistributionName }})\n\
-                 if ($names -contains '{name}') {{ 'same' }}"
+                 if ($names -contains '{name}') {{ 'same' }} else {{ 'differs' }}"
             ),
             format!(
                 "$env:WSL_UTF8 = '1'\n\
@@ -38,7 +38,7 @@ fn scripts(d: &DevSetting) -> Option<(String, String)> {
         DevSetting::WslDefault { name } => (
             format!(
                 "$d = (Get-ItemProperty '{LXSS}' -ErrorAction SilentlyContinue).DefaultDistribution\n\
-                 if ($d -and (Get-ItemProperty \"{LXSS}\\$d\" -ErrorAction SilentlyContinue).DistributionName -eq '{name}') {{ 'same' }}"
+                 if ($d -and (Get-ItemProperty \"{LXSS}\\$d\" -ErrorAction SilentlyContinue).DistributionName -eq '{name}') {{ 'same' }} else {{ 'differs' }}"
             ),
             format!(
                 "$env:WSL_UTF8 = '1'\n\
@@ -47,7 +47,9 @@ fn scripts(d: &DevSetting) -> Option<(String, String)> {
             ),
         ),
         DevSetting::VsCodeExtension { id } => (
-            format!("{FIND_CODE}\nif (@(& $code --list-extensions) -contains '{id}') {{ 'same' }}"),
+            format!(
+                "{FIND_CODE}\nif (@(& $code --list-extensions) -contains '{id}') {{ 'same' }} else {{ 'differs' }}"
+            ),
             format!(
                 "{FIND_CODE}\n& $code --install-extension '{id}' --force\n\
                  if ($LASTEXITCODE -ne 0) {{ throw \"VS Code couldn't install {id} (exit $LASTEXITCODE)\" }}"
@@ -80,7 +82,7 @@ fn read_settings() -> Result<(serde_json::Map<String, serde_json::Value>, bool)>
 
 /// JSON with comments and trailing commas (VS Code's settings) as plain JSON, and whether it
 /// had comments.
-fn strip_jsonc(text: &str) -> (String, bool) {
+pub(crate) fn strip_jsonc(text: &str) -> (String, bool) {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let (mut i, mut comments) = (0, false);

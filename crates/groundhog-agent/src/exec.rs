@@ -71,6 +71,10 @@ impl<'a> WinExecutor<'a> {
 }
 
 impl Executor for WinExecutor<'_> {
+    fn boot_id(&self) -> Option<u64> {
+        groundhog_win::system::boot_id()
+    }
+
     fn execute(&mut self, step: &Step, reporter: &dyn Reporter) -> Result<Outcome> {
         let log = &mut |line: &str| reporter.log(&format!("    {line}"));
         // Pick up PATH changes earlier steps' installers made (they change the registry only).
@@ -149,6 +153,12 @@ impl Executor for WinExecutor<'_> {
             }
             Action::Startup(st) => crate::startup::set_startup(st, log).map(|changed| Outcome::Done { changed }),
             Action::Developer(d) => crate::dev::apply(d, log).map(|changed| Outcome::Done { changed }),
+            Action::Shell(sh) => crate::shell::apply(sh, log).map(|changed| Outcome::Done { changed }),
+            Action::Ssh(sh) => crate::ssh::apply(sh, log).map(|changed| Outcome::Done { changed }),
+            Action::DefenderSetting(d) => {
+                crate::security::set_defender(d, log).map(|changed| Outcome::Done { changed })
+            }
+            Action::BitLocker(b) => crate::security::set_bitlocker(b, log).map(|changed| Outcome::Done { changed }),
             Action::DefaultApps(map) => {
                 let changed = crate::defaults::apply(map, log)?;
                 if changed {
@@ -182,6 +192,7 @@ impl Executor for WinExecutor<'_> {
                 Ok(Outcome::Done { changed })
             }
             Action::ScheduledTask(t) => crate::startup::set_task(t, log).map(|changed| Outcome::Done { changed }),
+            Action::CreateTask(t) => crate::startup::create_task(t, log).map(|changed| Outcome::Done { changed }),
             Action::RestartExplorer { .. } => {
                 // Only this session's Explorer: Windows starts it again by itself.
                 let script = "$me = (Get-Process -Id $PID).SessionId\n\
@@ -297,6 +308,10 @@ impl Executor for WinExecutor<'_> {
             Action::Startup(st) => would(crate::startup::startup_differs(st)?),
             Action::System(sys) => would(crate::system::differs(sys)?),
             Action::Developer(d) => would(crate::dev::differs(d)?),
+            Action::Shell(sh) => would(crate::shell::differs(sh)?),
+            Action::Ssh(sh) => would(crate::ssh::differs(sh)?),
+            Action::DefenderSetting(d) => would(crate::security::defender_differs(d)?),
+            Action::BitLocker(b) => would(crate::security::bitlocker_differs(b)?),
             Action::DefaultApps(map) => would(crate::defaults::differs(map)?),
             Action::Network(n) => would(crate::net::differs(n)?),
             Action::FirefoxExtension(e) => {
@@ -310,6 +325,7 @@ impl Executor for WinExecutor<'_> {
                 probe
             }
             Action::ScheduledTask(t) => would(crate::startup::task_differs(t)?),
+            Action::CreateTask(t) => would(crate::startup::new_task_differs(t)?),
             Action::TrayIcon(t) => match desktop::set_tray_icon(&t.program, t.shown, true)? {
                 desktop::TrayIcon::NotSeenYet => Probe::Unknown,
                 desktop::TrayIcon::AsWanted => Probe::Satisfied,
@@ -1298,7 +1314,9 @@ fn shortcut_scripts(d: &DesktopShortcut) -> (String, String) {
     if !d.state.is_present() {
         let both = format!("@({public}, (Join-Path ([Environment]::GetFolderPath('Desktop')) {file}))");
         return (
-            format!("if (-not ({both} | Where-Object {{ Test-Path -LiteralPath $_ }})) {{ 'same' }}"),
+            format!(
+                "if (-not ({both} | Where-Object {{ Test-Path -LiteralPath $_ }})) {{ 'same' }} else {{ 'differs' }}"
+            ),
             format!(
                 "{both} | Where-Object {{ Test-Path -LiteralPath $_ }} | ForEach-Object {{ Remove-Item -LiteralPath $_ -Force }}"
             ),
@@ -1358,7 +1376,7 @@ fn language_scripts(l: &LanguageSetting) -> (String, String) {
             }
             let show = "$show = { param($l) ($l | ForEach-Object { $_.LanguageTag + '=' + ($_.InputMethodTips -join ',') }) -join ';' }";
             (
-                format!("{build}{show}\nif ((& $show $list) -eq (& $show (Get-WinUserLanguageList))) {{ 'same' }}"),
+                format!("{build}{show}\nif ((& $show $list) -eq (& $show (Get-WinUserLanguageList))) {{ 'same' }} else {{ 'differs' }}"),
                 format!("{build}Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue"),
             )
         }
@@ -1369,7 +1387,7 @@ fn language_scripts(l: &LanguageSetting) -> (String, String) {
                 format!(
                     "$o = Get-WinUILanguageOverride\n\
                      $shown = if ($o) {{ $o.Name }} else {{ Get-SystemPreferredUILanguage }}\n\
-                     if ({installed} -and $shown -eq '{tag}'{system}) {{ 'same' }}"
+                     if ({installed} -and $shown -eq '{tag}'{system}) {{ 'same' }} else {{ 'differs' }}"
                 ),
                 format!(
                     "if (-not {installed}) {{ Install-Language '{tag}' | Out-Null }}\n\
@@ -1379,14 +1397,14 @@ fn language_scripts(l: &LanguageSetting) -> (String, String) {
             )
         }
         LanguageSetting::Formats { tag } => {
-            (format!("if ((Get-Culture).Name -eq '{tag}') {{ 'same' }}"), format!("Set-Culture '{tag}'"))
+            (format!("if ((Get-Culture).Name -eq '{tag}') {{ 'same' }} else {{ 'differs' }}"), format!("Set-Culture '{tag}'"))
         }
         LanguageSetting::Location { region } => {
             let geo = format!("([Globalization.RegionInfo]::new('{region}').GeoId)");
-            (format!("if ((Get-WinHomeLocation).GeoId -eq {geo}) {{ 'same' }}"), format!("Set-WinHomeLocation -GeoId {geo}"))
+            (format!("if ((Get-WinHomeLocation).GeoId -eq {geo}) {{ 'same' }} else {{ 'differs' }}"), format!("Set-WinHomeLocation -GeoId {geo}"))
         }
         LanguageSetting::SystemLocale { tag } => {
-            (format!("if ((Get-WinSystemLocale).Name -eq '{tag}') {{ 'same' }}"), format!("Set-WinSystemLocale '{tag}'"))
+            (format!("if ((Get-WinSystemLocale).Name -eq '{tag}') {{ 'same' }} else {{ 'differs' }}"), format!("Set-WinSystemLocale '{tag}'"))
         }
         LanguageSetting::Utf8 { on } => {
             let want = if *on {
@@ -1401,7 +1419,7 @@ fn language_scripts(l: &LanguageSetting) -> (String, String) {
             (
                 format!(
                     "{want}\n$have = Get-ItemProperty '{key}'\n\
-                     if (-not ($want.Keys | Where-Object {{ $have.$_ -ne $want[$_] }})) {{ 'same' }}"
+                     if (-not ($want.Keys | Where-Object {{ $have.$_ -ne $want[$_] }})) {{ 'same' }} else {{ 'differs' }}"
                 ),
                 format!("{want}\nforeach ($k in $want.Keys) {{ Set-ItemProperty '{key}' -Name $k -Value $want[$k] }}"),
             )
@@ -1456,7 +1474,13 @@ pub(crate) fn powershell(shell: Shell, command: &str) -> Proc {
     );
     let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-    Proc::new(ps_exe(shell)).args([
+    let mut proc = Proc::new(ps_exe(shell));
+    if shell == Shell::Powershell
+        && let Some(path) = std::env::var("PSModulePath").ok().and_then(|p| windows_module_path(&p))
+    {
+        proc.env.push(("PSModulePath".to_owned(), path));
+    }
+    proc.args([
         "-NoProfile",
         "-NonInteractive",
         "-ExecutionPolicy",
@@ -1466,6 +1490,22 @@ pub(crate) fn powershell(shell: Shell, command: &str) -> Proc {
         "-EncodedCommand",
         encoded.as_str(),
     ])
+}
+
+/// Started from PowerShell 7, the agent inherits a module path that puts 7's modules first,
+/// and Windows PowerShell then fails to load even its own (`Get-ExecutionPolicy ... the module
+/// could not be loaded`). This is `path` without 7's folders, or `None` if it has none.
+fn windows_module_path(path: &str) -> Option<String> {
+    let is_pwsh = |p: &str| p.to_ascii_lowercase().replace('/', "\\").contains("\\powershell\\");
+    if !path.split(';').any(is_pwsh) {
+        return None;
+    }
+    let kept: Vec<&str> = path.split(';').filter(|p| !p.is_empty() && !is_pwsh(p)).collect();
+    Some(if kept.is_empty() {
+        r"C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules".to_owned()
+    } else {
+        kept.join(";")
+    })
 }
 
 fn shell_for(path: &Path) -> Result<Shell> {
@@ -1596,6 +1636,16 @@ mod tests {
     use groundhog_core::model::InputLanguage;
 
     use super::*;
+
+    #[test]
+    fn windows_powershell_gets_its_own_modules() {
+        let from7 = r"C:\Users\me\Documents\PowerShell\Modules;C:\Program Files\PowerShell\Modules;c:\program files\powershell\7\Modules;C:\Program Files\WindowsPowerShell\Modules;C:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules";
+        assert_eq!(
+            windows_module_path(from7).as_deref(),
+            Some(r"C:\Program Files\WindowsPowerShell\Modules;C:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules")
+        );
+        assert_eq!(windows_module_path(r"C:\Program Files\WindowsPowerShell\Modules"), None);
+    }
 
     #[test]
     fn shortcut_checks_read_the_desktop() {

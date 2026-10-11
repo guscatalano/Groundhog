@@ -19,8 +19,14 @@ use windows_sys::Win32::System::Services::{
 use crate::process::Proc;
 use crate::wide;
 
-/// PIDs of running processes whose image name matches `name` (case-insensitive; the `.exe`
-/// suffix is optional), in snapshot order.
+/// Which boot this is: Windows counts its boots in Prefetch's `BootId`. `None` if unreadable.
+pub fn boot_id() -> Option<u64> {
+    let key = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters")
+        .ok()?;
+    key.get_value::<u32, _>("BootId").ok().map(u64::from)
+}
+
 /// The Windows build number and whether this is a Server edition, from the registry (which,
 /// unlike `GetVersionEx`, doesn't lie to programs without a compatibility manifest). A build
 /// of 0 means it couldn't be read.
@@ -33,6 +39,8 @@ pub fn windows_version() -> (u32, bool) {
     (build, server)
 }
 
+/// PIDs of running processes whose image name matches `name` (case-insensitive; the `.exe`
+/// suffix is optional), in snapshot order.
 pub fn find_processes(name: &str) -> Result<Vec<u32>> {
     let want = name.to_ascii_lowercase();
     let want = want.strip_suffix(".exe").unwrap_or(&want).to_owned();

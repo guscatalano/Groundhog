@@ -4,6 +4,44 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.29.0] - 2026-10-11
+
+### Added
+- **`privacy:`**: app permissions for the whole machine (location, camera, microphone,
+  contacts and ten more), diagnostic data, activity history, advertising ID, inking and typing,
+  online speech, Find my device, feedback prompts and Recall.
+- **`terminal:`**: Windows Terminal's default profile, theme, font and colour scheme (for every
+  profile), any other setting, and which app console programs open in. The rest of your
+  `settings.json` is kept.
+- **`powershell:`**:
+  - the execution policy, in Windows PowerShell and PowerShell 7;
+  - modules from the PowerShell Gallery;
+  - a block of your own in your PowerShell profile, kept apart from the rest of the file.
+- **`scheduled-tasks.create`**: tasks of your own, run daily or on chosen days at a time, every
+  so many minutes or hours, at sign-in or at startup, as you or as SYSTEM. A task is remade
+  when its definition in the file changes, and left alone otherwise.
+- **`ssh:`**:
+  - the OpenSSH server, with its default shell and `sshd_config` keywords (checked with
+    `sshd -t`, and put back if sshd rejects them);
+  - keys that may sign in to administrators' accounts;
+  - known hosts, the ssh-agent service, and a key pair for you.
+- **`defender:`**: cloud protection, sample submission, PUA blocking, network protection,
+  controlled folder access and the apps it allows, and the scheduled scan. A value Defender
+  keeps anyway (Tamper Protection, a policy) fails the step instead of passing as changed.
+- **`bitlocker:`**: encrypts the system drive with a TPM and a recovery password. The password
+  is sent to Entra ID or Active Directory, or saved in a folder you name, and is never printed.
+- **`groundhog-agent capture start-pins`** saves your Start layout for `pins-from`, waiting for
+  Start to finish saving it first.
+
+### Fixed
+- A restart a step was owed is no longer forgotten when a later step in the same run fails:
+  the next run takes it first.
+- Started from PowerShell 7, the agent's Windows PowerShell steps could fail to load Windows
+  PowerShell's own modules (`Get-ExecutionPolicy ... could not be loaded`). They now get Windows
+  PowerShell's module path.
+- Some checks reported an error instead of "needs a change" when what they looked for was
+  missing (the default WSL distribution when there was none, for one).
+
 ## [0.28.0] - 2026-10-11
 
 ### Added

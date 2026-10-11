@@ -23,13 +23,13 @@ fn scripts(s: &SystemSetting) -> (String, String) {
             // The name it will have: a rename waits for the restart, so a second run doesn't redo it.
             format!(
                 "$n = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName').ComputerName\n\
-                 if ($n -ieq {q}) {{ 'same' }}",
+                 if ($n -ieq {q}) {{ 'same' }} else {{ 'differs' }}",
                 q = quote(name)
             ),
             format!("Rename-Computer -NewName {} -Force -WarningAction SilentlyContinue", quote(name)),
         ),
         SystemSetting::TimeZone { id } => (
-            format!("if ((Get-TimeZone).Id -eq {}) {{ 'same' }}", quote(id)),
+            format!("if ((Get-TimeZone).Id -eq {}) {{ 'same' }} else {{ 'differs' }}", quote(id)),
             format!(
                 "if (-not (Get-TimeZone -ListAvailable | Where-Object Id -eq {q})) {{ throw \"Windows has no time zone {id}; tzutil /l lists them\" }}\n\
                  Set-TimeZone -Id {q}",
@@ -39,7 +39,7 @@ fn scripts(s: &SystemSetting) -> (String, String) {
         SystemSetting::PowerPlan { plan } => {
             let guid = plan.guid();
             (
-                format!("if ((powercfg /getactivescheme) -match '{guid}') {{ 'same' }}"),
+                format!("if ((powercfg /getactivescheme) -match '{guid}') {{ 'same' }} else {{ 'differs' }}"),
                 // A plan Windows hides (High performance on many laptops, Ultimate on most
                 // machines) is copied from its template under its own id first.
                 format!(
@@ -67,7 +67,7 @@ fn scripts(s: &SystemSetting) -> (String, String) {
                     "$q = powercfg /query SCHEME_CURRENT {sub} {setting} | Out-String\n\
                      $hex = @([regex]::Matches($q, '0x[0-9a-fA-F]{{8}}') | ForEach-Object Value)\n\
                      # None: this machine doesn't have the setting (no lid on a desktop or VM)\n\
-                     if ($hex.Count -lt 2 -or [Convert]::ToUInt32($hex[{index}], 16) -eq {value}) {{ 'same' }}"
+                     if ($hex.Count -lt 2 -or [Convert]::ToUInt32($hex[{index}], 16) -eq {value}) {{ 'same' }} else {{ 'differs' }}"
                 ),
                 format!(
                     "cmd /d /c \"powercfg /set{which}valueindex SCHEME_CURRENT {sub} {setting} {value} >nul 2>&1\"\n\
@@ -81,7 +81,7 @@ fn scripts(s: &SystemSetting) -> (String, String) {
             (
                 format!(
                     "$h = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Power' -ErrorAction SilentlyContinue).HibernateEnabled\n\
-                     if ([bool]$h -eq {want}) {{ 'same' }}"
+                     if ([bool]$h -eq {want}) {{ 'same' }} else {{ 'differs' }}"
                 ),
                 format!(
                     "cmd /d /c \"powercfg /hibernate {word} >nul 2>&1\"\n\
@@ -97,7 +97,7 @@ fn scripts(s: &SystemSetting) -> (String, String) {
                 format!(
                     "$deny = (Get-ItemProperty {key}).fDenyTSConnections\n\
                      $wrong = @(Get-NetFirewallRule -Group {RDP_RULES} -ErrorAction SilentlyContinue | Where-Object {{ \"$($_.Enabled)\" -eq '{wrong}' }})\n\
-                     if ($deny -eq {deny} -and -not $wrong) {{ 'same' }}"
+                     if ($deny -eq {deny} -and -not $wrong) {{ 'same' }} else {{ 'differs' }}"
                 ),
                 format!(
                     "Set-ItemProperty {key} -Name fDenyTSConnections -Value {deny} -Type DWord\n\

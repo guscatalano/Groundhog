@@ -15,11 +15,12 @@ use crate::fetch::{self, file_url_to_path};
 use crate::github;
 use crate::library;
 use crate::model::{
-    App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, DesktopShortcut,
-    DevSetting, EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirefoxExtension, FirewallProtocol, FirewallRule,
-    Groundhogfile, HiveScope, InputLanguage, LanguageSetting, LockScreen, NetSetting, Password, PathEntry, PowerKnob,
-    Presence, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell,
-    SourceRef, StartPins, StartupItem, SystemSetting, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    App, BitLocker, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion,
+    DefenderSetting, DesktopShortcut, DevSetting, EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirefoxExtension,
+    FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, InputLanguage, LanguageSetting, LockScreen, NetSetting,
+    NewTask, Password, PathEntry, PowerKnob, Presence, RegistryData, RegistryType, RegistryValue, RunAction,
+    ScreenSaver, Service, ServiceState, Shell, ShellSetting, SourceRef, SshSetting, StartPins, StartupItem,
+    StartupType, SystemSetting, TaskRule, TaskState, TaskTrigger, Theme, ThemeMode, TrayIcon, User, Wallpaper,
     WallpaperStyle, raw,
 };
 use crate::secret;
@@ -510,6 +511,12 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         developer,
         network,
         default_apps,
+        privacy,
+        terminal,
+        powershell,
+        ssh,
+        defender,
+        bitlocker,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -557,7 +564,13 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         Some(l) => resolve_language(l, &mut registry).context("language")?,
         None => Vec::new(),
     };
-    let (startup, scheduled_tasks) = resolve_startup(startup, scheduled_tasks)?;
+    let (startup, scheduled_tasks, new_tasks) = resolve_startup(startup, scheduled_tasks)?;
+    let shell = resolve_shell(terminal, powershell, &mut registry).context("terminal/powershell")?;
+    let defender = defender.map(resolve_defender).transpose().context("defender")?.unwrap_or_default();
+    let bitlocker = bitlocker.map(resolve_bitlocker).transpose().context("bitlocker")?;
+    if let Some(p) = privacy {
+        resolve_privacy(p, &mut registry).context("privacy")?;
+    }
     let default_apps = match default_apps {
         Some(d) => resolve_default_apps(d).context("default-apps")?,
         None => BTreeMap::new(),
@@ -609,7 +622,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         }
         None => Vec::new(),
     };
-    let capabilities = capabilities
+    let mut capabilities: Vec<Capability> = capabilities
         .into_iter()
         .enumerate()
         .map(|(i, c)| resolve_capability(base, c).with_context(|| format!("capabilities[{i}]")))
@@ -620,7 +633,11 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         .enumerate()
         .map(|(i, c)| resolve_certificate(base, c).with_context(|| format!("certificates[{i}]")))
         .collect::<Result<_>>()?;
-    let services = services.into_iter().map(resolve_service).collect::<Result<_>>()?;
+    let mut services: Vec<Service> = services.into_iter().map(resolve_service).collect::<Result<_>>()?;
+    let ssh = match ssh {
+        Some(s) => resolve_ssh(s, &mut capabilities, &mut services, &mut registry).context("ssh")?,
+        None => Vec::new(),
+    };
     let firewall = firewall.into_iter().map(resolve_firewall).collect::<Result<_>>()?;
     let defender_exclusions = defender_exclusions.into_iter().map(resolve_exclusion).collect::<Result<_>>()?;
     if remove_apps.iter().any(|a| a.trim().is_empty()) {
@@ -678,11 +695,16 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         language,
         startup,
         scheduled_tasks,
+        new_tasks,
         firefox_extensions,
         system,
         developer,
         network,
         default_apps,
+        shell,
+        ssh,
+        defender,
+        bitlocker,
         services,
         firewall,
         run,
@@ -2048,6 +2070,359 @@ fn resolve_developer(
 pub(crate) const TASKBAR_DEVELOPER_KEY: &str =
     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings";
 
+/// `defender:` as Defender's preferences.
+fn resolve_defender(d: raw::DefenderFull) -> Result<Vec<DefenderSetting>> {
+    let mut out = Vec::new();
+    let mut pref = |label: &str, name: &str, given: Option<String>, choices: &[(&str, u32)]| -> Result<()> {
+        let Some(given) = given else { return Ok(()) };
+        let Some((shown, value)) = choices.iter().find(|(n, _)| n.eq_ignore_ascii_case(&given)) else {
+            let names: Vec<&str> = choices.iter().map(|(n, _)| *n).collect();
+            bail!("{label}: '{given}' isn't one of {}", names.join(", "));
+        };
+        out.push(DefenderSetting::Pref {
+            label: label.to_owned(),
+            name: name.to_owned(),
+            value: *value,
+            shown: (*shown).to_owned(),
+        });
+        Ok(())
+    };
+    let modes: &[(&str, u32)] = &[("off", 0), ("on", 1), ("audit", 2)];
+    pref("cloud-protection", "MAPSReporting", d.cloud_protection, &[("off", 0), ("basic", 1), ("advanced", 2)])?;
+    pref(
+        "sample-submission",
+        "SubmitSamplesConsent",
+        d.sample_submission,
+        &[("prompt", 0), ("safe", 1), ("never", 2), ("all", 3)],
+    )?;
+    pref("pua", "PUAProtection", d.pua, modes)?;
+    pref("network-protection", "EnableNetworkProtection", d.network_protection, modes)?;
+    pref("controlled-folder-access", "EnableControlledFolderAccess", d.controlled_folder_access, modes)?;
+    if let Some(s) = d.scan {
+        let days: &[(&str, u32)] = &[
+            ("everyday", 0),
+            ("sunday", 1),
+            ("monday", 2),
+            ("tuesday", 3),
+            ("wednesday", 4),
+            ("thursday", 5),
+            ("friday", 6),
+            ("saturday", 7),
+            ("never", 8),
+        ];
+        pref("scan day", "ScanScheduleDay", s.day, days)?;
+        pref("scan type", "ScanParameters", s.kind, &[("quick", 1), ("full", 2)])?;
+        if let Some(at) = s.at {
+            out.push(DefenderSetting::ScanTime { at: time_of_day(&at)? });
+        }
+    }
+    if let Some(paths) = d.controlled_folder_apps {
+        if paths.iter().any(|p| !p.contains('\\')) {
+            bail!("controlled-folder-apps: give each program's whole path");
+        }
+        if !paths.is_empty() {
+            out.push(DefenderSetting::AllowedApps { paths });
+        }
+    }
+    if out.is_empty() {
+        bail!("needs at least one setting");
+    }
+    Ok(out)
+}
+
+fn resolve_bitlocker(b: raw::BitLockerFull) -> Result<BitLocker> {
+    if b.system_drive && b.recovery_key.is_none() {
+        bail!("recovery-key is needed (entra, ad, or a folder to save it in): without it a lost TPM loses the drive");
+    }
+    if let Some(r) = &b.recovery_key {
+        let known = ["entra", "ad"].iter().any(|k| k.eq_ignore_ascii_case(r));
+        if !known && !r.contains('\\') {
+            bail!("recovery-key '{r}' isn't entra, ad, or a folder's path");
+        }
+    }
+    Ok(BitLocker { on: b.system_drive, recovery_key: b.recovery_key })
+}
+
+/// `ssh:`: the server and agent are a capability and services; the rest steps of their own.
+fn resolve_ssh(
+    s: raw::SshFull,
+    capabilities: &mut Vec<Capability>,
+    services: &mut Vec<Service>,
+    registry: &mut Vec<RegistryValue>,
+) -> Result<Vec<SshSetting>> {
+    let mut out = Vec::new();
+    let service = |name: &str, on: bool| Service {
+        name: name.to_owned(),
+        startup: Some(if on { StartupType::Automatic } else { StartupType::Disabled }),
+        status: Some(if on { ServiceState::Running } else { ServiceState::Stopped }),
+    };
+    if let Some(on) = s.server {
+        capabilities.retain(|c| !c.name.to_ascii_lowercase().starts_with("openssh.server"));
+        capabilities.push(Capability {
+            name: "OpenSSH.Server~~~~0.0.1.0".to_owned(),
+            present: on,
+            sources: Vec::new(),
+            limit_access: false,
+            timeout_ms: None,
+        });
+        if on {
+            services.push(service("sshd", true));
+        }
+    }
+    if let Some(on) = s.agent {
+        services.push(service("ssh-agent", on));
+    }
+    if let Some(shell) = s.default_shell {
+        let path = match shell.to_ascii_lowercase().as_str() {
+            "powershell" => r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned(),
+            "pwsh" => r"C:\Program Files\PowerShell\7\pwsh.exe".to_owned(),
+            "cmd" => r"C:\Windows\System32\cmd.exe".to_owned(),
+            _ if shell.contains('\\') => shell,
+            _ => bail!("default-shell '{shell}' isn't powershell, pwsh, cmd or a program's path"),
+        };
+        registry.push(RegistryValue {
+            key: r"HKLM\SOFTWARE\OpenSSH".to_owned(),
+            name: Some("DefaultShell".to_owned()),
+            kind: RegistryType::String,
+            data: RegistryData::String(path),
+            scope: vec![HiveScope::CurrentUser],
+            state: Presence::Present,
+            group_policy: false,
+        });
+    }
+    if let Some(values) = s.server_config {
+        for (k, v) in &values {
+            if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric()) {
+                bail!("server-config: '{k}' isn't an sshd_config keyword");
+            }
+            if k.eq_ignore_ascii_case("match") || v.trim().is_empty() || v.contains(['\n', '\r']) {
+                bail!("server-config: {k} needs a one-line value (and Match blocks aren't supported)");
+            }
+        }
+        if !values.is_empty() {
+            out.push(SshSetting::ServerConfig { values });
+        }
+    }
+    let one_line = |l: &String| !l.trim().is_empty() && !l.contains(['\n', '\r']);
+    if let Some(keys) = s.authorized_keys {
+        for k in &keys {
+            let kind = k.split_whitespace().next().unwrap_or_default();
+            if !one_line(k) || !(kind.starts_with("ssh-") || kind.starts_with("ecdsa-") || kind.starts_with("sk-")) {
+                bail!("authorized-keys: '{k}' isn't a public key line (ssh-ed25519 AAAA... comment)");
+            }
+        }
+        if !keys.is_empty() {
+            out.push(SshSetting::AuthorizedKeys { keys: keys.iter().map(|k| k.trim().to_owned()).collect() });
+        }
+    }
+    if let Some(lines) = s.known_hosts {
+        for l in &lines {
+            if !one_line(l) || l.split_whitespace().count() < 3 {
+                bail!("known-hosts: '{l}' isn't a known_hosts line (host key-type key)");
+            }
+        }
+        if !lines.is_empty() {
+            out.push(SshSetting::KnownHosts { lines: lines.iter().map(|l| l.trim().to_owned()).collect() });
+        }
+    }
+    if let Some(kind) = s.key {
+        let kind = kind.to_ascii_lowercase();
+        if kind != "ed25519" && kind != "rsa" {
+            bail!("key '{kind}' isn't ed25519 or rsa");
+        }
+        out.push(SshSetting::Key { kind });
+    }
+    Ok(out)
+}
+
+/// `terminal:` and `powershell:`: the default console app is registry values; the rest steps.
+fn resolve_shell(
+    t: Option<raw::TerminalFull>,
+    p: Option<raw::PowerShellFull>,
+    registry: &mut Vec<RegistryValue>,
+) -> Result<Vec<ShellSetting>> {
+    let mut out = Vec::new();
+    if let Some(t) = t {
+        if let Some(which) = t.default_terminal {
+            // The app console programs open in (Settings > System > For developers > Terminal).
+            let (console, terminal) = match which {
+                raw::DefaultTerminal::Terminal => {
+                    ("{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}", "{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}")
+                }
+                raw::DefaultTerminal::Console => {
+                    ("{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}", "{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}")
+                }
+                raw::DefaultTerminal::Windows => {
+                    ("{00000000-0000-0000-0000-000000000000}", "{00000000-0000-0000-0000-000000000000}")
+                }
+            };
+            for (name, value) in [("DelegationConsole", console), ("DelegationTerminal", terminal)] {
+                registry.push(RegistryValue {
+                    key: r"HKCU\Console\%%Startup".to_owned(),
+                    name: Some(name.to_owned()),
+                    kind: RegistryType::String,
+                    data: RegistryData::String(value.to_owned()),
+                    scope: vec![HiveScope::CurrentUser],
+                    state: Presence::Present,
+                    group_policy: false,
+                });
+            }
+        }
+        let mut top = t.settings.unwrap_or_default();
+        if let Some(name) = t.default_profile {
+            top.insert("defaultProfile".to_owned(), serde_json::Value::String(name));
+        }
+        if let Some(theme) = t.theme {
+            top.insert("theme".to_owned(), serde_json::Value::String(theme));
+        }
+        let mut defaults = BTreeMap::new();
+        if let Some(f) = t.font {
+            let mut font = serde_json::Map::new();
+            if let Some(face) = f.face {
+                font.insert("face".to_owned(), serde_json::Value::String(face));
+            }
+            if let Some(size) = f.size {
+                font.insert(
+                    "size".to_owned(),
+                    if size.fract() == 0.0 { serde_json::json!(size as i64) } else { serde_json::json!(size) },
+                );
+            }
+            defaults.insert("font".to_owned(), serde_json::Value::Object(font));
+        }
+        if let Some(scheme) = t.color_scheme {
+            defaults.insert("colorScheme".to_owned(), serde_json::Value::String(scheme));
+        }
+        if !top.is_empty() || !defaults.is_empty() {
+            out.push(ShellSetting::Terminal { top, defaults });
+        }
+    }
+    if let Some(p) = p {
+        if let Some(policy) = p.execution_policy {
+            const POLICIES: &[&str] = &["Restricted", "AllSigned", "RemoteSigned", "Unrestricted", "Bypass"];
+            let Some(found) = POLICIES.iter().find(|n| n.eq_ignore_ascii_case(&policy)) else {
+                bail!("execution-policy '{policy}' isn't one of {}", POLICIES.join(", "));
+            };
+            out.push(ShellSetting::ExecutionPolicy { policy: (*found).to_owned() });
+        }
+        for name in p.modules.unwrap_or_default() {
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c)) {
+                bail!("'{name}' isn't a module's name on the PowerShell Gallery");
+            }
+            out.push(ShellSetting::Module { name });
+        }
+        if let Some(text) = p.profile {
+            out.push(ShellSetting::Profile { text });
+        }
+    }
+    Ok(out)
+}
+
+/// `privacy:` as the values Settings and Group Policy write; all machine-wide.
+fn resolve_privacy(p: raw::PrivacyFull, registry: &mut Vec<RegistryValue>) -> Result<()> {
+    let machine = [HiveScope::CurrentUser];
+    let before = registry.len();
+    // Each app permission's name in Windows' consent store.
+    const ACCESS: &[(&str, &str)] = &[
+        ("location", "location"),
+        ("camera", "webcam"),
+        ("microphone", "microphone"),
+        ("contacts", "contacts"),
+        ("calendar", "appointments"),
+        ("call-history", "phoneCallHistory"),
+        ("email", "email"),
+        ("messaging", "chat"),
+        ("radios", "radios"),
+        ("documents", "documentsLibrary"),
+        ("pictures", "picturesLibrary"),
+        ("videos", "videosLibrary"),
+        ("file-system", "broadFileSystemAccess"),
+        ("account-info", "userAccountInformation"),
+    ];
+    for (name, allowed) in p.app_access.unwrap_or_default() {
+        let Some((_, store)) = ACCESS.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)) else {
+            let names: Vec<&str> = ACCESS.iter().map(|(n, _)| *n).collect();
+            bail!("app-access: '{name}' isn't one of {}", names.join(", "));
+        };
+        registry.push(RegistryValue {
+            key: format!(
+                r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\{store}"
+            ),
+            name: Some("Value".to_owned()),
+            kind: RegistryType::String,
+            data: RegistryData::String(if allowed { "Allow" } else { "Deny" }.to_owned()),
+            scope: machine.to_vec(),
+            state: Presence::Present,
+            group_policy: false,
+        });
+    }
+    let policies = r"HKLM\SOFTWARE\Policies\Microsoft";
+    if let Some(d) = p.diagnostic_data {
+        let level = match d {
+            raw::DiagnosticData::Required => 1,
+            raw::DiagnosticData::Optional => 3,
+        };
+        registry.push(dword(&format!(r"{policies}\Windows\DataCollection"), "AllowTelemetry", level, &machine));
+    }
+    if let Some(on) = p.activity_history {
+        for name in ["EnableActivityFeed", "PublishUserActivities", "UploadUserActivities"] {
+            registry.push(dword(&format!(r"{policies}\Windows\System"), name, u32::from(on), &machine));
+        }
+    }
+    if let Some(on) = p.advertising_id {
+        registry.push(dword(
+            &format!(r"{policies}\Windows\AdvertisingInfo"),
+            "DisabledByGroupPolicy",
+            u32::from(!on),
+            &machine,
+        ));
+    }
+    if let Some(on) = p.inking_and_typing {
+        registry.push(dword(
+            &format!(r"{policies}\Windows\TextInput"),
+            "AllowLinguisticDataCollection",
+            u32::from(on),
+            &machine,
+        ));
+    }
+    if let Some(on) = p.online_speech {
+        registry.push(dword(
+            &format!(r"{policies}\InputPersonalization"),
+            "AllowInputPersonalization",
+            u32::from(on),
+            &machine,
+        ));
+    }
+    if let Some(on) = p.find_my_device {
+        registry.push(dword(&format!(r"{policies}\FindMyDevice"), "AllowFindMyDevice", u32::from(on), &machine));
+    }
+    if let Some(on) = p.feedback_prompts {
+        registry.push(dword(
+            &format!(r"{policies}\Windows\DataCollection"),
+            "DoNotShowFeedbackNotifications",
+            u32::from(!on),
+            &machine,
+        ));
+    }
+    if let Some(on) = p.recall {
+        registry.push(dword(
+            &format!(r"{policies}\Windows\WindowsAI"),
+            "DisableAIDataAnalysis",
+            u32::from(!on),
+            &machine,
+        ));
+        registry.push(dword(
+            &format!(r"{policies}\Windows\WindowsAI"),
+            "AllowRecallEnablement",
+            u32::from(on),
+            &machine,
+        ));
+    }
+    if registry.len() == before {
+        bail!("needs at least one setting");
+    }
+    Ok(())
+}
+
 /// `default-apps:` as one map of file and link types to apps; `browser`, `pdf` and `mail` are
 /// shorthands for the types they open.
 fn resolve_default_apps(d: raw::DefaultAppsFull) -> Result<BTreeMap<String, String>> {
@@ -2328,7 +2703,7 @@ fn amo_id(fetcher: &dyn crate::fetch::Fetcher, name: &str) -> Result<String> {
 fn resolve_startup(
     startup: Option<raw::StartupFull>,
     tasks: Option<raw::TasksFull>,
-) -> Result<(Vec<StartupItem>, Vec<TaskRule>)> {
+) -> Result<(Vec<StartupItem>, Vec<TaskRule>, Vec<NewTask>)> {
     let check = |names: &[String], what: &str| -> Result<()> {
         if names.iter().any(|n| n.trim().is_empty()) {
             bail!("{what}: a name is empty");
@@ -2344,7 +2719,12 @@ fn resolve_startup(
         }
     }
     let mut rules = Vec::new();
+    let mut new = Vec::new();
     if let Some(t) = tasks {
+        for n in t.create.unwrap_or_default() {
+            let name = n.name.clone();
+            new.push(new_task(n).with_context(|| format!("scheduled-tasks.create '{name}'"))?);
+        }
         for (list, state) in
             [(t.disable, TaskState::Disabled), (t.enable, TaskState::Enabled), (t.remove, TaskState::Absent)]
         {
@@ -2353,7 +2733,80 @@ fn resolve_startup(
             rules.extend(list.into_iter().map(|name| TaskRule { name, state }));
         }
     }
-    Ok((items, rules))
+    Ok((items, rules, new))
+}
+
+/// `HH:MM`, as Task Scheduler takes a time of day.
+fn time_of_day(at: &str) -> Result<String> {
+    let (h, m) = at.split_once(':').context("a time is HH:MM, like 03:00")?;
+    match (h.parse::<u32>(), m.parse::<u32>()) {
+        (Ok(h), Ok(m)) if h < 24 && m < 60 && at.ends_with(&format!(":{m:02}")) => Ok(format!("{h:02}:{m:02}")),
+        _ => bail!("'{at}' isn't a time of day (HH:MM, like 03:00)"),
+    }
+}
+
+fn new_task(n: raw::NewTaskFull) -> Result<NewTask> {
+    let name = n.name.trim();
+    if name.is_empty() || name.ends_with('\\') || name.contains(['*', '?', '/']) {
+        bail!("needs a name (a folder too, if you like: \\Folder\\Name)");
+    }
+    let name = if name.starts_with('\\') { name.to_owned() } else { format!(r"\Groundhog\{name}") };
+    if n.run.trim().is_empty() {
+        bail!("needs something to run");
+    }
+    const DAYS: &[&str] = &["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+    let days = n
+        .days
+        .unwrap_or_default()
+        .iter()
+        .map(|d| {
+            DAYS.iter()
+                .find(|full| d.len() >= 3 && full.to_ascii_lowercase().starts_with(&d.to_ascii_lowercase()))
+                .map(|full| (*full).to_owned())
+                .with_context(|| format!("'{d}' isn't a day of the week"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let at = n.at.as_deref().map(time_of_day).transpose()?;
+    let mut triggers = Vec::new();
+    if let Some(every) = n.every {
+        if !days.is_empty() {
+            bail!("days and every don't go together (every repeats all day, every day)");
+        }
+        let (num, unit) = every.trim().split_at(every.trim().len().saturating_sub(1));
+        let num: u32 = num.trim().parse().with_context(|| format!("'{every}' isn't like 15m, 2h or 1d"))?;
+        let minutes = match unit {
+            "m" => num,
+            "h" => num * 60,
+            "d" => num * 60 * 24,
+            _ => bail!("'{every}' isn't like 15m, 2h or 1d"),
+        };
+        if minutes == 0 {
+            bail!("every can't be 0");
+        }
+        triggers.push(TaskTrigger::Every { minutes, at });
+    } else if let Some(at) = at {
+        triggers.push(TaskTrigger::Daily { at, days });
+    } else if !days.is_empty() {
+        bail!("days needs at (the time of day)");
+    }
+    if n.at_sign_in {
+        triggers.push(TaskTrigger::SignIn);
+    }
+    if n.at_startup {
+        triggers.push(TaskTrigger::Startup);
+    }
+    if triggers.is_empty() {
+        bail!("needs a time to run: at, every, at-sign-in or at-startup");
+    }
+    Ok(NewTask {
+        name,
+        run: n.run,
+        args: n.args,
+        working_dir: n.working_dir,
+        triggers,
+        system: matches!(n.account, Some(raw::TaskAccount::System)),
+        elevated: n.elevated,
+    })
 }
 
 /// Where Explorer keeps which of Windows' own icons the desktop shows (0 shown, 1 hidden).
@@ -2606,6 +3059,9 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         .filter(|b| !top.scheduled_tasks.iter().any(|t| eq(&t.name, &b.name)))
         .collect();
     scheduled_tasks.extend(top.scheduled_tasks);
+    let mut new_tasks: Vec<NewTask> =
+        base.new_tasks.into_iter().filter(|b| !top.new_tasks.iter().any(|t| eq(&t.name, &b.name))).collect();
+    new_tasks.extend(top.new_tasks);
     let same_extension = |a: &FirefoxExtension, b: &FirefoxExtension| {
         eq(&a.name, &b.name) || a.id.as_deref().zip(b.id.as_deref()).is_some_and(|(x, y)| eq(x, y))
     };
@@ -2639,6 +3095,47 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
     let mut network: Vec<NetSetting> =
         base.network.into_iter().filter(|b| !top.network.iter().any(|t| t.key() == b.key())).collect();
     network.extend(top.network);
+    // Terminal settings add up key by key, the top file's winning; the rest by setting.
+    let mut top_shell = top.shell;
+    if let Some((mut t0, mut d0)) = base.shell.iter().find_map(|s| match s {
+        ShellSetting::Terminal { top, defaults } => Some((top.clone(), defaults.clone())),
+        _ => None,
+    }) {
+        for s in &mut top_shell {
+            if let ShellSetting::Terminal { top, defaults } = s {
+                t0.append(top);
+                d0.append(defaults);
+                *top = t0.clone();
+                *defaults = d0.clone();
+            }
+        }
+    }
+    let mut shell: Vec<ShellSetting> =
+        base.shell.into_iter().filter(|b| !top_shell.iter().any(|t| t.key() == b.key())).collect();
+    shell.extend(top_shell);
+    let mut defender: Vec<DefenderSetting> =
+        base.defender.into_iter().filter(|b| !top.defender.iter().any(|t| t.key() == b.key())).collect();
+    defender.extend(top.defender);
+    let bitlocker = top.bitlocker.or(base.bitlocker);
+    // sshd_config keywords add up, the top file's winning; keys and known hosts add up too.
+    let mut ssh = base.ssh;
+    for t in top.ssh {
+        match (ssh.iter_mut().find(|b| b.key() == t.key()), t) {
+            (Some(SshSetting::ServerConfig { values }), SshSetting::ServerConfig { values: mut more }) => {
+                values.append(&mut more)
+            }
+            (Some(SshSetting::AuthorizedKeys { keys: have }), SshSetting::AuthorizedKeys { keys: more })
+            | (Some(SshSetting::KnownHosts { lines: have }), SshSetting::KnownHosts { lines: more }) => {
+                for l in more {
+                    if !have.contains(&l) {
+                        have.push(l);
+                    }
+                }
+            }
+            (Some(b), t) => *b = t,
+            (None, t) => ssh.push(t),
+        }
+    }
     let mut default_apps = base.default_apps;
     default_apps.extend(top.default_apps);
     let theme = match (base.theme, top.theme) {
@@ -2669,11 +3166,16 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         language,
         startup,
         scheduled_tasks,
+        new_tasks,
         firefox_extensions,
         system,
         developer,
         network,
         default_apps,
+        shell,
+        ssh,
+        defender,
+        bitlocker,
         services,
         firewall,
         run,
@@ -3250,6 +3752,150 @@ firewall:
             plan.iter().any(|s| s.title.starts_with("make Acrobat for .pdf; Firefox for .htm, .html, http, https;")),
             "{plan:#?}"
         );
+        assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
+    }
+
+    #[test]
+    fn privacy_settings() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/p.yaml",
+                "privacy:\n  app-access: { location: false, Camera: true }\n  diagnostic-data: required\n  activity-history: false\n  advertising-id: false\n  recall: false",
+            )
+            .with("https://cfg.test/bad.yaml", "privacy: { app-access: { telepathy: false } }")
+            .with("https://cfg.test/empty.yaml", "privacy: {}");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/p.yaml", dir.path()).unwrap().file;
+        let value = |key: &str, name: &str| {
+            g.registry.iter().find(|r| r.key.ends_with(key) && r.name.as_deref() == Some(name)).map(|r| r.data.clone())
+        };
+        assert_eq!(value(r"ConsentStore\location", "Value"), Some(RegistryData::String("Deny".into())));
+        assert_eq!(value(r"ConsentStore\webcam", "Value"), Some(RegistryData::String("Allow".into())));
+        assert_eq!(value("DataCollection", "AllowTelemetry"), Some(RegistryData::Dword(1)));
+        assert_eq!(value(r"Windows\System", "PublishUserActivities"), Some(RegistryData::Dword(0)));
+        assert_eq!(value("AdvertisingInfo", "DisabledByGroupPolicy"), Some(RegistryData::Dword(1)));
+        assert_eq!(value("WindowsAI", "DisableAIDataAnalysis"), Some(RegistryData::Dword(1)));
+        assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
+        assert!(load_with(&f, "https://cfg.test/empty.yaml", dir.path()).is_err());
+    }
+
+    #[test]
+    fn terminal_and_powershell() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/base.yaml",
+                "terminal: { default-profile: PowerShell, font: { face: Cascadia Code, size: 11 }, theme: dark }\npowershell: { execution-policy: remotesigned, modules: [posh-git] }",
+            )
+            .with(
+                "https://cfg.test/top.yaml",
+                "extends: base.yaml\nterminal: { default-terminal: terminal, theme: light }\npowershell: { modules: [Terminal-Icons], profile: Import-Module posh-git }",
+            )
+            .with("https://cfg.test/bad.yaml", "powershell: { execution-policy: whatever }");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let Some(ShellSetting::Terminal { top, defaults }) = g.shell.iter().find(|s| s.key() == "terminal") else {
+            panic!("{:#?}", g.shell)
+        };
+        assert_eq!(top["theme"], "light");
+        assert_eq!(top["defaultProfile"], "PowerShell");
+        assert_eq!(defaults["font"]["face"], "Cascadia Code");
+        assert_eq!(defaults["font"]["size"].to_string(), "11");
+        assert!(g.shell.contains(&ShellSetting::ExecutionPolicy { policy: "RemoteSigned".into() }));
+        assert!(g.shell.contains(&ShellSetting::Module { name: "posh-git".into() }));
+        assert!(g.shell.contains(&ShellSetting::Module { name: "Terminal-Icons".into() }));
+        assert!(g.registry.iter().any(|r| r.name.as_deref() == Some("DelegationTerminal")));
+        let plan = crate::engine::plan(&g);
+        assert!(plan.iter().any(|s| s.title == "install the posh-git PowerShell module"), "{plan:#?}");
+        assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
+    }
+
+    #[test]
+    fn scheduled_tasks_to_create() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/t.yaml",
+                "scheduled-tasks:\n  create:\n    - { name: Backup, run: robocopy.exe, args: 'C:\\src D:\\bak /MIR', at: '3:00', days: [mon, fri], as: system }\n    - { name: '\\Mine\\Ping', run: ping.exe, every: 2h, at-sign-in: true }",
+            )
+            .with("https://cfg.test/none.yaml", "scheduled-tasks: { create: [{ name: X, run: x.exe }] }")
+            .with("https://cfg.test/time.yaml", "scheduled-tasks: { create: [{ name: X, run: x.exe, at: '25:00' }] }")
+            .with("https://cfg.test/both.yaml", "scheduled-tasks: { create: [{ name: X, run: x.exe, every: 1h, days: [mon] }] }");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/t.yaml", dir.path()).unwrap().file;
+        assert_eq!(g.new_tasks[0].name, r"\Groundhog\Backup");
+        assert_eq!(g.new_tasks[0].path_and_name(), (r"\Groundhog\", "Backup"));
+        assert!(g.new_tasks[0].system);
+        assert_eq!(
+            g.new_tasks[0].triggers,
+            [TaskTrigger::Daily { at: "03:00".into(), days: vec!["Monday".into(), "Friday".into()] }]
+        );
+        assert_eq!(g.new_tasks[1].triggers, [TaskTrigger::Every { minutes: 120, at: None }, TaskTrigger::SignIn]);
+        let plan = crate::engine::plan(&g);
+        assert!(plan.iter().any(|s| s.title == r"create scheduled task \Mine\Ping"), "{plan:#?}");
+        for bad in ["none", "time", "both"] {
+            assert!(load_with(&f, &format!("https://cfg.test/{bad}.yaml"), dir.path()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn ssh_settings() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/base.yaml",
+                "ssh:\n  server: true\n  default-shell: pwsh\n  server-config: { PasswordAuthentication: 'no', Port: '22' }\n  authorized-keys: ['ssh-ed25519 AAAA one@a']",
+            )
+            .with(
+                "https://cfg.test/top.yaml",
+                "extends: base.yaml\nssh:\n  agent: true\n  server-config: { Port: '2222' }\n  authorized-keys: ['ssh-ed25519 BBBB two@b']\n  known-hosts: ['github.com ssh-ed25519 CCCC']\n  key: ed25519",
+            )
+            .with("https://cfg.test/bad.yaml", "ssh: { authorized-keys: ['not a key'] }");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        assert!(g.capabilities.iter().any(|c| c.name.starts_with("OpenSSH.Server") && c.present));
+        let services: Vec<&str> = g.services.iter().map(|s| s.name.as_str()).collect();
+        assert!(services.contains(&"sshd") && services.contains(&"ssh-agent"), "{services:?}");
+        assert!(g.registry.iter().any(|r| r.name.as_deref() == Some("DefaultShell")));
+        let config = g.ssh.iter().find_map(|s| match s {
+            SshSetting::ServerConfig { values } => Some(values.clone()),
+            _ => None,
+        });
+        let config = config.unwrap();
+        assert_eq!(config["Port"], "2222");
+        assert_eq!(config["PasswordAuthentication"], "no");
+        assert!(g.ssh.contains(&SshSetting::AuthorizedKeys {
+            keys: vec!["ssh-ed25519 AAAA one@a".into(), "ssh-ed25519 BBBB two@b".into()]
+        }));
+        let plan = crate::engine::plan(&g);
+        assert!(plan.iter().any(|s| s.title == "know the SSH host keys of github.com"), "{plan:#?}");
+        assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
+    }
+
+    #[test]
+    fn defender_and_bitlocker() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/d.yaml",
+                "defender:\n  cloud-protection: advanced\n  pua: on\n  scan: { day: Sunday, at: '2:30', type: quick }\n  controlled-folder-apps: ['C:\\Tools\\sync.exe']\nbitlocker: { system-drive: true, recovery-key: 'D:\\keys' }",
+            )
+            .with("https://cfg.test/nokey.yaml", "bitlocker: { system-drive: true }")
+            .with("https://cfg.test/bad.yaml", "defender: { pua: maybe }");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/d.yaml", dir.path()).unwrap().file;
+        let prefs: Vec<(&str, u32)> = g
+            .defender
+            .iter()
+            .filter_map(|d| match d {
+                DefenderSetting::Pref { name, value, .. } => Some((name.as_str(), *value)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prefs, [("MAPSReporting", 2), ("PUAProtection", 1), ("ScanScheduleDay", 1), ("ScanParameters", 1)]);
+        assert!(g.defender.contains(&DefenderSetting::ScanTime { at: "02:30".into() }));
+        assert_eq!(g.bitlocker, Some(BitLocker { on: true, recovery_key: Some(r"D:\keys".into()) }));
+        let plan = crate::engine::plan(&g);
+        assert!(plan.iter().any(|s| s.title == "set Defender's cloud-protection to advanced"), "{plan:#?}");
+        let last = plan.last().unwrap();
+        assert_eq!(last.title, "turn on BitLocker for the system drive");
+        assert!(load_with(&f, "https://cfg.test/nokey.yaml", dir.path()).is_err());
         assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
     }
 

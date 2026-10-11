@@ -7,7 +7,7 @@
 //! for packaged apps (1: disabled by the user, 2: enabled).
 
 use anyhow::{Result, bail};
-use groundhog_core::model::{Shell, StartupItem, TaskRule, TaskState};
+use groundhog_core::model::{NewTask, Shell, StartupItem, TaskRule, TaskState, TaskTrigger};
 use groundhog_win::process::Proc;
 
 use crate::exec::powershell;
@@ -183,6 +183,80 @@ pub fn set_task(t: &TaskRule, log: &mut dyn FnMut(&str)) -> Result<bool> {
         return Ok(false);
     }
     apply(&task_script(t, false), log)?;
+    Ok(true)
+}
+
+/// A PowerShell string literal.
+fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// What the task's description carries, so a check knows it's this definition.
+fn fingerprint(t: &NewTask) -> String {
+    let json = serde_json::to_vec(t).expect("tasks serialize");
+    format!("groundhog:{}", &groundhog_core::fetch::sha256_hex(&json)[..16])
+}
+
+/// (check, change) for a task Groundhog makes.
+fn new_task_scripts(t: &NewTask) -> (String, String) {
+    let (path, name) = t.path_and_name();
+    let (path, name, mark) = (quote(path), quote(name), fingerprint(t));
+    let check = format!(
+        "$t = Get-ScheduledTask -TaskPath {path} -TaskName {name} -ErrorAction SilentlyContinue\n\
+         if ($t -and $t.Description -like '*{mark}*') {{ 'same' }} else {{ 'differs' }}"
+    );
+    let mut action = format!("New-ScheduledTaskAction -Execute {}", quote(&t.run));
+    if let Some(a) = &t.args {
+        action += &format!(" -Argument {}", quote(a));
+    }
+    if let Some(w) = &t.working_dir {
+        action += &format!(" -WorkingDirectory {}", quote(w));
+    }
+    let triggers: Vec<String> = t
+        .triggers
+        .iter()
+        .map(|tr| match tr {
+            TaskTrigger::Daily { at, days } if days.is_empty() => {
+                format!("(New-ScheduledTaskTrigger -Daily -At '{at}')")
+            }
+            TaskTrigger::Daily { at, days } => {
+                format!("(New-ScheduledTaskTrigger -Weekly -DaysOfWeek {} -At '{at}')", days.join(","))
+            }
+            TaskTrigger::Every { minutes, at } => format!(
+                "(New-ScheduledTaskTrigger -Once -At '{}' -RepetitionInterval (New-TimeSpan -Minutes {minutes}))",
+                at.as_deref().unwrap_or("00:00")
+            ),
+            TaskTrigger::SignIn if t.system => "(New-ScheduledTaskTrigger -AtLogOn)".to_owned(),
+            TaskTrigger::SignIn => "(New-ScheduledTaskTrigger -AtLogOn -User $me)".to_owned(),
+            TaskTrigger::Startup => "(New-ScheduledTaskTrigger -AtStartup)".to_owned(),
+        })
+        .collect();
+    let level = if t.elevated || t.system { "Highest" } else { "Limited" };
+    let principal = if t.system {
+        format!("New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel {level}")
+    } else {
+        format!("New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel {level}")
+    };
+    let change = format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name\n\
+         $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries\n\
+         $task = New-ScheduledTask -Action ({action}) -Trigger @({}) -Principal ({principal}) -Settings $settings -Description 'Made by Groundhog ({mark})'\n\
+         Register-ScheduledTask -TaskPath {path} -TaskName {name} -InputObject $task -Force | Out-Null",
+        triggers.join(", ")
+    );
+    (check, change)
+}
+
+pub fn new_task_differs(t: &NewTask) -> Result<bool> {
+    differs(&new_task_scripts(t).0)
+}
+
+pub fn create_task(t: &NewTask, log: &mut dyn FnMut(&str)) -> Result<bool> {
+    if !new_task_differs(t)? {
+        return Ok(false);
+    }
+    apply(&new_task_scripts(t).1, log)?;
     Ok(true)
 }
 

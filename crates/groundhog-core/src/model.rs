@@ -41,6 +41,7 @@ pub struct Groundhogfile {
     pub language: Vec<LanguageSetting>,
     pub startup: Vec<StartupItem>,
     pub scheduled_tasks: Vec<TaskRule>,
+    pub new_tasks: Vec<NewTask>,
     pub firefox_extensions: Vec<FirefoxExtension>,
     pub system: Vec<SystemSetting>,
     pub developer: Vec<DevSetting>,
@@ -48,6 +49,10 @@ pub struct Groundhogfile {
     /// File types (`.pdf`) and link types (`http`) to the app that opens them, by the app's
     /// name; Windows applies them at each sign-in.
     pub default_apps: BTreeMap<String, String>,
+    pub shell: Vec<ShellSetting>,
+    pub ssh: Vec<SshSetting>,
+    pub defender: Vec<DefenderSetting>,
+    pub bitlocker: Option<BitLocker>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -283,6 +288,88 @@ pub struct TrayIcon {
     pub shown: bool,
 }
 
+/// A `defender:` setting, one of Defender's preferences (Set-MpPreference); each is its own step.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "setting", rename_all = "kebab-case")]
+pub enum DefenderSetting {
+    /// A numbered preference: `name` as Get-MpPreference shows it, `shown` for people.
+    Pref { label: String, name: String, value: u32, shown: String },
+    /// When the scheduled scan starts (`HH:MM`).
+    ScanTime { at: String },
+    /// Programs controlled folder access lets write to protected folders.
+    AllowedApps { paths: Vec<String> },
+}
+
+impl DefenderSetting {
+    pub fn key(&self) -> String {
+        match self {
+            DefenderSetting::Pref { name, .. } => name.to_ascii_lowercase(),
+            DefenderSetting::ScanTime { .. } => "scan-time".to_owned(),
+            DefenderSetting::AllowedApps { .. } => "allowed-apps".to_owned(),
+        }
+    }
+}
+
+/// BitLocker on the system drive.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BitLocker {
+    pub on: bool,
+    /// Where its recovery password goes: `entra`, `ad`, or a folder (when `on`).
+    pub recovery_key: Option<String>,
+}
+
+/// An `ssh:` setting that isn't a capability, service or registry value; each is its own step.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "setting", rename_all = "kebab-case")]
+pub enum SshSetting {
+    /// Keywords set in `%ProgramData%\ssh\sshd_config` (before any `Match` block).
+    ServerConfig { values: BTreeMap<String, String> },
+    /// Public keys that may sign in to an administrator's account
+    /// (`administrators_authorized_keys`).
+    AuthorizedKeys { keys: Vec<String> },
+    /// Lines in the agent's account's `~/.ssh/known_hosts`.
+    KnownHosts { lines: Vec<String> },
+    /// A key pair for the agent's account, made if it has none of this type (`ed25519`, `rsa`).
+    Key { kind: String },
+}
+
+impl SshSetting {
+    pub fn key(&self) -> &'static str {
+        match self {
+            SshSetting::ServerConfig { .. } => "server-config",
+            SshSetting::AuthorizedKeys { .. } => "authorized-keys",
+            SshSetting::KnownHosts { .. } => "known-hosts",
+            SshSetting::Key { .. } => "key",
+        }
+    }
+}
+
+/// A `terminal:` or `powershell:` setting; each is its own step.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "setting", rename_all = "kebab-case")]
+pub enum ShellSetting {
+    /// Merged into Windows Terminal's settings.json: top-level settings, and the defaults every
+    /// profile gets (`profiles.defaults`).
+    Terminal { top: BTreeMap<String, serde_json::Value>, defaults: BTreeMap<String, serde_json::Value> },
+    /// The machine's execution policy, in Windows PowerShell and PowerShell 7.
+    ExecutionPolicy { policy: String },
+    /// A module from the PowerShell Gallery, for every account.
+    Module { name: String },
+    /// A block kept in the agent's account's profile, for both PowerShells.
+    Profile { text: String },
+}
+
+impl ShellSetting {
+    pub fn key(&self) -> String {
+        match self {
+            ShellSetting::Terminal { .. } => "terminal".to_owned(),
+            ShellSetting::ExecutionPolicy { .. } => "execution-policy".to_owned(),
+            ShellSetting::Module { name } => format!("module {}", name.to_ascii_lowercase()),
+            ShellSetting::Profile { .. } => "profile".to_owned(),
+        }
+    }
+}
+
 /// One of the `network:` settings that isn't a plain registry value; each is its own step.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "setting", rename_all = "kebab-case")]
@@ -498,6 +585,46 @@ impl FirefoxExtension {
 pub struct StartupItem {
     pub name: String,
     pub enabled: bool,
+}
+
+/// A scheduled task Groundhog makes (and remakes when its definition changes).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NewTask {
+    /// The whole path, `\Folder\Name`.
+    pub name: String,
+    pub run: String,
+    pub args: Option<String>,
+    pub working_dir: Option<String>,
+    pub triggers: Vec<TaskTrigger>,
+    /// Run as SYSTEM, rather than as the account Groundhog runs as (only while it's signed in).
+    pub system: bool,
+    /// With full administrator rights.
+    pub elevated: bool,
+}
+
+impl NewTask {
+    /// (`\Folder\`, `Name`), as Task Scheduler's cmdlets take them.
+    pub fn path_and_name(&self) -> (&str, &str) {
+        let i = self.name.rfind('\\').expect("starts with a backslash");
+        (&self.name[..=i], &self.name[i + 1..])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "when", rename_all = "kebab-case")]
+pub enum TaskTrigger {
+    /// Every day at `at` (`HH:MM`), or only on `days` (Monday, Tuesday...).
+    Daily {
+        at: String,
+        days: Vec<String>,
+    },
+    /// Every `minutes`, from `at` today (midnight if not given).
+    Every {
+        minutes: u32,
+        at: Option<String>,
+    },
+    SignIn,
+    Startup,
 }
 
 /// Scheduled tasks by name (`\Folder\Name` for the whole path; wildcards allowed).
@@ -1063,6 +1190,108 @@ pub(crate) mod raw {
         pub developer: Option<DeveloperFull>,
         pub network: Option<NetworkFull>,
         pub default_apps: Option<DefaultAppsFull>,
+        pub privacy: Option<PrivacyFull>,
+        pub terminal: Option<TerminalFull>,
+        pub ssh: Option<SshFull>,
+        pub defender: Option<DefenderFull>,
+        pub bitlocker: Option<BitLockerFull>,
+        pub powershell: Option<PowerShellFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct DefenderFull {
+        pub cloud_protection: Option<String>,
+        pub sample_submission: Option<String>,
+        pub pua: Option<String>,
+        pub network_protection: Option<String>,
+        pub controlled_folder_access: Option<String>,
+        pub controlled_folder_apps: Option<Vec<String>>,
+        pub scan: Option<ScanFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ScanFull {
+        pub day: Option<String>,
+        pub at: Option<String>,
+        #[serde(rename = "type")]
+        pub kind: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct BitLockerFull {
+        pub system_drive: bool,
+        pub recovery_key: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct SshFull {
+        pub server: Option<bool>,
+        pub server_config: Option<BTreeMap<String, String>>,
+        pub default_shell: Option<String>,
+        pub authorized_keys: Option<Vec<String>>,
+        pub known_hosts: Option<Vec<String>>,
+        pub agent: Option<bool>,
+        pub key: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct TerminalFull {
+        pub default_profile: Option<String>,
+        pub default_terminal: Option<DefaultTerminal>,
+        pub theme: Option<String>,
+        pub font: Option<TerminalFont>,
+        pub color_scheme: Option<String>,
+        pub settings: Option<BTreeMap<String, serde_json::Value>>,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum DefaultTerminal {
+        Terminal,
+        Console,
+        Windows,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TerminalFont {
+        pub face: Option<String>,
+        pub size: Option<f64>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct PowerShellFull {
+        pub execution_policy: Option<String>,
+        pub modules: Option<Vec<String>>,
+        pub profile: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct PrivacyFull {
+        /// Settings > Privacy & security > App permissions, for the whole device.
+        pub app_access: Option<BTreeMap<String, bool>>,
+        pub diagnostic_data: Option<DiagnosticData>,
+        pub activity_history: Option<bool>,
+        pub advertising_id: Option<bool>,
+        pub inking_and_typing: Option<bool>,
+        pub online_speech: Option<bool>,
+        pub find_my_device: Option<bool>,
+        pub feedback_prompts: Option<bool>,
+        pub recall: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum DiagnosticData {
+        Required,
+        Optional,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1226,9 +1455,37 @@ pub(crate) mod raw {
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct TasksFull {
+        pub create: Option<Vec<NewTaskFull>>,
         pub disable: Option<Vec<String>>,
         pub enable: Option<Vec<String>>,
         pub remove: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct NewTaskFull {
+        pub name: String,
+        pub run: String,
+        pub args: Option<String>,
+        pub working_dir: Option<String>,
+        pub at: Option<String>,
+        pub days: Option<Vec<String>>,
+        pub every: Option<String>,
+        #[serde(default)]
+        pub at_sign_in: bool,
+        #[serde(default)]
+        pub at_startup: bool,
+        #[serde(rename = "as")]
+        pub account: Option<TaskAccount>,
+        #[serde(default)]
+        pub elevated: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum TaskAccount {
+        System,
+        Me,
     }
 
     #[derive(Debug, Deserialize)]

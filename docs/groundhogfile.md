@@ -330,6 +330,44 @@ Folders, processes and file types Microsoft Defender's real-time scanning leaves
 can make builds and big unpacks much faster. `%VARS%` are expanded. When Defender isn't the
 active antivirus, these steps do nothing and say so. Needs the agent elevated.
 
+## `defender`
+
+```yaml
+defender:
+  cloud-protection: advanced            # off | basic | advanced
+  sample-submission: safe               # prompt | safe | never | all
+  pua: on                               # potentially unwanted apps: off | on | audit
+  network-protection: audit             # off | on | audit
+  controlled-folder-access: on          # ransomware protection: off | on | audit
+  controlled-folder-apps: ['C:\Tools\sync.exe']   # programs it lets write to protected folders
+  scan: { day: sunday, at: '02:00', type: quick } # day: everyday | sunday..saturday | never
+```
+
+Microsoft Defender's own preferences (what `Set-MpPreference` sets), each its own step. Turning
+real-time protection off isn't here on purpose. When Defender keeps its value anyway (Tamper
+Protection does that, without an error, for the settings it guards; a policy can too), the step
+reads it back and fails, saying so, rather than reporting a change that didn't happen. A later
+file overrides the settings it names.
+
+## `bitlocker`
+
+```yaml
+bitlocker:
+  system-drive: true
+  recovery-key: entra        # entra | ad | a folder: '\\nas\keys' or 'E:\' (a USB stick)
+```
+
+Encrypts the system drive with a TPM protector (XTS-AES 256, used space only) and adds a
+recovery password, which goes to Entra ID, Active Directory, or a text file in the folder you
+name. It's never printed. `recovery-key` is required: without one, a TPM reset or a firmware
+update can lock you out of the drive. A folder on the drive being encrypted defeats the point.
+A machine that already encrypted itself (Windows 11's device encryption, suspended until a
+Microsoft account signs in) gets the missing protectors and is resumed. Encryption carries on in
+the background; the step is satisfied once it has started. `system-drive: false` decrypts.
+
+Needs a TPM that's ready (`Get-Tpm`); the step fails and says so otherwise. Checking only looks at
+the drive's state and protectors, not where the recovery password was sent.
+
 ## `features` and `capabilities`
 
 Windows optional features (`Microsoft-Windows-Subsystem-Linux`, `VirtualMachinePlatform`,
@@ -739,9 +777,12 @@ hand on one machine, copy that file next to your Groundhogfile, and `pins-from` 
 machine the same Start:
 
 ```powershell
-# On the machine you pinned by hand, a few seconds after the last change (Start saves it then)
-Copy-Item "$env:LOCALAPPDATA\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState\start2.bin" .
+# On the machine you pinned by hand
+groundhog-agent capture start-pins            # writes start2.bin here (or: capture start-pins my-start.bin)
 ```
+
+Start saves the file a few seconds after each change; the command waits for it to settle,
+copies it, and prints the `pins-from` lines to paste.
 
 For the agent's own account the pins change at once (Groundhog restarts Start's process to
 load them). `default-user` in `scope` puts the file in the Default profile for accounts
@@ -849,6 +890,68 @@ missing, and `settings` are set key by key in your `settings.json`, keeping ever
 Comments in that file are not kept once it changes. A later file adds settings and overrides
 the ones it names.
 
+## `terminal` and `powershell`
+
+```yaml
+terminal:
+  default-terminal: terminal          # what console programs open in: terminal | console | windows
+  default-profile: PowerShell         # a profile's name or GUID
+  theme: dark
+  font: { face: Cascadia Mono, size: 11 }
+  color-scheme: One Half Dark
+  settings: { copyOnSelect: true }    # any of settings.json's top-level settings
+powershell:
+  execution-policy: RemoteSigned      # for the machine, in Windows PowerShell and PowerShell 7
+  modules: [posh-git, Terminal-Icons] # from the PowerShell Gallery, for every account
+  profile: |                          # kept in your profile.ps1, for both PowerShells
+    Import-Module posh-git
+    Import-Module Terminal-Icons
+```
+
+**Windows Terminal**, for the agent's account (install `Microsoft.WindowsTerminal` in `apps` on
+Windows 10): `font` and `color-scheme` go in the defaults every profile gets; the rest are
+top-level settings. Everything else in `settings.json` is kept, but not its comments. A later
+file adds settings and overrides the ones it names. `default-terminal` is the account's
+Settings > System > For developers > Terminal.
+
+**PowerShell**: the execution policy is set for the machine, in PowerShell 7 too when it's
+installed; one set by Group Policy wins and the step fails, saying so. Modules are installed for
+all accounts (the NuGet provider comes first if it's missing) and checked by name, so a module
+already there isn't updated. `profile` is a block between `# >>> groundhog >>>` and
+`# <<< groundhog <<<` in `Documents\WindowsPowerShell\profile.ps1` and
+`Documents\PowerShell\profile.ps1`; the rest of each file is yours and kept. PowerShell only runs
+a profile when the execution policy allows scripts: Windows' default on a PC (`Restricted`)
+doesn't, and the step warns when that's the case.
+
+## `ssh`
+
+```yaml
+ssh:
+  server: true                       # the OpenSSH server, started now and at boot
+  default-shell: pwsh                # powershell | pwsh | cmd | a program's path
+  server-config: { PasswordAuthentication: 'no', Port: '22' }   # sshd_config keywords
+  authorized-keys:                   # may sign in to any administrator's account
+    - ssh-ed25519 AAAAC3Nza... me@laptop
+  agent: true                        # the ssh-agent service, started now and at boot
+  known-hosts:
+    - github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+  key: ed25519                       # ed25519 | rsa: make ~\.ssh\id_ed25519 if missing
+```
+
+`server: true` adds Windows' `OpenSSH.Server` capability (and its firewall rule) and starts
+`sshd`; `false` removes it. `server-config` sets each keyword's first line in
+`%ProgramData%\ssh\sshd_config`, or uncomments it, or adds it before the first `Match` block;
+`sshd -t` checks the result, a config it rejects is put back and the step fails, and a running
+`sshd` is restarted. Quote `yes` and `no` so YAML keeps them as words.
+
+`authorized-keys` go in `%ProgramData%\ssh\administrators_authorized_keys`, which sshd reads for
+every member of Administrators (it ignores their own `~\.ssh\authorized_keys`), and that file is
+locked to Administrators and SYSTEM as sshd requires. Keys are added, never removed, and compared
+without their comments. `known-hosts` lines are added to the agent's account's
+`~\.ssh\known_hosts`. `key` makes a key pair without a passphrase for the agent's account and
+prints the public key. Later files add keys and hosts, and override the `server-config` keywords
+they name.
+
 ## `network`
 
 ```yaml
@@ -943,6 +1046,31 @@ many command-line tools, and breaks some old programs that assume a national cod
 `false` puts back the system locale's own code pages. A later file overrides an earlier one
 setting by setting.
 
+## `privacy`
+
+```yaml
+privacy:
+  app-access:                        # Settings > Privacy & security > App permissions
+    location: false
+    camera: true
+    microphone: true
+    contacts: false                  # also: calendar, call-history, email, messaging, radios,
+                                     # documents, pictures, videos, file-system, account-info
+  diagnostic-data: required          # required | optional
+  activity-history: false
+  advertising-id: false
+  inking-and-typing: false           # sending inking and typing data to Microsoft
+  online-speech: false
+  find-my-device: false
+  feedback-prompts: false            # "How likely are you to recommend..."
+  recall: false                      # Copilot+ PCs: no Recall snapshots
+```
+
+Each is the machine-wide value Settings or Group Policy writes, so it's the same for every
+account and, where it's a policy, Settings shows it as managed by your organization. `app-access`
+is the machine's switch for each permission: `false` turns it off for every app and account,
+`true` lets each account decide. A later file overrides the settings it names.
+
 ## `startup` and `scheduled-tasks`
 
 What starts when you sign in, and scheduled tasks: turned off, back on, or (tasks) deleted.
@@ -957,6 +1085,18 @@ scheduled-tasks:
     - '\Microsoft\XblGameSave\*'             # \Folder\Name: by the whole path
   remove: ['\Vendor\Updater']
   # enable: [...]
+  create:
+    - name: Nightly backup                   # in \Groundhog\ unless you give a \Folder\
+      run: robocopy.exe
+      args: C:\Work D:\Backup\Work /MIR
+      at: '02:30'                            # every day; with days: [mon, thu] only on those
+      as: system                             # system | me (the default: only while signed in)
+    - name: Sync notes
+      run: C:\Tools\sync.exe
+      every: 15m                             # 15m | 2h | 1d, from `at` (or midnight)
+      at-sign-in: true
+      at-startup: false
+      elevated: false                        # full administrator rights (always, as system)
 ```
 
 **Startup** entries are matched by any of their names: a Run value's name (`OneDrive`), the
@@ -970,6 +1110,12 @@ left alone.
 `\`. `disable` is usually the better choice: some tasks are recreated when missing (Windows'
 SoftLanding tips tasks, each time Explorer starts), but a disabled one stays disabled. A few of
 Windows' own tasks refuse changes even from administrators; the step fails and names them.
+
+**Created tasks** need at least one of `at`, `every`, `at-sign-in` and `at-startup`. Each
+carries a fingerprint of its definition in its description, so it's made once, remade when its
+definition in the file changes, and left alone otherwise (whatever you change by hand stays until
+then). `as: me` is the agent's account, run only while it's signed in, which needs no password.
+Tasks are created after the rules above.
 
 Both are checked again on every apply, since programs put their entries and tasks back when
 they update, and both run after `apps` and `run`, which create them. A name that matches

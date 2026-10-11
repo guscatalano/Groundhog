@@ -10,6 +10,9 @@ mod ensure;
 mod exec;
 mod net;
 mod secrets;
+mod security;
+mod shell;
+mod ssh;
 mod startup;
 mod system;
 mod update;
@@ -74,6 +77,20 @@ enum Command {
         /// holding one (default: GitHub releases).
         #[arg(long, value_name = "SOURCE")]
         from: Option<String>,
+    },
+    /// Save part of this machine's setup to a file a Groundhogfile can use.
+    #[command(subcommand)]
+    Capture(Capture),
+}
+
+#[derive(Subcommand)]
+enum Capture {
+    /// This account's Start menu pins, as a layout file for `desktop.start.pins-from`. Pin and
+    /// unpin by hand first.
+    StartPins {
+        /// Where to write it, next to your Groundhogfile.
+        #[arg(default_value = "start2.bin")]
+        out: PathBuf,
     },
 }
 
@@ -209,6 +226,10 @@ fn run(home: &Path, command: Command) -> Result<i32> {
         }
         Command::Clean => {
             clean(home)?;
+            Ok(0)
+        }
+        Command::Capture(Capture::StartPins { out }) => {
+            capture_start_pins(&out)?;
             Ok(0)
         }
         Command::Update { to, from } => {
@@ -463,7 +484,30 @@ fn failed_before_start(p: &Pending, e: &anyhow::Error) -> RunState {
         steps: Vec::new(),
         sources: Vec::new(),
         agent: env!("CARGO_PKG_VERSION").to_owned(),
+        restart_owed: Vec::new(),
+        boot: None,
     }
+}
+
+/// Copies this account's Start layout. Start writes it a few seconds after a change, so a file
+/// changed just now is given a moment to settle first.
+fn capture_start_pins(out: &Path) -> Result<()> {
+    let from = groundhog_win::desktop::start_layout_path(groundhog_win::desktop::Profile::Current)?;
+    let modified = || std::fs::metadata(&from).and_then(|m| m.modified()).ok();
+    let fresh =
+        |t: Option<std::time::SystemTime>| t.and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() < 10);
+    while fresh(modified()) {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let bytes = std::fs::read(&from).with_context(|| format!("reading {}", from.display()))?;
+    std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+    let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    println!("Saved this account's Start pins to {} ({} bytes). In your Groundhogfile:", out.display(), bytes.len());
+    println!();
+    println!("desktop:");
+    println!("  start:");
+    println!("    pins-from: {name}");
+    Ok(())
 }
 
 fn run_pending(home: &Path) -> Result<i32> {

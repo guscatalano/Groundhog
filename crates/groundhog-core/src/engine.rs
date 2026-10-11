@@ -15,10 +15,11 @@ use url::Url;
 use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
-    App, Capability, CertScope, Certificate, Check, DefenderExclusion, DesktopShortcut, DevSetting, EnvScope, Feature,
-    FileCopy, FirefoxExtension, FirewallRule, Groundhogfile, LanguageSetting, LockScreen, NetSetting, PowerKnob,
-    Presence, RegistryData, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, StartPins, StartupItem,
-    SystemSetting, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    App, BitLocker, Capability, CertScope, Certificate, Check, DefenderExclusion, DefenderSetting, DesktopShortcut,
+    DevSetting, EnvScope, Feature, FileCopy, FirefoxExtension, FirewallRule, Groundhogfile, LanguageSetting,
+    LockScreen, NetSetting, NewTask, PowerKnob, Presence, RegistryData, RegistryValue, RunAction, ScreenSaver, Service,
+    ServiceState, ShellSetting, SshSetting, StartPins, StartupItem, SystemSetting, TaskRule, TaskState, Theme,
+    ThemeMode, TrayIcon, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -81,12 +82,17 @@ pub enum Action {
     Language(LanguageSetting),
     Startup(StartupItem),
     ScheduledTask(TaskRule),
+    CreateTask(NewTask),
     FirefoxExtension(FirefoxExtension),
     System(SystemSetting),
     Developer(DevSetting),
     Network(NetSetting),
     /// The default apps, as one associations file for Windows' policy.
     DefaultApps(BTreeMap<String, String>),
+    Shell(ShellSetting),
+    Ssh(SshSetting),
+    DefenderSetting(DefenderSetting),
+    BitLocker(BitLocker),
 }
 
 impl Action {
@@ -214,6 +220,36 @@ fn title(action: &Action) -> String {
         Action::DesktopShortcut(d) => format!("take the {} shortcut off the desktop", d.name),
         Action::RestartExplorer { .. } => "restart Explorer to show the taskbar and desktop now".to_owned(),
         Action::System(s) => system_title(s),
+        Action::DefenderSetting(d) => match d {
+            DefenderSetting::Pref { label, shown, .. } => format!("set Defender's {label} to {shown}"),
+            DefenderSetting::ScanTime { at } => format!("start Defender's scheduled scan at {at}"),
+            DefenderSetting::AllowedApps { paths } => {
+                format!("let {} write to Defender's protected folders", paths.join(", "))
+            }
+        },
+        Action::BitLocker(b) if b.on => "turn on BitLocker for the system drive".to_owned(),
+        Action::BitLocker(_) => "turn off BitLocker for the system drive".to_owned(),
+        Action::Ssh(s) => match s {
+            SshSetting::ServerConfig { values } => {
+                let set: Vec<String> = values.iter().map(|(k, v)| format!("{k} {v}")).collect();
+                format!("set {} in sshd_config", set.join(", "))
+            }
+            SshSetting::AuthorizedKeys { keys } => format!("let {} SSH key(s) sign in as an administrator", keys.len()),
+            SshSetting::KnownHosts { lines } => {
+                let hosts: Vec<&str> = lines.iter().filter_map(|l| l.split_whitespace().next()).collect();
+                format!("know the SSH host keys of {}", hosts.join(", "))
+            }
+            SshSetting::Key { kind } => format!("make an {kind} SSH key"),
+        },
+        Action::Shell(s) => match s {
+            ShellSetting::Terminal { top, defaults } => {
+                let keys: Vec<&str> = top.keys().chain(defaults.keys()).map(String::as_str).collect();
+                format!("set Windows Terminal's {}", keys.join(", "))
+            }
+            ShellSetting::ExecutionPolicy { policy } => format!("set PowerShell's execution policy to {policy}"),
+            ShellSetting::Module { name } => format!("install the {name} PowerShell module"),
+            ShellSetting::Profile { .. } => "keep Groundhog's block in your PowerShell profile".to_owned(),
+        },
         Action::DefaultApps(map) => {
             // "Firefox for http, https, .pdf; Visual Studio Code for .txt"
             let mut by_app: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -251,6 +287,7 @@ fn title(action: &Action) -> String {
         Action::FirefoxExtension(e) => format!("stop adding {} to Firefox", e.name),
         Action::Startup(s) if s.enabled => format!("let {} start at sign-in", s.name),
         Action::Startup(s) => format!("stop {} starting at sign-in", s.name),
+        Action::CreateTask(t) => format!("create scheduled task {}", t.name),
         Action::ScheduledTask(t) => match t.state {
             TaskState::Enabled => format!("enable scheduled tasks {}", t.name),
             TaskState::Disabled => format!("disable scheduled tasks {}", t.name),
@@ -394,6 +431,7 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     actions.extend(file.certificates.iter().cloned().map(Action::Certificate));
     // Defender exclusions before the big installs and unpacks they speed up.
     actions.extend(file.defender_exclusions.iter().cloned().map(Action::Defender));
+    actions.extend(file.defender.iter().cloned().map(Action::DefenderSetting));
     // Windows features next: apps often need them (WSL for Docker, .NET 3.5 for old
     // installers), and their restarts are best taken before long installs, not in the middle.
     actions.extend(file.features.iter().cloned().map(Action::Feature));
@@ -409,6 +447,7 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     actions.extend(file.files.iter().cloned().map(Action::File));
     // After apps, which install WSL and VS Code.
     actions.extend(file.developer.iter().cloned().map(Action::Developer));
+    actions.extend(file.shell.iter().cloned().map(Action::Shell));
     actions.extend(file.env.iter().map(|(name, v)| Action::Env {
         name: name.clone(),
         value: v.value.clone(),
@@ -431,6 +470,8 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     // Services and firewall rules after apps, which often install what they refer to.
     actions.extend(file.services.iter().cloned().map(Action::Service));
     actions.extend(file.firewall.iter().cloned().map(Action::Firewall));
+    // After the server is added and started, which writes its config.
+    actions.extend(file.ssh.iter().cloned().map(Action::Ssh));
     actions.extend(file.run.iter().cloned().map(Action::Run));
     // After apps and commands: the apps must be there to be the defaults.
     if !file.default_apps.is_empty() {
@@ -458,6 +499,9 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     // Explorer's restart, which recreates some of Windows' tasks.
     actions.extend(file.startup.iter().cloned().map(Action::Startup));
     actions.extend(file.scheduled_tasks.iter().cloned().map(Action::ScheduledTask));
+    actions.extend(file.new_tasks.iter().cloned().map(Action::CreateTask));
+    // Last: it encrypts in the background while the machine is used.
+    actions.extend(file.bitlocker.iter().cloned().map(Action::BitLocker));
     actions.extend(file.verify.iter().cloned().map(Action::Verify));
 
     let mut chain = String::new();
@@ -555,6 +599,10 @@ fn section(action: &Action) -> &'static str {
         Action::Developer(_) => "developer",
         Action::Network(_) => "network",
         Action::DefaultApps(_) => "default apps",
+        Action::Shell(_) => "terminal",
+        Action::Ssh(_) => "ssh",
+        Action::DefenderSetting(_) => "defender",
+        Action::BitLocker(_) => "bitlocker",
         Action::User(_) => "users",
         Action::RemoveApp { .. } => "remove apps",
         Action::EnsureWinget | Action::App(_) => "apps",
@@ -577,7 +625,7 @@ fn section(action: &Action) -> &'static str {
         Action::Language(_) => "language",
         Action::Startup(_) => "startup",
         Action::FirefoxExtension(_) => "firefox",
-        Action::ScheduledTask(_) => "scheduled tasks",
+        Action::ScheduledTask(_) | Action::CreateTask(_) => "scheduled tasks",
         Action::Run(_) => "run",
         Action::Verify(_) => "verify",
     }
@@ -590,6 +638,13 @@ pub trait Executor {
     /// Whether the machine already matches the step, found without changing anything.
     fn check(&mut self, _step: &Step) -> Result<Probe> {
         Ok(Probe::Unknown)
+    }
+
+    /// Which boot of the machine this is (a number that changes at each restart), so a
+    /// restart a step asked for and a failed run left owed is still owed on the next run, and
+    /// known to be done after one. `None`: unknown, nothing carried over.
+    fn boot_id(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -693,6 +748,11 @@ pub struct RunState {
     /// The agent version that produced this state.
     #[serde(default)]
     pub agent: String,
+    /// Steps that finish after a restart that hasn't happened yet, and the boot they ran in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_owed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<u64>,
 }
 
 pub fn now() -> String {
@@ -756,6 +816,13 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
         .flat_map(|p| p.steps.iter().filter(|s| s.status == StepStatus::Done).map(|s| s.id.clone()))
         .collect();
     let continuing = prior.as_ref().is_some_and(|p| p.status == RunStatus::RebootPending);
+    // A restart an earlier run was owed (it failed, or was stopped, before taking it) is still
+    // owed while the machine hasn't restarted since.
+    let boot = exec.boot_id();
+    let carried: Vec<String> = match &prior {
+        Some(p) if boot.is_some() && p.boot == boot => p.restart_owed.clone(),
+        _ => Vec::new(),
+    };
 
     let mut state = RunState {
         source: opts.source.clone(),
@@ -780,6 +847,8 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
             .collect(),
         sources: opts.sources,
         agent: env!("CARGO_PKG_VERSION").to_owned(),
+        restart_owed: carried.clone(),
+        boot,
     };
 
     let save = |state: &mut RunState| -> Result<()> {
@@ -807,7 +876,8 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
         }
         save(state)
     };
-    let mut owed: Vec<String> = Vec::new();
+    // Carried over: taken before anything else runs (no section matches "").
+    let mut owed: Vec<String> = carried;
     let mut owed_section = "";
 
     for (i, step) in steps.iter().enumerate() {
@@ -834,6 +904,7 @@ pub fn run(steps: &[Step], exec: &mut dyn Executor, reporter: &dyn Reporter, opt
                 state.steps[i].message = Some("finishes after a restart".to_owned());
                 owed.push(step.title.clone());
                 owed_section = section(&step.action);
+                state.restart_owed = owed.clone();
             }
             Ok(outcome @ (Outcome::RebootRequired | Outcome::RetryAfterReboot)) => {
                 let retry = matches!(outcome, Outcome::RetryAfterReboot);
@@ -898,6 +969,9 @@ mod tests {
         ran: RefCell<Vec<String>>,
         fail: Option<String>,
         reboot: Option<String>,
+        /// Finishes after a restart (a later one, at the end of its section).
+        later: Option<String>,
+        boot: Option<u64>,
     }
 
     impl Executor for Fake {
@@ -910,8 +984,42 @@ mod tests {
             if self.reboot.take_if(|r| r == command).is_some() {
                 return Ok(Outcome::RebootRequired);
             }
+            if self.later.as_deref() == Some(command) {
+                return Ok(Outcome::DoneRestartLater { changed: true });
+            }
             Ok(Outcome::Done { changed: true })
         }
+
+        fn boot_id(&self) -> Option<u64> {
+            self.boot
+        }
+    }
+
+    #[test]
+    fn a_restart_owed_by_a_failed_run_is_still_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let steps = plan(&file(&["rename", "broken", "after"]));
+
+        // "rename" wants a restart at the end of its section, but "broken" fails first.
+        let mut exec =
+            Fake { later: Some("rename".into()), fail: Some("broken".into()), boot: Some(7), ..Default::default() };
+        let first = go(&steps, &mut exec, &path);
+        assert_eq!(first.status, RunStatus::Failed);
+        assert_eq!(first.restart_owed, ["run: rename"]);
+
+        // Fixed and run again without a restart: the restart is still owed, taken before the rest.
+        let mut exec = Fake { boot: Some(7), ..Default::default() };
+        let second = go(&steps, &mut exec, &path);
+        assert_eq!(second.status, RunStatus::RebootPending, "{:?}", second.message);
+        assert!(exec.ran.borrow().is_empty(), "nothing runs before the restart");
+
+        // After the restart (a new boot) it carries on.
+        let mut exec = Fake { boot: Some(8), ..Default::default() };
+        let third = go(&steps, &mut exec, &path);
+        assert_eq!(third.status, RunStatus::Succeeded);
+        assert_eq!(*exec.ran.borrow(), ["broken", "after"]);
+        assert!(third.restart_owed.is_empty());
     }
 
     fn file(cmds: &[&str]) -> Groundhogfile {

@@ -105,7 +105,7 @@ fn dns_scripts(adapter: &str, servers: &[String]) -> (String, String) {
                  }}\n\
                }}\n\
              }}\n\
-             if ($ok) {{ 'same' }}"
+             if ($ok) {{ 'same' }} else {{ 'differs' }}"
         ),
         format!(
             "{head}\n\
