@@ -17,9 +17,10 @@ use crate::library;
 use crate::model::{
     App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, DesktopShortcut,
     EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirefoxExtension, FirewallProtocol, FirewallRule,
-    Groundhogfile, HiveScope, InputLanguage, LanguageSetting, LockScreen, Password, PathEntry, Presence, RegistryData,
-    RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell, SourceRef, StartPins,
-    StartupItem, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper, WallpaperStyle, raw,
+    Groundhogfile, HiveScope, InputLanguage, LanguageSetting, LockScreen, Password, PathEntry, PowerKnob, Presence,
+    RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell, SourceRef,
+    StartPins, StartupItem, SystemSetting, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    WallpaperStyle, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
@@ -505,6 +506,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         startup,
         scheduled_tasks,
         firefox,
+        system,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -553,6 +555,10 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         None => Vec::new(),
     };
     let (startup, scheduled_tasks) = resolve_startup(startup, scheduled_tasks)?;
+    let system = match system {
+        Some(s) => resolve_system(s, &mut registry).context("system")?,
+        None => Vec::new(),
+    };
     let firefox_extensions = match firefox.and_then(|f| f.extensions) {
         Some(e) => resolve_firefox_extensions(e).context("firefox")?,
         None => Vec::new(),
@@ -656,6 +662,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         startup,
         scheduled_tasks,
         firefox_extensions,
+        system,
         services,
         firewall,
         run,
@@ -1910,6 +1917,119 @@ fn language_tag(tag: &str) -> Result<String> {
     Ok(tag.to_owned())
 }
 
+/// `system:` as one step per setting; Windows Update's are policy values.
+fn resolve_system(s: raw::SystemFull, registry: &mut Vec<RegistryValue>) -> Result<Vec<SystemSetting>> {
+    let mut out = Vec::new();
+    if let Some(name) = s.computer_name {
+        let ok = (1..=15).contains(&name.len())
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !name.bytes().all(|b| b.is_ascii_digit())
+            && !name.starts_with('-');
+        if !ok {
+            bail!("computer-name '{name}': up to 15 letters, digits and hyphens, not only digits");
+        }
+        out.push(SystemSetting::ComputerName { name });
+    }
+    if let Some(id) = s.time_zone {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || " .()+-'".contains(c)) {
+            bail!("time-zone '{id}' should be a Windows time zone id, like Pacific Standard Time (tzutil /l)");
+        }
+        out.push(SystemSetting::TimeZone { id });
+    }
+    if let Some(p) = s.power {
+        if let Some(plan) = p.plan {
+            out.push(SystemSetting::PowerPlan { plan });
+        }
+        let secs = |d: raw::Duration, what: &str| -> Result<u32> {
+            if matches!(&d, raw::Duration::Text(t) if t.eq_ignore_ascii_case("never")) {
+                return Ok(0);
+            }
+            let ms = duration_ms(d).with_context(|| format!("power {what}"))?;
+            let s = u32::try_from(ms / 1000).ok().filter(|s| *s > 0);
+            s.ok_or_else(|| anyhow!("power {what}: a time like 15m or 2h, or never"))
+        };
+        let lid = |l: raw::LidAction| match l {
+            raw::LidAction::Nothing => 0,
+            raw::LidAction::Sleep => 1,
+            raw::LidAction::Hibernate => 2,
+            raw::LidAction::ShutDown => 3,
+        };
+        let mut knobs = |on_battery: bool,
+                         sleep: Option<raw::Duration>,
+                         screen: Option<raw::Duration>,
+                         l: Option<raw::LidAction>|
+         -> Result<()> {
+            if let Some(d) = sleep {
+                out.push(SystemSetting::Power { knob: PowerKnob::Sleep, on_battery, value: secs(d, "sleep")? });
+            }
+            if let Some(d) = screen {
+                out.push(SystemSetting::Power {
+                    knob: PowerKnob::ScreenOff,
+                    on_battery,
+                    value: secs(d, "screen-off")?,
+                });
+            }
+            if let Some(l) = l {
+                out.push(SystemSetting::Power { knob: PowerKnob::Lid, on_battery, value: lid(l) });
+            }
+            Ok(())
+        };
+        knobs(false, p.sleep, p.screen_off, p.lid)?;
+        if let Some(b) = p.on_battery {
+            knobs(true, b.sleep, b.screen_off, b.lid)?;
+        }
+        if let Some(on) = p.hibernation {
+            out.push(SystemSetting::Hibernation { on });
+        }
+    }
+    if let Some(on) = s.remote_desktop {
+        out.push(SystemSetting::RemoteDesktop { on });
+    }
+    if let Some(w) = s.windows_update {
+        let machine = [HiveScope::CurrentUser];
+        if let Some(on) = w.automatic {
+            registry.push(dword(WINDOWS_UPDATE_AU, "NoAutoUpdate", u32::from(!on), &machine));
+        }
+        if let Some(on) = w.restart_while_signed_in {
+            registry.push(dword(WINDOWS_UPDATE_AU, "NoAutoRebootWithLoggedOnUsers", u32::from(!on), &machine));
+        }
+        if let Some(hours) = w.active_hours {
+            let parsed = hours
+                .split_once('-')
+                .and_then(|(a, b)| Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?)));
+            let Some((start, end)) = parsed.filter(|(a, b)| *a < 24 && *b < 24 && a != b) else {
+                bail!("windows-update active-hours '{hours}' should be like 8-20 (hours of the day)");
+            };
+            if (end + 24 - start) % 24 > 18 {
+                bail!("windows-update active-hours '{hours}': Windows allows at most 18 hours");
+            }
+            registry.push(dword(WINDOWS_UPDATE, "SetActiveHours", 1, &machine));
+            registry.push(dword(WINDOWS_UPDATE, "ActiveHoursStart", start, &machine));
+            registry.push(dword(WINDOWS_UPDATE, "ActiveHoursEnd", end, &machine));
+        }
+        for (days, max, flag, period) in [
+            (w.defer_feature_updates, 365, "DeferFeatureUpdates", "DeferFeatureUpdatesPeriodInDays"),
+            (w.defer_quality_updates, 30, "DeferQualityUpdates", "DeferQualityUpdatesPeriodInDays"),
+        ] {
+            if let Some(days) = days {
+                if days > max {
+                    bail!("windows-update: {period} can be at most {max} days");
+                }
+                registry.push(dword(WINDOWS_UPDATE, flag, u32::from(days > 0), &machine));
+                registry.push(dword(WINDOWS_UPDATE, period, days, &machine));
+            }
+        }
+        if let Some(on) = w.drivers {
+            registry.push(dword(WINDOWS_UPDATE, "ExcludeWUDriversInQualityUpdate", u32::from(!on), &machine));
+        }
+    }
+    out.sort_by_key(SystemSetting::order);
+    Ok(out)
+}
+
+const WINDOWS_UPDATE: &str = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate";
+const WINDOWS_UPDATE_AU: &str = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU";
+
 /// `firefox.extensions`: by addons.mozilla.org name, or by id and address for others.
 fn resolve_firefox_extensions(e: raw::FirefoxExtensionsFull) -> Result<Vec<FirefoxExtension>> {
     let plain = |s: &str| !s.is_empty() && !s.contains(['\\', '/', ' ']);
@@ -2241,6 +2361,10 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         .filter(|b| !top.firefox_extensions.iter().any(|t| same_extension(t, b)))
         .collect();
     firefox_extensions.extend(top.firefox_extensions);
+    let mut system: Vec<SystemSetting> =
+        base.system.into_iter().filter(|b| !top.system.iter().any(|t| t.key() == b.key())).collect();
+    system.extend(top.system);
+    system.sort_by_key(SystemSetting::order);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -2270,6 +2394,7 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         startup,
         scheduled_tasks,
         firefox_extensions,
+        system,
         services,
         firewall,
         run,
@@ -2814,6 +2939,46 @@ firewall:
             let f = MapFetcher::default().with("https://cfg.test/bad.yaml", bad);
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
             assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn system_settings_parse_merge_and_become_policy() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/base.yaml",
+                "system:\n  computer-name: DEV-01\n  time-zone: Pacific Standard Time\n  power: { plan: high-performance, sleep: never, screen-off: 15m, lid: nothing, on-battery: { sleep: 30m } }\n  remote-desktop: true\n  windows-update: { automatic: false, active-hours: '8-20', defer-feature-updates: 180, drivers: false }",
+            )
+            .with("https://cfg.test/top.yaml", "extends: base.yaml\nsystem: { power: { sleep: 2h }, time-zone: UTC }")
+            .with("https://cfg.test/bad1.yaml", "system: { computer-name: '12345' }")
+            .with("https://cfg.test/bad2.yaml", "system: { windows-update: { active-hours: '1-23' } }")
+            .with("https://cfg.test/bad3.yaml", "system: { power: { sleep: soon } }");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let power = |knob: PowerKnob, on_battery: bool| {
+            g.system.iter().find_map(|s| match s {
+                SystemSetting::Power { knob: k, on_battery: b, value } if *k == knob && *b == on_battery => {
+                    Some(*value)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(power(PowerKnob::Sleep, false), Some(7200), "the top file's sleep wins");
+        assert_eq!(power(PowerKnob::ScreenOff, false), Some(900));
+        assert_eq!(power(PowerKnob::Lid, false), Some(0));
+        assert_eq!(power(PowerKnob::Sleep, true), Some(1800));
+        assert!(g.system.contains(&SystemSetting::TimeZone { id: "UTC".into() }));
+        assert_eq!(g.system[0], SystemSetting::ComputerName { name: "DEV-01".into() }, "in order: the name first");
+        let policy = |name: &str| g.registry.iter().find(|r| r.name.as_deref() == Some(name)).map(|r| r.data.clone());
+        assert_eq!(policy("NoAutoUpdate"), Some(RegistryData::Dword(1)));
+        assert_eq!(policy("ActiveHoursEnd"), Some(RegistryData::Dword(20)));
+        assert_eq!(policy("DeferFeatureUpdatesPeriodInDays"), Some(RegistryData::Dword(180)));
+        assert_eq!(policy("ExcludeWUDriversInQualityUpdate"), Some(RegistryData::Dword(1)));
+        let plan = crate::engine::plan(&g);
+        assert!(plan.iter().any(|s| s.title == "sleep after 2 h plugged in"), "{plan:#?}");
+        assert!(plan.iter().any(|s| s.title == "name this computer DEV-01 (after a restart)"));
+        for bad in ["bad1", "bad2", "bad3"] {
+            assert!(load_with(&f, &format!("https://cfg.test/{bad}.yaml"), dir.path()).is_err(), "{bad}");
         }
     }
 

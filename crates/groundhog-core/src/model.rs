@@ -42,6 +42,7 @@ pub struct Groundhogfile {
     pub startup: Vec<StartupItem>,
     pub scheduled_tasks: Vec<TaskRule>,
     pub firefox_extensions: Vec<FirefoxExtension>,
+    pub system: Vec<SystemSetting>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -275,6 +276,99 @@ pub struct TrayIcon {
     pub program: String,
     /// On the taskbar (`true`) or in the overflow.
     pub shown: bool,
+}
+
+/// One of the machine settings under `system:`; each is its own step.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "setting", rename_all = "kebab-case")]
+pub enum SystemSetting {
+    /// Takes effect after a restart.
+    ComputerName {
+        name: String,
+    },
+    /// A Windows time zone id (`Pacific Standard Time`), as `tzutil /l` lists them.
+    TimeZone {
+        id: String,
+    },
+    /// The active power plan, by its well-known id.
+    PowerPlan {
+        plan: PowerPlan,
+    },
+    /// A power plan value for the active plan, plugged in or on battery.
+    Power {
+        knob: PowerKnob,
+        on_battery: bool,
+        value: u32,
+    },
+    Hibernation {
+        on: bool,
+    },
+    /// Remote Desktop connections, with Network Level Authentication and their firewall rules.
+    RemoteDesktop {
+        on: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PowerPlan {
+    Balanced,
+    HighPerformance,
+    PowerSaver,
+    Ultimate,
+}
+
+impl PowerPlan {
+    /// Windows' own id for the plan.
+    pub fn guid(self) -> &'static str {
+        match self {
+            PowerPlan::Balanced => "381b4222-f694-41f0-9685-ff5bb260df2e",
+            PowerPlan::HighPerformance => "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+            PowerPlan::PowerSaver => "a1841308-3541-4fab-bc81-f71556f20b4a",
+            PowerPlan::Ultimate => "e9a42b02-d5df-448d-aa00-03f14749eb61",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PowerPlan::Balanced => "Balanced",
+            PowerPlan::HighPerformance => "High performance",
+            PowerPlan::PowerSaver => "Power saver",
+            PowerPlan::Ultimate => "Ultimate Performance",
+        }
+    }
+}
+
+/// A power plan setting: seconds before sleep or the screen goes off (0: never), or what
+/// closing the lid does (0 nothing, 1 sleep, 2 hibernate, 3 shut down).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PowerKnob {
+    Sleep,
+    ScreenOff,
+    Lid,
+}
+
+impl SystemSetting {
+    /// What a later file replaces: the same setting (for power values, plugged in or not).
+    pub fn key(&self) -> String {
+        match self {
+            SystemSetting::Power { knob, on_battery, .. } => format!("power {knob:?} {on_battery}"),
+            other => format!("{:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    /// The order they're applied in: the plan before its values.
+    pub fn order(&self) -> u8 {
+        match self {
+            SystemSetting::ComputerName { .. } => 0,
+            SystemSetting::TimeZone { .. } => 1,
+            SystemSetting::PowerPlan { .. } => 2,
+            SystemSetting::Power { .. } => 3,
+            SystemSetting::Hibernation { .. } => 4,
+            SystemSetting::RemoteDesktop { .. } => 5,
+        }
+    }
 }
 
 /// A Firefox extension, installed for every account through Firefox's enterprise policy
@@ -845,7 +939,7 @@ pub(crate) mod raw {
 
     use super::{
         CertScope, CertStore, EnvScope, EventsSince, FirewallAction, FirewallDirection, FirewallProtocol, HiveScope,
-        Presence, RegistryType, ServiceState, Shell, StartupType, ThemeMode, WallpaperStyle,
+        PowerPlan, Presence, RegistryType, ServiceState, Shell, StartupType, ThemeMode, WallpaperStyle,
     };
 
     #[derive(Debug, Default, Deserialize)]
@@ -897,6 +991,56 @@ pub(crate) mod raw {
         pub startup: Option<StartupFull>,
         pub scheduled_tasks: Option<TasksFull>,
         pub firefox: Option<FirefoxFull>,
+        pub system: Option<SystemFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct SystemFull {
+        pub computer_name: Option<String>,
+        pub time_zone: Option<String>,
+        pub power: Option<PowerFull>,
+        pub remote_desktop: Option<bool>,
+        pub windows_update: Option<WindowsUpdateFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct PowerFull {
+        pub plan: Option<PowerPlan>,
+        pub sleep: Option<Duration>,
+        pub screen_off: Option<Duration>,
+        pub hibernation: Option<bool>,
+        pub lid: Option<LidAction>,
+        pub on_battery: Option<BatteryFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct BatteryFull {
+        pub sleep: Option<Duration>,
+        pub screen_off: Option<Duration>,
+        pub lid: Option<LidAction>,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum LidAction {
+        Nothing,
+        Sleep,
+        Hibernate,
+        ShutDown,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct WindowsUpdateFull {
+        pub automatic: Option<bool>,
+        pub active_hours: Option<String>,
+        pub restart_while_signed_in: Option<bool>,
+        pub defer_feature_updates: Option<u32>,
+        pub defer_quality_updates: Option<u32>,
+        pub drivers: Option<bool>,
     }
 
     #[derive(Debug, Deserialize)]

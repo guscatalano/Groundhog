@@ -16,9 +16,9 @@ use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
     App, Capability, CertScope, Certificate, Check, DefenderExclusion, DesktopShortcut, EnvScope, Feature, FileCopy,
-    FirefoxExtension, FirewallRule, Groundhogfile, LanguageSetting, LockScreen, Presence, RegistryData, RegistryValue,
-    RunAction, ScreenSaver, Service, ServiceState, StartPins, StartupItem, TaskRule, TaskState, Theme, ThemeMode,
-    TrayIcon, User, Wallpaper,
+    FirefoxExtension, FirewallRule, Groundhogfile, LanguageSetting, LockScreen, PowerKnob, Presence, RegistryData,
+    RegistryValue, RunAction, ScreenSaver, Service, ServiceState, StartPins, StartupItem, SystemSetting, TaskRule,
+    TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -82,6 +82,7 @@ pub enum Action {
     Startup(StartupItem),
     ScheduledTask(TaskRule),
     FirefoxExtension(FirefoxExtension),
+    System(SystemSetting),
 }
 
 impl Action {
@@ -208,6 +209,7 @@ fn title(action: &Action) -> String {
         Action::DesktopShortcut(d) if d.state.is_present() => format!("put a {} shortcut on the desktop", d.name),
         Action::DesktopShortcut(d) => format!("take the {} shortcut off the desktop", d.name),
         Action::RestartExplorer { .. } => "restart Explorer to show the taskbar and desktop now".to_owned(),
+        Action::System(s) => system_title(s),
         Action::FirefoxExtension(e) if e.state.is_present() => {
             format!("add {} to Firefox{}", e.name, if e.locked { " (locked)" } else { "" })
         }
@@ -361,6 +363,9 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     // installers), and their restarts are best taken before long installs, not in the middle.
     actions.extend(file.features.iter().cloned().map(Action::Feature));
     actions.extend(file.capabilities.iter().cloned().map(Action::Capability));
+    // The machine's own settings next: a new name, like a feature, takes a restart, which is
+    // best taken with theirs and before long installs.
+    actions.extend(file.system.iter().cloned().map(Action::System));
     actions.extend(file.remove_apps.iter().map(|name| Action::RemoveApp { name: name.clone() }));
     if file.apps.iter().any(|a| matches!(a, App::Winget { .. })) {
         actions.push(Action::EnsureWinget);
@@ -435,6 +440,34 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
 
 /// The secrets an action refers to with `${secret:NAME}`. (User passwords aren't included:
 /// an existing account's password is left alone, so rotating one isn't a reason to rerun.)
+fn system_title(s: &SystemSetting) -> String {
+    let when = |on_battery: bool| if on_battery { "on battery" } else { "plugged in" };
+    let after = |secs: u32| match secs {
+        0 => "never".to_owned(),
+        s if s % 3600 == 0 => format!("after {} h", s / 3600),
+        s if s % 60 == 0 => format!("after {} min", s / 60),
+        s => format!("after {s} s"),
+    };
+    match s {
+        SystemSetting::ComputerName { name } => format!("name this computer {name} (after a restart)"),
+        SystemSetting::TimeZone { id } => format!("set the time zone to {id}"),
+        SystemSetting::PowerPlan { plan } => format!("use the {} power plan", plan.name()),
+        SystemSetting::Power { knob: PowerKnob::Sleep, on_battery, value } => {
+            format!("sleep {} {}", after(*value), when(*on_battery))
+        }
+        SystemSetting::Power { knob: PowerKnob::ScreenOff, on_battery, value } => {
+            format!("turn the screen off {} {}", after(*value), when(*on_battery))
+        }
+        SystemSetting::Power { knob: PowerKnob::Lid, on_battery, value } => {
+            let does = ["do nothing", "sleep", "hibernate", "shut down"].get(*value as usize).copied().unwrap_or("?");
+            format!("{does} when the lid closes {}", when(*on_battery))
+        }
+        SystemSetting::Hibernation { on } => format!("turn hibernation {}", if *on { "on" } else { "off" }),
+        SystemSetting::RemoteDesktop { on: true } => "allow Remote Desktop connections".to_owned(),
+        SystemSetting::RemoteDesktop { on: false } => "turn Remote Desktop off".to_owned(),
+    }
+}
+
 pub fn secrets_in(action: &Action) -> BTreeSet<String> {
     let texts: Vec<&str> = match action {
         Action::File(FileCopy { content: Some(c), .. }) => vec![c],
@@ -471,6 +504,7 @@ pub enum Outcome {
 fn section(action: &Action) -> &'static str {
     match action {
         Action::Feature(_) | Action::Capability(_) => "windows features",
+        Action::System(_) => "system",
         Action::User(_) => "users",
         Action::RemoveApp { .. } => "remove apps",
         Action::EnsureWinget | Action::App(_) => "apps",

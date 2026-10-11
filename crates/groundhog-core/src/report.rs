@@ -341,6 +341,7 @@ fn label(section: &str) -> &'static str {
         "certificates" => "Certificates",
         "defender" => "Defender",
         "windows features" => "Windows features",
+        "system" => "System",
         "remove apps" => "Removed apps",
         "apps" => "Apps",
         "files" => "Files",

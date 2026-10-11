@@ -785,6 +785,39 @@ it does more than silence prompts: every administrator then runs everything with
 and Store apps and Edge stop working. `never-notify` is almost always what's wanted instead,
 and on a disposable test VM it is what lets automation click through elevation.
 
+## `system`
+
+The machine's own settings.
+
+```yaml
+system:
+  computer-name: DEV-01            # takes effect after a restart
+  time-zone: Pacific Standard Time # Windows' id for it, as `tzutil /l` lists them
+  power:
+    plan: high-performance         # balanced | high-performance | power-saver | ultimate
+    sleep: never                   # plugged in: never, or a time (30m, 2h)
+    screen-off: 15m
+    hibernation: false
+    lid: nothing                   # nothing | sleep | hibernate | shut-down
+    on-battery: { sleep: 15m, screen-off: 5m, lid: sleep }
+  remote-desktop: true             # with Network Level Authentication and its firewall rules
+  windows-update:
+    automatic: false               # don't download and install updates by itself
+    active-hours: '8-20'           # no restarts for updates between these hours (at most 18)
+    restart-while-signed-in: false # never restart for updates while someone is signed in
+    defer-feature-updates: 180     # days (up to 365)
+    defer-quality-updates: 7       # days (up to 30)
+    drivers: false                 # no drivers through Windows Update
+```
+
+Each setting is a step that looks first and changes only what differs. The new name
+waits for a restart: the run pauses for it like a Windows feature does (`--reboot` restarts
+and continues). Power values go to the active plan, after `plan` sets it; a machine without
+a setting (no lid on a desktop or VM) is left as it is. A plan Windows hides (Ultimate
+Performance, usually) is copied from its template first. `windows-update` is Group Policy
+values; deferring updates works on Pro, Enterprise and Education. A later file overrides an
+earlier one setting by setting.
+
 ## `language`
 
 Languages, keyboards and IMEs, formats and locale, as Settings > Time & language sets them.

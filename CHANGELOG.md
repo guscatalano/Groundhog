@@ -4,6 +4,26 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.25.0] - 2026-10-11
+
+### Added
+- **`system:`**: the machine's own settings.
+  - The computer's name, which takes effect after a restart.
+  - The time zone.
+  - The power plan, plus sleep, screen-off and lid action, plugged in and on battery, and
+    hibernation.
+  - Remote Desktop, with Network Level Authentication and its firewall rules.
+  - Windows Update: automatic updates on or off, active hours, no restarts while someone is
+    signed in, deferring feature and quality updates, and leaving out drivers.
+  ```yaml
+  system:
+    computer-name: DEV-01
+    time-zone: Pacific Standard Time
+    power: { plan: high-performance, sleep: never }
+    remote-desktop: true
+    windows-update: { automatic: false, active-hours: '8-20' }
+  ```
+
 ## [0.24.0] - 2026-10-11
 
 ### Changed

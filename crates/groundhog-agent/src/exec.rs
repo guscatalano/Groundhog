@@ -11,8 +11,8 @@ use groundhog_core::engine::{Action, Executor, Outcome, Probe, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
     App, Capability, Certificate, DesktopShortcut, EnvScope, Feature, FileCopy, HiveScope, LanguageSetting, LockScreen,
-    Password, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, StartPins, Theme, ThemeMode,
-    User, Wallpaper, WallpaperStyle,
+    Password, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, StartPins, SystemSetting,
+    Theme, ThemeMode, User, Wallpaper, WallpaperStyle,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
@@ -148,6 +148,15 @@ impl Executor for WinExecutor<'_> {
                 Ok(Outcome::Done { changed: true })
             }
             Action::Startup(st) => crate::startup::set_startup(st, log).map(|changed| Outcome::Done { changed }),
+            Action::System(sys) => {
+                let changed = crate::system::apply(sys, log)?;
+                // A new name is the machine's only after a restart.
+                Ok(if changed && matches!(sys, SystemSetting::ComputerName { .. }) {
+                    self.restart_later_if(true)
+                } else {
+                    Outcome::Done { changed }
+                })
+            }
             Action::FirefoxExtension(e) => {
                 // Its policy values; Firefox installs (or stops installing) it when it next starts.
                 let mut changed = false;
@@ -271,6 +280,7 @@ impl Executor for WinExecutor<'_> {
             Action::DesktopShortcut(d) => would(shortcut_differs(d)?),
             Action::RestartExplorer { .. } => Probe::Unknown,
             Action::Startup(st) => would(crate::startup::startup_differs(st)?),
+            Action::System(sys) => would(crate::system::differs(sys)?),
             Action::FirefoxExtension(e) => {
                 let mut probe = Probe::Satisfied;
                 for r in e.registry() {
