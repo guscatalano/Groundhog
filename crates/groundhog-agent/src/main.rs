@@ -7,6 +7,7 @@ mod checks;
 mod dev;
 mod ensure;
 mod exec;
+mod net;
 mod secrets;
 mod startup;
 mod system;

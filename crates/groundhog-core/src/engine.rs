@@ -16,9 +16,9 @@ use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
     App, Capability, CertScope, Certificate, Check, DefenderExclusion, DesktopShortcut, DevSetting, EnvScope, Feature,
-    FileCopy, FirefoxExtension, FirewallRule, Groundhogfile, LanguageSetting, LockScreen, PowerKnob, Presence,
-    RegistryData, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, StartPins, StartupItem, SystemSetting,
-    TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    FileCopy, FirefoxExtension, FirewallRule, Groundhogfile, LanguageSetting, LockScreen, NetSetting, PowerKnob,
+    Presence, RegistryData, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, StartPins, StartupItem,
+    SystemSetting, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -84,6 +84,7 @@ pub enum Action {
     FirefoxExtension(FirefoxExtension),
     System(SystemSetting),
     Developer(DevSetting),
+    Network(NetSetting),
 }
 
 impl Action {
@@ -211,6 +212,18 @@ fn title(action: &Action) -> String {
         Action::DesktopShortcut(d) => format!("take the {} shortcut off the desktop", d.name),
         Action::RestartExplorer { .. } => "restart Explorer to show the taskbar and desktop now".to_owned(),
         Action::System(s) => system_title(s),
+        Action::Network(n) => match n {
+            NetSetting::Dns { adapter, servers } if servers.is_empty() => {
+                format!("let {adapter} get its DNS servers automatically")
+            }
+            NetSetting::Dns { adapter, servers } => format!("use DNS servers {} on {adapter}", servers.join(", ")),
+            NetSetting::HostsEntry { name, address: Some(a) } => format!("point {name} at {a} in the hosts file"),
+            NetSetting::HostsEntry { name, address: None } => format!("take {name} out of the hosts file"),
+            NetSetting::Drive { letter, path: Some(p) } => format!("map {letter}: to {p} (from the next sign-in)"),
+            NetSetting::Drive { letter, path: None } => format!("unmap {letter}:"),
+            NetSetting::Wifi { ssid, state, .. } if state.is_present() => format!("add the {ssid} Wi-Fi network"),
+            NetSetting::Wifi { ssid, .. } => format!("forget the {ssid} Wi-Fi network"),
+        },
         Action::Developer(d) => match d {
             DevSetting::WslDistro { name } => format!("install the {name} WSL distribution"),
             DevSetting::WslDefault { name } => format!("make {name} the default WSL distribution"),
@@ -393,6 +406,7 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     actions.extend(file.path.iter().map(|p| Action::Path { dir: p.dir.clone(), scope: p.scope, state: p.state }));
     actions.extend(file.registry.iter().cloned().map(Action::Registry));
     actions.extend(file.language.iter().cloned().map(Action::Language));
+    actions.extend(file.network.iter().cloned().map(Action::Network));
     actions.extend(file.firefox_extensions.iter().cloned().map(Action::FirefoxExtension));
     actions.extend(file.wallpaper.iter().cloned().map(Action::Wallpaper));
     actions.extend(file.theme.iter().cloned().map(Action::Theme));
@@ -495,6 +509,7 @@ pub fn secrets_in(action: &Action) -> BTreeSet<String> {
         },
         Action::Run(RunAction::Command { command, .. }) => vec![command],
         Action::Run(RunAction::Script { args: Some(a), .. }) => vec![a],
+        Action::Network(NetSetting::Wifi { password: Some(p), .. }) => vec![p],
         _ => vec![],
     };
     // Validated when the file was loaded, so a parse error can't happen here.
@@ -522,6 +537,7 @@ fn section(action: &Action) -> &'static str {
         Action::Feature(_) | Action::Capability(_) => "windows features",
         Action::System(_) => "system",
         Action::Developer(_) => "developer",
+        Action::Network(_) => "network",
         Action::User(_) => "users",
         Action::RemoveApp { .. } => "remove apps",
         Action::EnsureWinget | Action::App(_) => "apps",

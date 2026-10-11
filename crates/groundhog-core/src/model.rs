@@ -44,6 +44,7 @@ pub struct Groundhogfile {
     pub firefox_extensions: Vec<FirefoxExtension>,
     pub system: Vec<SystemSetting>,
     pub developer: Vec<DevSetting>,
+    pub network: Vec<NetSetting>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -277,6 +278,33 @@ pub struct TrayIcon {
     pub program: String,
     /// On the taskbar (`true`) or in the overflow.
     pub shown: bool,
+}
+
+/// One of the `network:` settings that isn't a plain registry value; each is its own step.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "setting", rename_all = "kebab-case")]
+pub enum NetSetting {
+    /// DNS servers for the adapters a name matches (wildcards); none: back to automatic.
+    Dns { adapter: String, servers: Vec<String> },
+    /// A line in the hosts file; `None` takes the name's lines out.
+    HostsEntry { name: String, address: Option<String> },
+    /// A drive letter mapped to a share for the agent's account, at each sign-in; `None`
+    /// takes the mapping out.
+    Drive { letter: String, path: Option<String> },
+    /// A Wi-Fi network for every account (WPA2/WPA3 personal, or open without a password).
+    Wifi { ssid: String, password: Option<String>, auto_connect: bool, state: Presence },
+}
+
+impl NetSetting {
+    /// What a later file replaces.
+    pub fn key(&self) -> String {
+        match self {
+            NetSetting::Dns { adapter, .. } => format!("dns {}", adapter.to_ascii_lowercase()),
+            NetSetting::HostsEntry { name, .. } => format!("hosts {}", name.to_ascii_lowercase()),
+            NetSetting::Drive { letter, .. } => format!("drive {}", letter.to_ascii_uppercase()),
+            NetSetting::Wifi { ssid, .. } => format!("wifi {ssid}"),
+        }
+    }
 }
 
 /// One of the `developer:` settings that isn't a plain registry value; each is its own step.
@@ -1030,6 +1058,42 @@ pub(crate) mod raw {
         pub firefox: Option<FirefoxFull>,
         pub system: Option<SystemFull>,
         pub developer: Option<DeveloperFull>,
+        pub network: Option<NetworkFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct NetworkFull {
+        pub dns: Option<Vec<DnsFull>>,
+        pub proxy: Option<StringOr<ProxyFull>>,
+        /// name: address, or name: ~ to take it out.
+        pub hosts: Option<BTreeMap<String, Option<String>>>,
+        /// letter: share, or letter: ~ to take it out.
+        pub drives: Option<BTreeMap<String, Option<String>>>,
+        pub wifi: Option<Vec<WifiFull>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct DnsFull {
+        pub adapter: String,
+        pub servers: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProxyFull {
+        pub server: String,
+        pub bypass: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct WifiFull {
+        pub ssid: String,
+        pub password: Option<String>,
+        pub auto_connect: Option<bool>,
+        pub state: Option<Presence>,
     }
 
     #[derive(Debug, Deserialize)]

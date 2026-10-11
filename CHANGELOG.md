@@ -4,6 +4,24 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.27.0] - 2026-10-11
+
+### Added
+- **`network:`**:
+  - DNS servers per adapter (or back to automatic);
+  - this account's proxy (or off);
+  - hosts file entries added and taken out;
+  - mapped drives that connect at each sign-in;
+  - Wi-Fi networks (WPA2 personal or open), with the password as a secret.
+  ```yaml
+  network:
+    dns: [{ adapter: Ethernet, servers: [1.1.1.1, 1.0.0.1] }]
+    hosts: { build.local: 10.0.0.5 }
+    drives: { Z: '\\nas\share' }
+  ```
+  Wi-Fi is untested on real hardware: the test machines have no wireless adapter (there it
+  fails with a clear message).
+
 ## [0.26.0] - 2026-10-11
 
 ### Added

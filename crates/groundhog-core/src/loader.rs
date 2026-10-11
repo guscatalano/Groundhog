@@ -17,9 +17,9 @@ use crate::library;
 use crate::model::{
     App, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion, DesktopShortcut,
     DevSetting, EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirefoxExtension, FirewallProtocol, FirewallRule,
-    Groundhogfile, HiveScope, InputLanguage, LanguageSetting, LockScreen, Password, PathEntry, PowerKnob, Presence,
-    RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell, SourceRef,
-    StartPins, StartupItem, SystemSetting, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    Groundhogfile, HiveScope, InputLanguage, LanguageSetting, LockScreen, NetSetting, Password, PathEntry, PowerKnob,
+    Presence, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell,
+    SourceRef, StartPins, StartupItem, SystemSetting, TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
     WallpaperStyle, raw,
 };
 use crate::secret;
@@ -508,6 +508,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         firefox,
         system,
         developer,
+        network,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -556,6 +557,10 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         None => Vec::new(),
     };
     let (startup, scheduled_tasks) = resolve_startup(startup, scheduled_tasks)?;
+    let network = match network {
+        Some(n) => resolve_network(n, &mut registry).context("network")?,
+        None => Vec::new(),
+    };
     let system = match system {
         Some(s) => resolve_system(s, &mut registry).context("system")?,
         None => Vec::new(),
@@ -671,6 +676,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         firefox_extensions,
         system,
         developer,
+        network,
         services,
         firewall,
         run,
@@ -2036,6 +2042,98 @@ fn resolve_developer(
 pub(crate) const TASKBAR_DEVELOPER_KEY: &str =
     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings";
 
+/// `network:`: the proxy is this account's registry values; the rest are steps.
+fn resolve_network(n: raw::NetworkFull, registry: &mut Vec<RegistryValue>) -> Result<Vec<NetSetting>> {
+    let mut out = Vec::new();
+    for d in n.dns.unwrap_or_default() {
+        if d.adapter.trim().is_empty() || d.adapter.contains('\'') {
+            bail!("dns: '{}' isn't an adapter's name", d.adapter);
+        }
+        for s in &d.servers {
+            if s.parse::<std::net::IpAddr>().is_err() {
+                bail!("dns: '{s}' isn't an IP address");
+            }
+        }
+        out.push(NetSetting::Dns { adapter: d.adapter, servers: d.servers });
+    }
+    if let Some(p) = n.proxy {
+        let user = [HiveScope::CurrentUser];
+        let string = |name: &str, value: String| RegistryValue {
+            key: INTERNET_SETTINGS.to_owned(),
+            name: Some(name.to_owned()),
+            kind: RegistryType::String,
+            data: RegistryData::String(value),
+            scope: user.to_vec(),
+            state: Presence::Present,
+            group_policy: false,
+        };
+        match p {
+            raw::StringOr::Short(off) if off.eq_ignore_ascii_case("off") => {
+                registry.push(dword(INTERNET_SETTINGS, "ProxyEnable", 0, &user));
+            }
+            raw::StringOr::Short(other) => bail!("proxy: '{other}' should be off, or {{ server: host:port }}"),
+            raw::StringOr::Full(f) => {
+                if f.server.trim().is_empty() || f.server.contains(char::is_whitespace) {
+                    bail!("proxy: server '{}' should be host:port", f.server);
+                }
+                registry.push(dword(INTERNET_SETTINGS, "ProxyEnable", 1, &user));
+                registry.push(string("ProxyServer", f.server));
+                if let Some(bypass) = f.bypass {
+                    registry.push(string("ProxyOverride", bypass.join(";")));
+                }
+            }
+        }
+    }
+    for (name, address) in n.hosts.unwrap_or_default() {
+        let ok = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c));
+        if !ok {
+            bail!("hosts: '{name}' isn't a host name");
+        }
+        if let Some(a) = &address
+            && a.parse::<std::net::IpAddr>().is_err()
+        {
+            bail!("hosts: {name}: '{a}' isn't an IP address");
+        }
+        out.push(NetSetting::HostsEntry { name, address });
+    }
+    for (letter, path) in n.drives.unwrap_or_default() {
+        let l = letter.trim_end_matches(':').to_ascii_uppercase();
+        if l.len() != 1 || !l.chars().all(|c| c.is_ascii_uppercase()) {
+            bail!("drives: '{letter}' isn't a drive letter");
+        }
+        if let Some(p) = &path
+            && (!p.starts_with(r"\\") || p.contains('\''))
+        {
+            bail!(r"drives: {l}: '{p}' should be a share, like \\server\share");
+        }
+        out.push(NetSetting::Drive { letter: l, path });
+    }
+    for w in n.wifi.unwrap_or_default() {
+        if w.ssid.is_empty() || w.ssid.len() > 32 || w.ssid.contains(['\'', '"', '<', '>', '&']) {
+            bail!("wifi: '{}' can't be a network name here (1 to 32 characters, no quotes or <>&)", w.ssid);
+        }
+        if let Some(p) = &w.password {
+            if p.contains(['\'', '"', '<', '>', '&']) && !p.contains("${secret:") {
+                bail!("wifi {}: the password can't hold quotes or <>& here", w.ssid);
+            }
+            if !p.contains("${secret:") && !(8..=63).contains(&p.len()) {
+                bail!("wifi {}: a WPA password is 8 to 63 characters", w.ssid);
+            }
+            secret::names(p).with_context(|| format!("wifi {}", w.ssid))?;
+        }
+        out.push(NetSetting::Wifi {
+            ssid: w.ssid,
+            password: w.password,
+            auto_connect: w.auto_connect.unwrap_or(true),
+            state: w.state.unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
+/// This account's Internet Options (the proxy most programs use).
+const INTERNET_SETTINGS: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
 /// `system:` as one step per setting; Windows Update's are policy values.
 fn resolve_system(s: raw::SystemFull, registry: &mut Vec<RegistryValue>) -> Result<Vec<SystemSetting>> {
     let mut out = Vec::new();
@@ -2501,6 +2599,9 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         base.developer.into_iter().filter(|b| !top_developer.iter().any(|t| t.key() == b.key())).collect();
     developer.extend(top_developer);
     developer.sort_by_key(DevSetting::order);
+    let mut network: Vec<NetSetting> =
+        base.network.into_iter().filter(|b| !top.network.iter().any(|t| t.key() == b.key())).collect();
+    network.extend(top.network);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -2532,6 +2633,7 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         firefox_extensions,
         system,
         developer,
+        network,
         services,
         firewall,
         run,
@@ -3077,6 +3179,34 @@ firewall:
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
             assert!(err.contains(why), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn network_settings() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/n.yaml",
+                "network:\n  dns: [{ adapter: Ethernet, servers: [1.1.1.1, '2606:4700:4700::1111'] }]\n  proxy: { server: proxy.example:8080, bypass: ['*.example', '<local>'] }\n  hosts: { build.local: 10.0.0.5, old.local: ~ }\n  drives: { 'z:': '\\\\nas\\share' }\n  wifi: [{ ssid: Office, password: '${secret:WIFI}' }]",
+            )
+            .with("https://cfg.test/off.yaml", "network: { proxy: off }")
+            .with("https://cfg.test/bad.yaml", "network: { hosts: { build.local: not-an-ip } }");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/n.yaml", dir.path()).unwrap().file;
+        let value = |name: &str| g.registry.iter().find(|r| r.name.as_deref() == Some(name)).map(|r| r.data.clone());
+        assert_eq!(value("ProxyEnable"), Some(RegistryData::Dword(1)));
+        assert_eq!(value("ProxyOverride"), Some(RegistryData::String("*.example;<local>".into())));
+        assert!(g.network.contains(&NetSetting::HostsEntry { name: "old.local".into(), address: None }));
+        assert!(g.network.contains(&NetSetting::Drive { letter: "Z".into(), path: Some(r"\\nas\share".into()) }));
+        let plan = crate::engine::plan(&g);
+        assert!(
+            plan.iter().any(|s| s.title == "use DNS servers 1.1.1.1, 2606:4700:4700::1111 on Ethernet"),
+            "{plan:#?}"
+        );
+        let wifi = plan.iter().find(|s| s.title == "add the Office Wi-Fi network").unwrap();
+        assert!(crate::engine::secrets_in(&wifi.action).contains("WIFI"), "its password is a secret");
+        let off = load_with(&f, "https://cfg.test/off.yaml", dir.path()).unwrap().file;
+        assert_eq!(off.registry[0].data, RegistryData::Dword(0));
+        assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
     }
 
     #[test]

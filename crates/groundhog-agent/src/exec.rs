@@ -11,8 +11,8 @@ use groundhog_core::engine::{Action, Executor, Outcome, Probe, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
     App, Capability, Certificate, DesktopShortcut, EnvScope, Feature, FileCopy, HiveScope, LanguageSetting, LockScreen,
-    Password, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, StartPins, SystemSetting,
-    Theme, ThemeMode, User, Wallpaper, WallpaperStyle,
+    NetSetting, Password, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, StartPins,
+    SystemSetting, Theme, ThemeMode, User, Wallpaper, WallpaperStyle,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
@@ -149,6 +149,13 @@ impl Executor for WinExecutor<'_> {
             }
             Action::Startup(st) => crate::startup::set_startup(st, log).map(|changed| Outcome::Done { changed }),
             Action::Developer(d) => crate::dev::apply(d, log).map(|changed| Outcome::Done { changed }),
+            Action::Network(n) => {
+                let password = match n {
+                    NetSetting::Wifi { password: Some(p), .. } => Some(fill(&self.secrets, p)?),
+                    _ => None,
+                };
+                crate::net::apply(n, password.as_deref(), &self.work_dir, log).map(|changed| Outcome::Done { changed })
+            }
             Action::System(sys) => {
                 let changed = crate::system::apply(sys, log)?;
                 // A new name is the machine's only after a restart.
@@ -283,6 +290,7 @@ impl Executor for WinExecutor<'_> {
             Action::Startup(st) => would(crate::startup::startup_differs(st)?),
             Action::System(sys) => would(crate::system::differs(sys)?),
             Action::Developer(d) => would(crate::dev::differs(d)?),
+            Action::Network(n) => would(crate::net::differs(n)?),
             Action::FirefoxExtension(e) => {
                 let mut probe = Probe::Satisfied;
                 for r in e.registry() {

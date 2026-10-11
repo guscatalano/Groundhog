@@ -343,6 +343,7 @@ fn label(section: &str) -> &'static str {
         "windows features" => "Windows features",
         "system" => "System",
         "developer" => "Developer",
+        "network" => "Network",
         "remove apps" => "Removed apps",
         "apps" => "Apps",
         "files" => "Files",

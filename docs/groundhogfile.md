@@ -849,6 +849,39 @@ missing, and `settings` are set key by key in your `settings.json`, keeping ever
 Comments in that file are not kept once it changes. A later file adds settings and overrides
 the ones it names.
 
+## `network`
+
+```yaml
+network:
+  dns:
+    - { adapter: Ethernet, servers: [1.1.1.1, 1.0.0.1] }   # an adapter's name (wildcards); [] = automatic again
+  proxy: { server: proxy.corp.example:8080, bypass: ['*.corp.example', '<local>'] }   # or: off
+  hosts:
+    build.local: 10.0.0.5          # a line in the hosts file
+    old.local: ~                   # its lines taken out
+  drives:
+    Z: '\\nas\share'               # mapped for the agent's account at each sign-in; ~ unmaps
+  wifi:
+    - { ssid: Office, password: '${secret:OFFICE_WIFI}', auto-connect: true }
+    - { ssid: Guest }              # an open network
+    - { ssid: Old, state: absent } # forgotten
+```
+
+- **DNS** servers are set on every adapter the name matches (`Get-NetAdapter` lists them),
+  IPv4 and IPv6 alike; an empty list goes back to the servers the network hands out.
+- **The proxy** is the agent's account's Internet Options proxy, which most programs use (new
+  connections pick it up). `off` turns it off and keeps the address.
+- **The hosts file**: a name gets exactly one line (any other lines for it go); `~` takes it out.
+  Other lines and comments are left alone.
+- **Drives** are kept with the account's mapped drives, so Windows connects them at each
+  sign-in, from the next one on (a drive mapped from the elevated agent wouldn't show in
+  Explorer). They connect as the signed-in user.
+- **Wi-Fi** networks are added for every account, WPA2 personal with a password (it also joins
+  WPA3 networks in transition mode) or open without one. Keep the password a
+  [secret](#secrets): it never reaches the logs, and the profile file is deleted once added.
+  This needs a wireless adapter; Groundhog's own tests ran without one, so a real Wi-Fi network
+  hasn't been tried yet.
+
 ## `language`
 
 Languages, keyboards and IMEs, formats and locale, as Settings > Time & language sets them.
