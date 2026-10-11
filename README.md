@@ -57,6 +57,10 @@ The file can be written on the spot too. For example, to set the desktop backgro
 & ([scriptblock]::Create((irm https://github.com/guscatalano/Groundhog/releases/latest/download/apply.ps1))) https://raw.githubusercontent.com/guscatalano/Groundhog/main/examples/desktop/windows-wallpaper.groundhog.yaml
 ```
 
+[examples/neon/demo.mp4](examples/neon/demo.mp4) shows [the neon sample](examples/neon/neon.groundhog.yaml)
+applied this way to a clean machine: wallpaper and colors, taskbar and Start pins, and PowerShell 7
+in a Terminal themed to match.
+
 Or download from [Releases](https://github.com/guscatalano/Groundhog/releases/latest):
 
 | Asset | Use |
