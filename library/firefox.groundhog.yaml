@@ -1,0 +1,52 @@
+# Firefox for every account, with uBlock Origin and Bitwarden from addons.mozilla.org, and
+# without the terms screen, the first-run tour, the "make Firefox your default" prompt,
+# sponsored shortcuts and stories, recommendations, telemetry or studies. Firefox reads these
+# as enterprise policies (about:policies lists them) and installs the extensions when it next
+# starts; they stay up to date by themselves. On its first start Firefox still asks Windows
+# to pin it to the taskbar: no policy turns that off.
+#
+#   groundhog-agent apply groundhog:firefox
+#
+# More extensions: one key each, named by the extension's id (the AMO page's "Add to Firefox"
+# link ends in its slug; its id is in about:support once installed). In your own file:
+#
+#   extends: groundhog:firefox
+#   registry:
+#     - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\@react-devtools', name: installation_mode, value: normal_installed }
+#     - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\@react-devtools', name: install_url, value: 'https://addons.mozilla.org/firefox/downloads/latest/react-devtools/latest.xpi' }
+#
+# And to leave one of these out, `state: absent` on its two values. `normal_installed` lets
+# people disable an extension but not remove it; `force_installed` locks it on.
+
+apps:
+  - id: Mozilla.Firefox
+    args: --scope machine
+
+registry:
+  # Quiet: no terms screen, tour, default-browser prompt, telemetry or studies.
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox', name: SkipTermsOfUse, type: dword, value: 1 }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox', name: DontCheckDefaultBrowser, type: dword, value: 1 }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox', name: DisableTelemetry, type: dword, value: 1 }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox', name: DisableFirefoxStudies, type: dword, value: 1 }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox', name: OverrideFirstRunPage, value: '' }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox', name: OverridePostUpdatePage, value: '' }
+  # No onboarding, and no recommendations.
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\UserMessaging', name: SkipOnboarding, type: dword, value: 1 }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\UserMessaging', name: ExtensionRecommendations, type: dword, value: 0 }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\UserMessaging', name: FeatureRecommendations, type: dword, value: 0 }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\UserMessaging', name: MoreFromMozilla, type: dword, value: 0 }
+
+  # A plain new tab: no sponsored shortcuts or stories.
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\FirefoxHome', name: SponsoredTopSites, type: dword, value: 0 }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\FirefoxHome', name: SponsoredPocket, type: dword, value: 0 }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\FirefoxHome', name: Pocket, type: dword, value: 0 }
+
+  # uBlock Origin: blocks ads and trackers.
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\uBlock0@raymondhill.net', name: installation_mode, value: normal_installed }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\uBlock0@raymondhill.net', name: install_url, value: 'https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi' }
+  # Bitwarden: the password manager.
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\{446900e4-71c2-419f-a6a7-df9c091e268b}', name: installation_mode, value: normal_installed }
+  - { key: 'HKLM\SOFTWARE\Policies\Mozilla\Firefox\ExtensionSettings\{446900e4-71c2-419f-a6a7-df9c091e268b}', name: install_url, value: 'https://addons.mozilla.org/firefox/downloads/latest/bitwarden-password-manager/latest.xpi' }
+
+verify:
+  - file: '%ProgramFiles%\Mozilla Firefox\firefox.exe'

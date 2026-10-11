@@ -114,7 +114,8 @@ groundhog-agent apply groundhog:windows-internals
 ```
 
 Developer machines too: `dev-core` (Git, GitHub CLI, VS Code, PowerShell 7, the usual command
-line tools), with `dotnet`, `vs`, `node`, `python`, `rust`, `containers` and `ai` on top.
+line tools), with `dotnet`, `vs`, `node`, `python`, `rust`, `containers` and `ai` on top, and
+`firefox` (with uBlock Origin and Bitwarden, and without the first-run prompts).
 Combine them in your own file:
 
 ```yaml

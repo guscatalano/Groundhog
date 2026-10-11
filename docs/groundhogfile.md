@@ -158,6 +158,7 @@ machine that can't reach GitHub can use a copy from your own share by path inste
 | `rust` | The Visual Studio C++ build tools, then rustup with the stable toolchain, clippy and rustfmt, for this user. |
 | `containers` | WSL 2 and Docker Desktop (this user in `docker-users`), with kubectl, Helm, k9s and kind. Needs a restart (apply with `--reboot`) and, in a VM, nested virtualization. Docker Desktop needs a subscription in larger organizations. |
 | `ai` | Claude Code, OpenAI Codex and the GitHub Copilot CLI for every account, kept up to date, and Ollama for this user. |
+| `firefox` | Firefox for every account with uBlock Origin and Bitwarden, as enterprise policies: no terms screen, tour, default-browser prompt, sponsored shortcuts, recommendations, telemetry or studies. Add extensions in your own file, one registry key each (the file shows how). Doesn't build on `dev-core`. |
 
 ## Conditions and variables
 

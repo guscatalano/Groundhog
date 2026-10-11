@@ -4,6 +4,15 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.22.1] - 2026-10-11
+
+### Added
+- **`groundhog:firefox`**: Firefox with uBlock Origin and Bitwarden, set up through Firefox's
+  enterprise policies. It skips the terms screen, the tour, the default-browser prompt,
+  sponsored shortcuts and stories, recommendations, telemetry and studies. You add
+  extensions in your own file, one registry key each, as the template shows. Firefox still
+  asks once, on its first start, to be pinned to the taskbar; no policy turns that off.
+
 ## [0.22.0] - 2026-10-11
 
 ### Added
