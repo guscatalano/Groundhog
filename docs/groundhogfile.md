@@ -882,6 +882,32 @@ network:
   This needs a wireless adapter; Groundhog's own tests ran without one, so a real Wi-Fi network
   hasn't been tried yet.
 
+## `default-apps`
+
+```yaml
+default-apps:
+  browser: Firefox                 # web pages and http/https links
+  pdf: Firefox
+  mail: Thunderbird                # mailto: links
+  associations:                    # any file type or link type
+    .txt: Visual Studio Code
+    .json: Visual Studio Code
+    .log: FindNeedle
+```
+
+Apps are named the way they call themselves: browsers, mail and PDF readers by the name
+they register (Firefox, Google Chrome, Microsoft Edge), other programs by their description
+or file name among those Windows offers in "Open with" for that type (Visual Studio Code,
+Notepad++), or by a ProgId (`VSCode.txt`). An app that isn't installed, or doesn't open that
+type, fails the step and names the apps that do.
+
+**Where it takes effect.** Windows protects each user's own choice from programs, so this
+goes through the two ways Windows offers: the file is imported as the defaults every **new
+account** starts with, and named by the policy that applies it at each sign-in on machines
+managed by a domain or Intune. On a standalone PC, Windows leaves the choices of accounts
+that already exist alone; their user picks once in Settings > Apps > Default apps. Groundhog
+doesn't get around that protection.
+
 ## `language`
 
 Languages, keyboards and IMEs, formats and locale, as Settings > Time & language sets them.

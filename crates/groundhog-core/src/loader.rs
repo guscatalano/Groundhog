@@ -509,6 +509,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         system,
         developer,
         network,
+        default_apps,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -557,6 +558,10 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         None => Vec::new(),
     };
     let (startup, scheduled_tasks) = resolve_startup(startup, scheduled_tasks)?;
+    let default_apps = match default_apps {
+        Some(d) => resolve_default_apps(d).context("default-apps")?,
+        None => BTreeMap::new(),
+    };
     let network = match network {
         Some(n) => resolve_network(n, &mut registry).context("network")?,
         None => Vec::new(),
@@ -677,6 +682,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         system,
         developer,
         network,
+        default_apps,
         services,
         firewall,
         run,
@@ -2042,6 +2048,37 @@ fn resolve_developer(
 pub(crate) const TASKBAR_DEVELOPER_KEY: &str =
     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings";
 
+/// `default-apps:` as one map of file and link types to apps; `browser`, `pdf` and `mail` are
+/// shorthands for the types they open.
+fn resolve_default_apps(d: raw::DefaultAppsFull) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    let app_ok = |a: &str| !a.trim().is_empty() && !a.contains(['\'', '"', '<', '>', '&']);
+    let shorthands =
+        [(d.browser, &["http", "https", ".htm", ".html"][..]), (d.pdf, &[".pdf"][..]), (d.mail, &["mailto"][..])];
+    for (app, types) in shorthands {
+        if let Some(app) = app {
+            if !app_ok(&app) {
+                bail!("'{app}' isn't an app's name");
+            }
+            for t in types {
+                out.insert((*t).to_owned(), app.clone());
+            }
+        }
+    }
+    for (kind, app) in d.associations.unwrap_or_default() {
+        let k = kind.to_ascii_lowercase();
+        let body = k.strip_prefix('.').unwrap_or(&k);
+        if body.is_empty() || !body.chars().all(|c| c.is_ascii_alphanumeric() || "-+_".contains(c)) {
+            bail!("'{kind}' should be a file type (.txt) or a link type (mailto)");
+        }
+        if !app_ok(&app) {
+            bail!("{kind}: '{app}' isn't an app's name");
+        }
+        out.insert(k, app);
+    }
+    Ok(out)
+}
+
 /// `network:`: the proxy is this account's registry values; the rest are steps.
 fn resolve_network(n: raw::NetworkFull, registry: &mut Vec<RegistryValue>) -> Result<Vec<NetSetting>> {
     let mut out = Vec::new();
@@ -2602,6 +2639,8 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
     let mut network: Vec<NetSetting> =
         base.network.into_iter().filter(|b| !top.network.iter().any(|t| t.key() == b.key())).collect();
     network.extend(top.network);
+    let mut default_apps = base.default_apps;
+    default_apps.extend(top.default_apps);
     let theme = match (base.theme, top.theme) {
         (Some(b), Some(t)) => Some(Theme { apps: t.apps.or(b.apps), windows: t.windows.or(b.windows), scope: t.scope }),
         (b, t) => t.or(b),
@@ -2634,6 +2673,7 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         system,
         developer,
         network,
+        default_apps,
         services,
         firewall,
         run,
@@ -3179,6 +3219,38 @@ firewall:
             let err = format!("{:#}", load_with(&f, "https://cfg.test/bad.yaml", dir.path()).unwrap_err());
             assert!(err.contains(why), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn default_apps_expand_and_merge() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/base.yaml",
+                "default-apps: { browser: Firefox, pdf: Firefox, associations: { .TXT: Visual Studio Code } }",
+            )
+            .with("https://cfg.test/top.yaml", "extends: base.yaml\ndefault-apps: { pdf: Acrobat, mail: Thunderbird }")
+            .with("https://cfg.test/bad.yaml", "default-apps: { associations: { 'not a type': Notepad } }");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let got: Vec<(&str, &str)> = g.default_apps.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                (".htm", "Firefox"),
+                (".html", "Firefox"),
+                (".pdf", "Acrobat"),
+                (".txt", "Visual Studio Code"),
+                ("http", "Firefox"),
+                ("https", "Firefox"),
+                ("mailto", "Thunderbird"),
+            ]
+        );
+        let plan = crate::engine::plan(&g);
+        assert!(
+            plan.iter().any(|s| s.title.starts_with("make Acrobat for .pdf; Firefox for .htm, .html, http, https;")),
+            "{plan:#?}"
+        );
+        assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
     }
 
     #[test]

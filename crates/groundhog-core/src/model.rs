@@ -45,6 +45,9 @@ pub struct Groundhogfile {
     pub system: Vec<SystemSetting>,
     pub developer: Vec<DevSetting>,
     pub network: Vec<NetSetting>,
+    /// File types (`.pdf`) and link types (`http`) to the app that opens them, by the app's
+    /// name; Windows applies them at each sign-in.
+    pub default_apps: BTreeMap<String, String>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -1059,6 +1062,16 @@ pub(crate) mod raw {
         pub system: Option<SystemFull>,
         pub developer: Option<DeveloperFull>,
         pub network: Option<NetworkFull>,
+        pub default_apps: Option<DefaultAppsFull>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct DefaultAppsFull {
+        pub browser: Option<String>,
+        pub pdf: Option<String>,
+        pub mail: Option<String>,
+        pub associations: Option<BTreeMap<String, String>>,
     }
 
     #[derive(Debug, Deserialize)]

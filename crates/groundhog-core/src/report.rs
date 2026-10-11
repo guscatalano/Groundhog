@@ -344,6 +344,7 @@ fn label(section: &str) -> &'static str {
         "system" => "System",
         "developer" => "Developer",
         "network" => "Network",
+        "default apps" => "Default apps",
         "remove apps" => "Removed apps",
         "apps" => "Apps",
         "files" => "Files",

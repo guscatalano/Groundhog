@@ -4,7 +4,7 @@
 //! re-running after a reboot, a failure or an edit to the Groundhogfile skips what is already
 //! done and runs only what is new or failed.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -85,6 +85,8 @@ pub enum Action {
     System(SystemSetting),
     Developer(DevSetting),
     Network(NetSetting),
+    /// The default apps, as one associations file for Windows' policy.
+    DefaultApps(BTreeMap<String, String>),
 }
 
 impl Action {
@@ -212,6 +214,16 @@ fn title(action: &Action) -> String {
         Action::DesktopShortcut(d) => format!("take the {} shortcut off the desktop", d.name),
         Action::RestartExplorer { .. } => "restart Explorer to show the taskbar and desktop now".to_owned(),
         Action::System(s) => system_title(s),
+        Action::DefaultApps(map) => {
+            // "Firefox for http, https, .pdf; Visual Studio Code for .txt"
+            let mut by_app: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+            for (kind, app) in map {
+                by_app.entry(app).or_default().push(kind);
+            }
+            let parts: Vec<String> =
+                by_app.iter().map(|(app, kinds)| format!("{app} for {}", kinds.join(", "))).collect();
+            format!("make {} the defaults (from the next sign-in)", parts.join("; "))
+        }
         Action::Network(n) => match n {
             NetSetting::Dns { adapter, servers } if servers.is_empty() => {
                 format!("let {adapter} get its DNS servers automatically")
@@ -420,6 +432,10 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     actions.extend(file.services.iter().cloned().map(Action::Service));
     actions.extend(file.firewall.iter().cloned().map(Action::Firewall));
     actions.extend(file.run.iter().cloned().map(Action::Run));
+    // After apps and commands: the apps must be there to be the defaults.
+    if !file.default_apps.is_empty() {
+        actions.push(Action::DefaultApps(file.default_apps.clone()));
+    }
     // Explorer reads the taskbar's pins and Windows' own desktop icons when it starts: one
     // restart shows them now instead of at the next sign-in. After the commands, which may
     // make the shortcuts the pins point at.
@@ -538,6 +554,7 @@ fn section(action: &Action) -> &'static str {
         Action::System(_) => "system",
         Action::Developer(_) => "developer",
         Action::Network(_) => "network",
+        Action::DefaultApps(_) => "default apps",
         Action::User(_) => "users",
         Action::RemoveApp { .. } => "remove apps",
         Action::EnsureWinget | Action::App(_) => "apps",

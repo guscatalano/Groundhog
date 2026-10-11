@@ -149,6 +149,13 @@ impl Executor for WinExecutor<'_> {
             }
             Action::Startup(st) => crate::startup::set_startup(st, log).map(|changed| Outcome::Done { changed }),
             Action::Developer(d) => crate::dev::apply(d, log).map(|changed| Outcome::Done { changed }),
+            Action::DefaultApps(map) => {
+                let changed = crate::defaults::apply(map, log)?;
+                if changed {
+                    log("Windows applies them at each sign-in, from the next one");
+                }
+                Ok(Outcome::Done { changed })
+            }
             Action::Network(n) => {
                 let password = match n {
                     NetSetting::Wifi { password: Some(p), .. } => Some(fill(&self.secrets, p)?),
@@ -290,6 +297,7 @@ impl Executor for WinExecutor<'_> {
             Action::Startup(st) => would(crate::startup::startup_differs(st)?),
             Action::System(sys) => would(crate::system::differs(sys)?),
             Action::Developer(d) => would(crate::dev::differs(d)?),
+            Action::DefaultApps(map) => would(crate::defaults::differs(map)?),
             Action::Network(n) => would(crate::net::differs(n)?),
             Action::FirefoxExtension(e) => {
                 let mut probe = Probe::Satisfied;

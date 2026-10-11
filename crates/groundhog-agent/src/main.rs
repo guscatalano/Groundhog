@@ -4,6 +4,7 @@
 //! path, URL or zip bundle. Hosts (Sandbox, Hyper-V, Proxmox, ...) only start it and watch.
 
 mod checks;
+mod defaults;
 mod dev;
 mod ensure;
 mod exec;

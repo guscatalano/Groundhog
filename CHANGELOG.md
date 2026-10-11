@@ -4,6 +4,22 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.28.0] - 2026-10-11
+
+### Added
+- **`default-apps:`**: which app opens web pages, PDFs, mail links, or any file or link type.
+  Apps are named the way they call themselves (Firefox, Visual Studio Code), and Groundhog
+  finds the ids Windows needs.
+  ```yaml
+  default-apps: { browser: Firefox, pdf: Firefox, associations: { .txt: Visual Studio Code } }
+  ```
+  - **New accounts** start with them (Windows' own import for new accounts).
+  - **Domain- or Intune-managed machines** apply them at each sign-in.
+  - **Existing accounts on a standalone PC** keep their own choice: Windows protects it, so
+    their user picks once in Settings.
+  - Tested: names resolve to the right ids, and the defaults are imported. Not yet seen on a
+    new account's first sign-in or on a managed machine.
+
 ## [0.27.0] - 2026-10-11
 
 ### Added
