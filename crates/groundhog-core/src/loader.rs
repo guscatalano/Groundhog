@@ -517,6 +517,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         ssh,
         defender,
         bitlocker,
+        edge,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -570,6 +571,9 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     let bitlocker = bitlocker.map(resolve_bitlocker).transpose().context("bitlocker")?;
     if let Some(p) = privacy {
         resolve_privacy(p, &mut registry).context("privacy")?;
+    }
+    if let Some(e) = edge {
+        resolve_edge(e, &mut registry).context("edge")?;
     }
     let default_apps = match default_apps {
         Some(d) => resolve_default_apps(d).context("default-apps")?,
@@ -2423,6 +2427,63 @@ fn resolve_privacy(p: raw::PrivacyFull, registry: &mut Vec<RegistryValue>) -> Re
     Ok(())
 }
 
+/// Where Edge reads its machine policies from.
+const EDGE_POLICIES: &str = r"HKLM\SOFTWARE\Policies\Microsoft\Edge";
+
+/// `edge:` as Edge's machine policies; Edge reads them when it next starts.
+fn resolve_edge(e: raw::EdgeFull, registry: &mut Vec<RegistryValue>) -> Result<()> {
+    let machine = [HiveScope::CurrentUser];
+    let before = registry.len();
+    let mut set = |name: &str, value: u32| registry.push(dword(EDGE_POLICIES, name, value, &machine));
+    if let Some(on) = e.first_run {
+        set("HideFirstRunExperience", u32::from(!on));
+        if !on {
+            // Without the first-run screens nobody is asked, so nothing is imported either.
+            set("AutoImportAtFirstRun", 4);
+        }
+    }
+    if let Some(on) = e.default_browser_prompt {
+        set("DefaultBrowserSettingEnabled", u32::from(on));
+    }
+    if let Some(t) = e.new_tab {
+        let plain = matches!(t, raw::EdgeNewTab::Plain);
+        set("NewTabPageContentEnabled", u32::from(!plain));
+        set("NewTabPageHideDefaultTopSites", u32::from(plain));
+        // 3: no background picture; 0 allows them all again.
+        set("NewTabPageAllowedBackgroundTypes", if plain { 3 } else { 0 });
+    }
+    if let Some(on) = e.sidebar {
+        set("HubsSidebarEnabled", u32::from(on));
+    }
+    if let Some(on) = e.copilot {
+        set("Microsoft365CopilotChatIconEnabled", u32::from(on));
+    }
+    if let Some(on) = e.shopping {
+        set("EdgeShoppingAssistantEnabled", u32::from(on));
+    }
+    if let Some(on) = e.startup_boost {
+        set("StartupBoostEnabled", u32::from(on));
+    }
+    if let Some(on) = e.run_in_background {
+        set("BackgroundModeEnabled", u32::from(on));
+    }
+    if let Some(on) = e.sign_in {
+        set("BrowserSignin", u32::from(on));
+    }
+    if let Some(d) = e.diagnostic_data {
+        let level = match d {
+            raw::EdgeDiagnosticData::Off => 0,
+            raw::EdgeDiagnosticData::Required => 1,
+            raw::EdgeDiagnosticData::Optional => 2,
+        };
+        set("DiagnosticData", level);
+    }
+    if registry.len() == before {
+        bail!("needs at least one setting");
+    }
+    Ok(())
+}
+
 /// `default-apps:` as one map of file and link types to apps; `browser`, `pdf` and `mail` are
 /// shorthands for the types they open.
 fn resolve_default_apps(d: raw::DefaultAppsFull) -> Result<BTreeMap<String, String>> {
@@ -3775,6 +3836,35 @@ firewall:
         assert_eq!(value(r"Windows\System", "PublishUserActivities"), Some(RegistryData::Dword(0)));
         assert_eq!(value("AdvertisingInfo", "DisabledByGroupPolicy"), Some(RegistryData::Dword(1)));
         assert_eq!(value("WindowsAI", "DisableAIDataAnalysis"), Some(RegistryData::Dword(1)));
+        assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
+        assert!(load_with(&f, "https://cfg.test/empty.yaml", dir.path()).is_err());
+    }
+
+    #[test]
+    fn edge_settings() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/base.yaml", "edge: { first-run: false, new-tab: plain, sidebar: false }")
+            .with(
+                "https://cfg.test/top.yaml",
+                "extends: base.yaml\nedge:\n  sidebar: true\n  default-browser-prompt: false\n  diagnostic-data: off",
+            )
+            .with("https://cfg.test/bad.yaml", "edge: { new-tab: busy }")
+            .with("https://cfg.test/empty.yaml", "edge: {}");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let value = |name: &str| {
+            g.registry
+                .iter()
+                .find(|r| r.key == EDGE_POLICIES && r.name.as_deref() == Some(name))
+                .map(|r| r.data.clone())
+        };
+        assert_eq!(value("HideFirstRunExperience"), Some(RegistryData::Dword(1)));
+        assert_eq!(value("AutoImportAtFirstRun"), Some(RegistryData::Dword(4)));
+        assert_eq!(value("NewTabPageContentEnabled"), Some(RegistryData::Dword(0)));
+        assert_eq!(value("NewTabPageAllowedBackgroundTypes"), Some(RegistryData::Dword(3)));
+        assert_eq!(value("HubsSidebarEnabled"), Some(RegistryData::Dword(1)), "the extending file wins");
+        assert_eq!(value("DefaultBrowserSettingEnabled"), Some(RegistryData::Dword(0)));
+        assert_eq!(value("DiagnosticData"), Some(RegistryData::Dword(0)));
         assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
         assert!(load_with(&f, "https://cfg.test/empty.yaml", dir.path()).is_err());
     }

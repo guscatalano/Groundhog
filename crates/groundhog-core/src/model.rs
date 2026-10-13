@@ -1196,6 +1196,38 @@ pub(crate) mod raw {
         pub defender: Option<DefenderFull>,
         pub bitlocker: Option<BitLockerFull>,
         pub powershell: Option<PowerShellFull>,
+        pub edge: Option<EdgeFull>,
+    }
+
+    /// `edge:`, as Edge's machine policies.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct EdgeFull {
+        pub first_run: Option<bool>,
+        pub default_browser_prompt: Option<bool>,
+        pub new_tab: Option<EdgeNewTab>,
+        pub sidebar: Option<bool>,
+        pub copilot: Option<bool>,
+        pub shopping: Option<bool>,
+        pub startup_boost: Option<bool>,
+        pub run_in_background: Option<bool>,
+        pub sign_in: Option<bool>,
+        pub diagnostic_data: Option<EdgeDiagnosticData>,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum EdgeNewTab {
+        Plain,
+        Default,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum EdgeDiagnosticData {
+        Off,
+        Required,
+        Optional,
     }
 
     #[derive(Debug, Deserialize)]

@@ -4,6 +4,16 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.32.0] - 2026-10-13
+
+### Added
+- **`edge:`**: Microsoft Edge without its first-run screens, for every account. `first-run:
+  false` opens Edge straight to a new tab. Also: `default-browser-prompt`, `new-tab: plain` (no
+  news feed, picture or suggested sites), `sidebar`, `copilot`, `shopping`, `startup-boost`,
+  `run-in-background`, `sign-in` and `diagnostic-data`. Each is an Edge machine policy, and
+  Edge honours them on machines no organization manages too.
+- The README shows the neon example's demo, as a GIF beside the video.
+
 ## [0.31.1] - 2026-10-11
 
 ### Fixed

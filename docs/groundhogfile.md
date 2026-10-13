@@ -1202,6 +1202,31 @@ Firefox stops installing it (a copy already installed stays until removed in Fir
 that extends another adds, removes or replaces add-ons by name, and about:policies in Firefox
 shows what it got.
 
+## `edge`
+
+Microsoft Edge without its first-run screens and extras, for every account.
+
+```yaml
+edge:
+  first-run: false                   # no welcome and sign-in screens: straight to a new tab
+  default-browser-prompt: false      # no "make Edge your default browser"
+  new-tab: plain                     # plain | default: no news feed, picture or suggested sites
+  sidebar: false
+  copilot: false                     # the Copilot button by the address bar
+  shopping: false                    # price comparisons and coupons
+  startup-boost: false               # Edge started in the background at sign-in
+  run-in-background: false           # Edge kept running after its last window closes
+  sign-in: false                     # no signing in to Edge (or syncing)
+  diagnostic-data: off               # off | required | optional
+```
+
+Each is one of Edge's machine policies, which Edge reads when it next starts, including on
+machines that aren't managed by an organization (`edge://policy` lists them). Because they're
+policies, Edge's own settings show them as managed by your organization and can't change
+them. `first-run: false` also stops Edge importing another browser's data on its first start,
+since no one is asked. Leave a setting out to keep Edge's default for it; a later file overrides
+the settings it names.
+
 ## `services`
 
 ```yaml
