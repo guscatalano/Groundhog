@@ -554,6 +554,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         edge,
         join,
         domain_controller,
+        windows_365_boot,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -613,6 +614,9 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     }
     if let Some(e) = edge {
         resolve_edge(e, &mut registry).context("edge")?;
+    }
+    if let Some(w) = windows_365_boot {
+        resolve_windows_365_boot(w, &mut registry, &mut apps).context("windows-365-boot")?;
     }
     let default_apps = match default_apps {
         Some(d) => resolve_default_apps(d).context("default-apps")?,
@@ -770,6 +774,7 @@ fn resolve_app(base: &Url, a: raw::App) -> Result<App> {
                 timeout_ms: None,
                 upgrade: false,
                 state: Presence::Present,
+                provision: false,
             });
         }
         raw::App::Full(f) => f,
@@ -778,8 +783,8 @@ fn resolve_app(base: &Url, a: raw::App) -> Result<App> {
     let state = f.state.unwrap_or_default();
     match f.url {
         Some(u) => {
-            if f.version.is_some() || f.upgrade {
-                bail!("app '{}': 'version' and 'upgrade' only apply to winget apps", f.id);
+            if f.version.is_some() || f.upgrade || f.provision {
+                bail!("app '{}': 'version', 'upgrade' and 'provision' only apply to winget apps", f.id);
             }
             if !state.is_present() {
                 bail!(
@@ -815,7 +820,18 @@ fn resolve_app(base: &Url, a: raw::App) -> Result<App> {
             if !state.is_present() && (f.version.is_some() || f.upgrade) {
                 bail!("app '{}': 'version' and 'upgrade' don't go with 'state: absent'", f.id);
             }
-            Ok(App::Winget { id: f.id, version: f.version, args: f.args, timeout_ms, upgrade: f.upgrade, state })
+            if f.provision && !state.is_present() {
+                bail!("app '{}': 'provision' doesn't go with 'state: absent'", f.id);
+            }
+            Ok(App::Winget {
+                id: f.id,
+                version: f.version,
+                args: f.args,
+                timeout_ms,
+                upgrade: f.upgrade,
+                state,
+                provision: f.provision,
+            })
         }
     }
 }
@@ -2544,6 +2560,52 @@ fn resolve_domain_controller(d: raw::DomainControllerFull) -> Result<DomainContr
     Ok(DomainController { domain, netbios, safe_mode_password })
 }
 
+/// Windows App, which Windows 365 Boot signs in to the Cloud PC with: winget's package, and
+/// the Microsoft Store's.
+pub const WINDOWS_APP_IDS: [&str; 2] = ["Microsoft.WindowsApp", "9N1F85V9T8BN"];
+
+/// `windows-365-boot:` as the values Microsoft lists for a Windows 365 Boot device ("Physical
+/// device registry key configuration" in Troubleshoot Windows 365 Boot), and Windows App for
+/// every account.
+fn resolve_windows_365_boot(
+    w: raw::Windows365BootFull,
+    registry: &mut Vec<RegistryValue>,
+    apps: &mut Vec<App>,
+) -> Result<()> {
+    let machine = [HiveScope::CurrentUser];
+    let device = r"HKLM\SOFTWARE\Microsoft\PolicyManager\current\device";
+    registry.push(dword(&format!(r"{device}\CloudDesktop"), "BootToCloudMode", 1, &machine));
+    // The lightweight shell that starts the Cloud PC connection instead of Explorer.
+    registry.push(dword(&format!(r"{device}\WindowsLogon"), "OverrideShellProgram", 1, &machine));
+    if let Some(t) = w.connection_timeout {
+        let minutes = duration_ms(t)? / 60_000;
+        if !(5..=20).contains(&minutes) {
+            bail!("connection-timeout is 5m to 20m, not {minutes}m");
+        }
+        registry.push(dword(&format!(r"{device}\CloudDesktop"), "SetMaxConnectionTimeout", minutes as u32, &machine));
+    }
+    if w.mode == raw::Windows365BootMode::Shared {
+        // Shared PC mode: fast switching between accounts, and their cleanup.
+        let shared = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\SharedPC\NodeValues";
+        registry.push(dword(shared, "01", 1, &machine));
+        registry.push(dword(shared, "18", 1, &machine));
+    }
+    if !apps.iter().any(|a| WINDOWS_APP_IDS.iter().any(|id| a.id().eq_ignore_ascii_case(id))) {
+        // Provisioned, so every account that signs in has it; downloaded by winget rather
+        // than from the Store, which machines that keep Windows Update in-house can't reach.
+        apps.push(App::Winget {
+            id: WINDOWS_APP_IDS[0].to_owned(),
+            version: None,
+            upgrade: false,
+            args: None,
+            timeout_ms: None,
+            state: Presence::Present,
+            provision: true,
+        });
+    }
+    Ok(())
+}
+
 /// A password given as `{ secret: NAME }` or `${secret:NAME}`: never the password itself.
 fn secret_name(v: raw::StringOr<raw::SecretRef>) -> Result<String> {
     let name = match v {
@@ -3455,7 +3517,8 @@ run:
                 args: None,
                 timeout_ms: None,
                 upgrade: false,
-                state: Presence::Present
+                state: Presence::Present,
+                provision: false,
             }
         );
         let App::Url { url, .. } = &g.apps[1] else { panic!() };
@@ -4062,6 +4125,31 @@ firewall:
         for bad in ["both", "single", "longnb"] {
             assert!(load("server", &format!("https://cfg.test/{bad}.yaml")).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn windows_365_boot() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/shared.yaml", "windows-365-boot: { mode: shared, connection-timeout: 10m }")
+            .with(
+                "https://cfg.test/dedicated.yaml",
+                "apps: [{ id: 9N1F85V9T8BN, args: --source msstore }]\nwindows-365-boot: { mode: dedicated }",
+            )
+            .with("https://cfg.test/slow.yaml", "windows-365-boot: { mode: shared, connection-timeout: 30m }");
+        let dir = tempfile::tempdir().unwrap();
+        let has = |g: &Groundhogfile, name: &str| g.registry.iter().any(|r| r.name.as_deref() == Some(name));
+
+        let shared = load_with(&f, "https://cfg.test/shared.yaml", dir.path()).unwrap().file;
+        assert!(has(&shared, "BootToCloudMode") && has(&shared, "OverrideShellProgram") && has(&shared, "18"));
+        let timeout = shared.registry.iter().find(|r| r.name.as_deref() == Some("SetMaxConnectionTimeout")).unwrap();
+        assert_eq!(timeout.data, RegistryData::Dword(10));
+        assert!(matches!(&shared.apps[..], [App::Winget { id, provision: true, .. }] if id == "Microsoft.WindowsApp"));
+
+        // The file's own Windows App entry is kept, not doubled; no Shared PC mode.
+        let dedicated = load_with(&f, "https://cfg.test/dedicated.yaml", dir.path()).unwrap().file;
+        assert_eq!(dedicated.apps.len(), 1);
+        assert!(has(&dedicated, "BootToCloudMode") && !has(&dedicated, "18"));
+        assert!(load_with(&f, "https://cfg.test/slow.yaml", dir.path()).is_err());
     }
 
     #[test]

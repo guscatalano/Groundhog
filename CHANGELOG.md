@@ -4,6 +4,24 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.36.0] - 2026-10-14
+
+### Added
+- **`windows-365-boot:`**: makes the machine a Windows 365 Boot device, in `shared` or
+  `dedicated` mode, so signing in signs in to the person's Cloud PC. It writes the values
+  Microsoft lists for such a device, and provisions Windows App for every account. No Intune
+  needed. `groundhog-agent undo` takes it off again.
+- **`provision: true` on a winget app**: the MSIX package is downloaded by winget and
+  provisioned, so every account has it, new ones too. Windows App needs this: winget's
+  `--scope machine` fails for it, and the Store's install needs Windows Update's servers.
+- **`groundhog:remote-access`**: Windows App, mRemoteNG, PuTTY, RDPeek's Companion and
+  MonitorAnchor, for every account.
+
+### Changed
+- An app from a URL that's an MSIX or APPX package is now installed for every account, new
+  ones included, not only the agent's. A package Windows can't install that way is still
+  installed for the agent's account.
+
 ## [0.35.0] - 2026-10-14
 
 ### Added

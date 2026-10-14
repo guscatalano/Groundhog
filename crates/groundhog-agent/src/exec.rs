@@ -129,8 +129,11 @@ impl WinExecutor<'_> {
         env::refresh_process_path();
         match &step.action {
             Action::EnsureWinget => self.ensure_winget(log),
-            Action::App(App::Winget { id, version, args, timeout_ms, upgrade, state }) => {
+            Action::App(App::Winget { id, version, args, timeout_ms, upgrade, state, provision }) => {
                 let want = WingetWant { version: version.as_deref(), upgrade: *upgrade, present: state.is_present() };
+                if *provision {
+                    return self.winget_provision(id, version.as_deref(), *timeout_ms, log);
+                }
                 self.winget_app(id, want, args.as_deref(), *timeout_ms, log)
             }
             Action::App(App::Url { url, sha256, resolved, args, timeout_ms, .. }) => {
@@ -318,7 +321,7 @@ impl WinExecutor<'_> {
         let would = |changes: bool| if changes { Probe::WouldChange } else { Probe::Satisfied };
         Ok(match &step.action {
             Action::EnsureWinget => would(winget::locate().is_none()),
-            Action::App(App::Winget { id, version, upgrade, state, .. }) => {
+            Action::App(App::Winget { id, version, upgrade, state, provision: false, .. }) => {
                 let Some(winget) = winget::locate() else { return Ok(Probe::WouldChange) };
                 match (installed_version(&winget, id)?, state.is_present()) {
                     (None, present) => would(present),
@@ -330,7 +333,8 @@ impl WinExecutor<'_> {
                     },
                 }
             }
-            Action::App(App::Url { .. }) => Probe::Unknown,
+            // winget doesn't list provisioned packages, and its id isn't the package's name.
+            Action::App(App::Url { .. } | App::Winget { provision: true, .. }) => Probe::Unknown,
             Action::File(f) => self.check_file(f)?,
             Action::Env { name, value, scope, state } => {
                 let scope = env_scope(*scope);
@@ -575,6 +579,68 @@ impl WinExecutor<'_> {
         winget_outcome(code, id, verb)
     }
 
+    /// Downloads an MSIX package with winget and provisions it with its dependencies, so every
+    /// account has it, new ones too. winget's `--scope machine` fails for some (Windows App:
+    /// access denied), and the Store's machine-wide install needs Windows Update's servers.
+    fn winget_provision(
+        &mut self,
+        id: &str,
+        version: Option<&str>,
+        timeout_ms: Option<u64>,
+        log: &mut dyn FnMut(&str),
+    ) -> Result<Outcome> {
+        let winget = self.winget()?.to_path_buf();
+        let dir = self.work_dir.join("provision").join(id.replace(|c: char| !c.is_ascii_alphanumeric(), "_"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let dir_s = dir.to_string_lossy().into_owned();
+        let mut args = vec!["download", "--id", id, "--exact", "--download-directory", dir_s.as_str()];
+        args.extend(["--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"]);
+        if let Some(v) = version {
+            args.extend(["--version", v]);
+        }
+        let code = Proc::new(&winget).args(args).timeout_ms(timeout_ms).run(log)?.code;
+        match code {
+            0 => {}
+            codes::NO_APPLICATIONS_FOUND => bail!("no winget package with id '{id}'"),
+            other => bail!("winget download failed with {other:#010X}"),
+        }
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'\n\
+             $d = '{dir}'\n\
+             $main = Get-ChildItem $d -File | Where-Object Extension -in '.msix', '.msixbundle', '.appx', '.appxbundle' | Select-Object -First 1\n\
+             if (-not $main) {{ throw '{id} has no MSIX package, so it can''t be provisioned: install it without provision' }}\n\
+             $deps = @()\n\
+             $depdir = Join-Path $d 'Dependencies'\n\
+             if (Test-Path $depdir) {{\n\
+             \x20 foreach ($z in Get-ChildItem $depdir -Filter *.zip) {{ Expand-Archive $z.FullName (Join-Path $depdir $z.BaseName) -Force }}\n\
+             \x20 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {{ 'arm64' }} else {{ 'x64' }}\n\
+             \x20 $deps = @(Get-ChildItem $depdir -Recurse -File | Where-Object {{ $_.Extension -in '.msix', '.appx' -and $_.Name -match \"$arch|neutral\" }} | ForEach-Object FullName)\n\
+             }}\n\
+             $before = @(Get-AppxProvisionedPackage -Online | ForEach-Object PackageName)\n\
+             $p = @{{ Online = $true; PackagePath = $main.FullName; SkipLicense = $true }}\n\
+             if ($deps) {{ $p.DependencyPackagePath = $deps }}\n\
+             Add-AppxProvisionedPackage @p | Out-Null\n\
+             $new = @(Get-AppxProvisionedPackage -Online | Where-Object {{ $before -notcontains $_.PackageName }})\n\
+             if ($new) {{ $new | ForEach-Object {{ \"provisioned $($_.DisplayName) $($_.Version) for every account\" }}; 'changed' }}\n\
+             else {{ 'already provisioned'; 'same' }}",
+            dir = dir_s.replace('\'', "''"),
+            id = id.replace('\'', "''"),
+        );
+        let mut lines = Vec::new();
+        let out = powershell(Shell::Powershell, &script).run(&mut |l| {
+            lines.push(l.trim().to_owned());
+            if !matches!(l.trim(), "changed" | "same") {
+                log(l);
+            }
+        })?;
+        let _ = std::fs::remove_dir_all(&dir);
+        if out.code != 0 {
+            bail!("provisioning {id} failed (PowerShell exited with {})", out.code);
+        }
+        Ok(Outcome::Done { changed: lines.iter().any(|l| l == "changed") })
+    }
+
     fn url_install(
         &mut self,
         url: &Url,
@@ -589,7 +655,18 @@ impl WinExecutor<'_> {
         let proc = match ext.as_str() {
             "msi" => Proc::new("msiexec.exe").args(["/i", path.as_str(), "/qn", "/norestart"]).raw(args),
             "msix" | "msixbundle" | "appx" | "appxbundle" => {
-                powershell(Shell::Powershell, &format!("Add-AppxPackage -Path '{}'", path.replace('\'', "''")))
+                // Provisioned, so every account gets it, new ones included; and added for this
+                // one now. A package that can't be provisioned (a missing framework) is added
+                // for this account only, as before.
+                let script = format!(
+                    "$ErrorActionPreference = 'Stop'\n\
+                     $p = '{}'\n\
+                     try {{ Add-AppxProvisionedPackage -Online -PackagePath $p -SkipLicense | Out-Null; 'provisioned for every account' }}\n\
+                     catch {{ \"not provisioned for every account: $($_.Exception.Message.Trim())\" }}\n\
+                     Add-AppxPackage -Path $p",
+                    path.replace('\'', "''")
+                );
+                powershell(Shell::Powershell, &script)
             }
             "exe" => Proc::new(&installer).raw(args),
             other => bail!("don't know how to install '.{other}' files (supported: msi, msix, appx, exe)"),

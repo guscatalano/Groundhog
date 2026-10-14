@@ -1110,6 +1110,7 @@ mod tests {
             timeout_ms: None,
             upgrade: true,
             state: Presence::Present,
+            provision: false,
         });
         let steps = plan(&g);
         let titles: Vec<&str> = steps.iter().map(|s| s.title.as_str()).collect();
@@ -1340,6 +1341,7 @@ mod tests {
             timeout_ms: None,
             upgrade: false,
             state: Presence::Present,
+            provision: false,
         });
         assert_eq!(plan(&g)[0].action, Action::EnsureWinget);
     }

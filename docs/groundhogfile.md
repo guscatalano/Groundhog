@@ -213,6 +213,7 @@ machine that can't reach GitHub can use a copy from your own share by path inste
 | `containers` | WSL 2 and Docker Desktop (this user in `docker-users`), with kubectl, Helm, k9s and kind. Needs a restart (apply with `--reboot`) and, in a VM, nested virtualization. Docker Desktop needs a subscription in larger organizations. |
 | `ai` | Claude Code, OpenAI Codex and the GitHub Copilot CLI for every account, kept up to date, and Ollama for this user. |
 | `firefox` | Firefox for every account with uBlock Origin and Bitwarden, as enterprise policies: no terms screen, tour, default-browser prompt, sponsored shortcuts, recommendations, telemetry or studies. Add or remove extensions in your own file with [`firefox.extensions`](#firefox). Doesn't build on `dev-core`. |
+| `remote-access` | Windows App (Windows 365, Azure Virtual Desktop and Remote Desktop, from the Microsoft Store), mRemoteNG, PuTTY, RDPeek's Companion and MonitorAnchor (with its certificate trusted), for every account. Doesn't build on `dev-core`. |
 
 ## Conditions and variables
 
@@ -466,6 +467,51 @@ fails to load until that value is set to 0.
 None of these are undone by `undo`: leave a domain or Entra ID, or remove a work account, in
 Settings.
 
+## `windows-365-boot`
+
+Makes the machine a [Windows 365 Boot](https://learn.microsoft.com/windows-365/enterprise/windows-365-boot-overview)
+device: signing in to it signs in to the person's Cloud PC instead of the machine itself.
+
+```yaml
+windows-365-boot:
+  mode: shared               # shared: several people, each to their own Cloud PC | dedicated: one person
+  connection-timeout: 10m    # optional: how long sign-in waits for the Cloud PC, 5m to 20m (5m)
+```
+
+It writes the values Microsoft lists for a Windows 365 Boot device, the ones Intune's Windows
+365 Boot guide sets
+([Troubleshoot Windows 365 Boot](https://learn.microsoft.com/troubleshoot/windows-365/troubleshoot-windows-365-boot#physical-device-registry-key-configuration)):
+- `BootToCloudMode`: sign-in connects to the Cloud PC;
+- `OverrideShellProgram`: a lightweight shell in place of Explorer;
+- for `shared`, Shared PC mode;
+- with `connection-timeout`, `SetMaxConnectionTimeout`.
+
+It also provisions Windows App for every account (`Microsoft.WindowsApp` with
+[`provision: true`](#apps)), unless the file already lists it under `apps`. It takes effect at
+the next sign-in: no desktop, just Windows App asking for the person's work account and then
+connecting to their Cloud PC.
+
+The rest is the organization's:
+- Windows 11 Pro or Enterprise, build 22621.3374 or later;
+- the machine in Entra ID ([`join.entra`](#join)), since people sign in with their work
+  accounts;
+- a Windows 365 license and a Cloud PC for each of them.
+
+Intune's guide also locks the machine down (no Task Manager, notifications or Copilot, and for
+shared mode no biometrics or Windows Hello). That isn't done here; Microsoft lists the policies
+in [CloudDesktop CSP](https://learn.microsoft.com/windows/client-management/mdm/clouddesktop-csp#boottocloudpcenhanced-technical-reference).
+On a machine Intune manages, set this in Intune instead, which owns these values.
+
+To use the machine itself again, `groundhog-agent undo` on the same file puts the values back,
+and the desktop returns at the next sign-in; Windows App stays. With no desktop to run it from,
+run it remotely, for example as a `run:` step of a file given to the machine's logon task
+(`pending.json`), which still runs in a Windows 365 Boot session:
+
+```yaml
+run:
+  - '& "$env:ProgramData\groundhog\bin\groundhog-agent.exe" undo C:\setup\w365.groundhog.yaml'
+```
+
 ## `domain-controller`
 
 Makes a Windows Server the first domain controller of a new Active Directory forest, with its
@@ -628,6 +674,11 @@ apps:
 - With `state: absent`, it's uninstalled. A package installed per user (portable tools such
   as ripgrep or jq usually are) can't be uninstalled by an elevated process, which the agent
   is; the agent then retries as the same user, unelevated, through a one-off scheduled task.
+- With `provision: true`, an MSIX package is downloaded by winget (`winget download`) and
+  provisioned with its dependencies, so every account has it, new ones too. It's for packages
+  that winget's `--scope machine` can't install for everyone (Windows App fails with access
+  denied), and it doesn't use the Microsoft Store, which machines that keep Windows Update
+  in-house often can't reach. Previews and `drift` can't tell whether it's still there.
 
 If winget is missing, the agent installs it first (via the `Microsoft.WinGet.Client` PowerShell
 module). Direct installers can't be uninstalled with `state: absent` (they don't say how); use a
@@ -638,7 +689,7 @@ module). Direct installers can't be uninstalled with `state: absent` (they don't
 | Type | How it's run |
 |---|---|
 | `.msi` | `msiexec /i … /qn /norestart` |
-| `.msix`, `.msixbundle`, `.appx`, `.appxbundle` | `Add-AppxPackage` |
+| `.msix`, `.msixbundle`, `.appx`, `.appxbundle` | provisioned for every account (`Add-AppxProvisionedPackage`), and added for this one; a package that can't be provisioned is added for this account only |
 | `.exe` | run with `args` (pass the installer's own silent switch) |
 
 Exit code 3010 or 1641 means a restart is needed.

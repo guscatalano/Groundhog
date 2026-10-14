@@ -1,0 +1,26 @@
+# Remote access: Windows App (Windows 365, Azure Virtual Desktop and Remote Desktop), mRemoteNG,
+# PuTTY, RDPeek's Companion (what's going on in a remote session) and MonitorAnchor (keeps the
+# monitor layout put across docks, KVMs and remote sessions), for every account.
+#
+#   groundhog-agent apply groundhog:remote-access
+#
+# RDPeek's agent runs on the machines you connect to, inside the session; its Companion has a
+# button that copies the one line that sets it up there.
+
+agent: ">=0.36.0"   # provision, and MSIX packages for every account
+
+certificates:
+  # MonitorAnchor's MSIX is signed with the project's own certificate.
+  - from: github:guscatalano/MonitorAnchor@latest/MonitorAnchor.cer
+    store: trusted-people
+    scope: machine
+
+apps:
+  - id: Microsoft.WindowsApp
+    provision: true                 # every account has it, new ones too
+  - mRemoteNG.mRemoteNG
+  - PuTTY.PuTTY
+  - id: RDPeek.Companion
+    url: github:guscatalano/RDPeek@latest/rdpeek-companion.msi
+  - id: MonitorAnchor
+    url: github:guscatalano/MonitorAnchor@latest/MonitorAnchor.msix   # starts at sign-in

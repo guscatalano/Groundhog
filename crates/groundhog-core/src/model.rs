@@ -939,6 +939,10 @@ pub enum App {
         /// `absent`: uninstall it.
         #[serde(skip_serializing_if = "Presence::is_present")]
         state: Presence,
+        /// An MSIX package downloaded by winget and provisioned, so every account has it, new
+        /// ones too: what winget's own `--scope machine` can't always do.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        provision: bool,
     },
     /// An installer fetched from a URL (or found in a cache by hash) and run directly.
     Url {
@@ -1249,6 +1253,23 @@ pub(crate) mod raw {
         pub edge: Option<EdgeFull>,
         pub join: Option<JoinFull>,
         pub domain_controller: Option<DomainControllerFull>,
+        pub windows_365_boot: Option<Windows365BootFull>,
+    }
+
+    /// `windows-365-boot:`.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct Windows365BootFull {
+        pub mode: Windows365BootMode,
+        /// How long sign-in waits for the Cloud PC: 5m to 20m.
+        pub connection_timeout: Option<Duration>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum Windows365BootMode {
+        Shared,
+        Dedicated,
     }
 
     /// `domain-controller:`.
@@ -2071,6 +2092,8 @@ pub(crate) mod raw {
         #[serde(default)]
         pub upgrade: bool,
         pub state: Option<Presence>,
+        #[serde(default)]
+        pub provision: bool,
     }
 
     #[derive(Debug, Deserialize)]
