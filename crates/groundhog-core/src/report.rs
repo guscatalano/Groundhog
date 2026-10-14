@@ -348,6 +348,7 @@ pub fn label(section: &str) -> &'static str {
         "terminal" => "Terminal",
         "ssh" => "SSH",
         "bitlocker" => "BitLocker",
+        "join" => "Join",
         "remove apps" => "Removed apps",
         "apps" => "Apps",
         "files" => "Files",

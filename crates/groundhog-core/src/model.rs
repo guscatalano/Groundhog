@@ -53,6 +53,7 @@ pub struct Groundhogfile {
     pub ssh: Vec<SshSetting>,
     pub defender: Vec<DefenderSetting>,
     pub bitlocker: Option<BitLocker>,
+    pub join: Vec<JoinSetting>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -316,6 +317,44 @@ pub struct BitLocker {
     pub on: bool,
     /// Where its recovery password goes: `entra`, `ad`, or a folder (when `on`).
     pub recovery_key: Option<String>,
+}
+
+/// A `join:` setting: the organization the machine belongs to, or a work account for the
+/// agent's user. Each is its own step.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "join", rename_all = "kebab-case")]
+pub enum JoinSetting {
+    /// An Active Directory domain, joined with an account allowed to add computers.
+    Domain {
+        name: String,
+        user: String,
+        /// The secret holding that account's password.
+        password: String,
+        /// The organizational unit the computer goes in (its distinguished name).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ou: Option<String>,
+    },
+    /// Entra ID, through a provisioning package that carries a bulk enrollment token. The
+    /// package is downloaded at run time only, never cached: the token joins any machine.
+    Entra {
+        package: Url,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+    },
+    /// Settings' "Access work or school" opened for the agent's user to add a work account,
+    /// since only that person can sign in to it.
+    WorkAccount,
+}
+
+impl JoinSetting {
+    /// Which setting this is, for a later file to replace.
+    pub fn key(&self) -> &'static str {
+        match self {
+            JoinSetting::Domain { .. } => "domain",
+            JoinSetting::Entra { .. } => "entra",
+            JoinSetting::WorkAccount => "work-account",
+        }
+    }
 }
 
 /// An `ssh:` setting that isn't a capability, service or registry value; each is its own step.
@@ -1197,6 +1236,38 @@ pub(crate) mod raw {
         pub bitlocker: Option<BitLockerFull>,
         pub powershell: Option<PowerShellFull>,
         pub edge: Option<EdgeFull>,
+        pub join: Option<JoinFull>,
+    }
+
+    /// `join:`.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct JoinFull {
+        pub domain: Option<DomainJoinFull>,
+        pub entra: Option<EntraJoinFull>,
+        pub work_account: Option<WorkAccount>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct DomainJoinFull {
+        pub name: String,
+        pub user: String,
+        pub password: StringOr<SecretRef>,
+        pub ou: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct EntraJoinFull {
+        pub package: String,
+        pub sha256: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum WorkAccount {
+        Prompt,
     }
 
     /// `edge:`, as Edge's machine policies.

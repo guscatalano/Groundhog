@@ -4,6 +4,20 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.34.0] - 2026-10-14
+
+### Added
+- **`join:`**: what organization the machine belongs to.
+  - `domain`: an Active Directory domain, with the joining account's password supplied at run
+    time as a secret, and optionally an OU.
+  - `entra`: Entra ID, from a provisioning package with a bulk token. The package is never
+    cached, and is deleted once installed.
+  - `work-account: prompt`: Settings opens at Access work or school for the user to sign in to
+    their work account, until they have one.
+
+  A file that also blocks work accounts (`groundhog:quiet-windows` does) fails to load with
+  `work-account`, and says why.
+
 ## [0.33.0] - 2026-10-13
 
 ### Fixed

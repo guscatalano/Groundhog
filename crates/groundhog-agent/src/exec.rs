@@ -10,9 +10,9 @@ use groundhog_core::content::ContentStore;
 use groundhog_core::engine::{Action, Executor, Outcome, Probe, Step};
 use groundhog_core::fetch::{file_name, file_url_to_path};
 use groundhog_core::model::{
-    App, Capability, Certificate, DesktopShortcut, EnvScope, Feature, FileCopy, HiveScope, LanguageSetting, LockScreen,
-    NetSetting, Password, RegistryData, RegistryType, RegistryValue, RunAction, ScreenSaver, Shell, StartPins,
-    SystemSetting, Theme, ThemeMode, User, Wallpaper, WallpaperStyle,
+    App, Capability, Certificate, DesktopShortcut, EnvScope, Feature, FileCopy, HiveScope, JoinSetting,
+    LanguageSetting, LockScreen, NetSetting, Password, RegistryData, RegistryType, RegistryValue, RunAction,
+    ScreenSaver, Shell, StartPins, SystemSetting, Theme, ThemeMode, User, Wallpaper, WallpaperStyle,
 };
 use groundhog_core::plugin::{PROTOCOL_VERSION, PluginRequest, PluginResponse};
 use groundhog_core::report::Reporter;
@@ -207,6 +207,17 @@ impl WinExecutor<'_> {
                 crate::security::set_defender(d, log).map(|changed| Outcome::Done { changed })
             }
             Action::BitLocker(b) => crate::security::set_bitlocker(b, log).map(|changed| Outcome::Done { changed }),
+            Action::Join(j @ JoinSetting::Domain { password, .. }) => {
+                let changed = crate::join::join_domain(j, secret_value(&self.secrets, password)?, log)?;
+                Ok(if changed { self.restart_later_if(true) } else { Outcome::Done { changed: false } })
+            }
+            Action::Join(j @ JoinSetting::Entra { .. }) => {
+                let changed = crate::join::join_entra(j, self.content.fetcher, log)?;
+                Ok(if changed { self.restart_later_if(true) } else { Outcome::Done { changed: false } })
+            }
+            Action::Join(j @ JoinSetting::WorkAccount) => {
+                crate::join::prompt_work_account(j, log).map(|changed| Outcome::Done { changed })
+            }
             Action::DefaultApps(map) => {
                 let changed = crate::defaults::apply(map, log)?;
                 if changed {
@@ -360,6 +371,7 @@ impl WinExecutor<'_> {
             Action::Ssh(sh) => would(crate::ssh::differs(sh)?),
             Action::DefenderSetting(d) => would(crate::security::defender_differs(d)?),
             Action::BitLocker(b) => would(crate::security::bitlocker_differs(b)?),
+            Action::Join(j) => would(crate::join::differs(j)?),
             Action::DefaultApps(map) => would(crate::defaults::differs(map)?),
             Action::Network(n) => would(crate::net::differs(n)?),
             Action::FirefoxExtension(e) => {

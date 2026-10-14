@@ -422,6 +422,49 @@ the background; the step is satisfied once it has started. `system-drive: false`
 Needs a TPM that's ready (`Get-Tpm`); the step fails and says so otherwise. Checking only looks at
 the drive's state and protectors, not where the recovery password was sent.
 
+## `join`
+
+The organization the machine belongs to (a domain or Entra ID, not both), and a work or school
+account for the person using it.
+
+```yaml
+join:
+  domain:                                  # Active Directory
+    name: corp.example.com
+    user: CORP\joiner                      # an account allowed to add computers
+    password: { secret: JOIN_PASSWORD }    # supplied at run time, never in the file
+    ou: 'OU=Labs,DC=corp,DC=example,DC=com'   # optional: where the computer goes
+  # or
+  entra:                                   # Entra ID (Azure AD)
+    package: \\files\it\join.ppkg          # a provisioning package with a bulk token
+    sha256: 9f2c...                        # optional
+  work-account: prompt                     # Settings opens for this user to add one
+```
+
+**`domain`** joins with `Add-Computer`, under the computer's new name when `system.computer-name`
+changes it (the rename's restart comes first). The join takes effect after a restart, which the
+run takes with `--reboot` or asks for. A machine already in another domain isn't moved: the step
+fails and says so. The password reaches PowerShell in an environment variable, never on a
+command line, and isn't logged.
+
+**`entra`** installs a provisioning package made in Windows Configuration Designer (*Provision
+desktop devices*, with *Enroll in Azure AD* and a bulk token; add Intune enrollment there too).
+It's downloaded only when the machine isn't joined yet, into the agent account's own temp folder
+rather than the download cache, and deleted after installing, since anyone holding it can join
+machines to your tenant until its token expires (180 days at most). Keep it on a share or
+behind an [authenticated download](#authenticated-downloads-and-report-sinks), not in a public
+repo. The join finishes after a restart.
+
+**`work-account: prompt`** opens Settings at *Accounts > Access work or school* for the agent's
+user to select *Connect* and sign in. An organization's sign-in, with its second factor, is
+theirs to do, so it can't be done for them. The step is satisfied once the user's account is
+added (`dsregcmd /status` shows `WorkplaceJoined : YES`), or the machine is joined to Entra
+ID. `groundhog:quiet-windows` blocks work accounts (`BlockAADWorkplaceJoin`); a file with both
+fails to load until that value is set to 0.
+
+None of these are undone by `undo`: leave a domain or Entra ID, or remove a work account, in
+Settings.
+
 ## `features` and `capabilities`
 
 Windows optional features (`Microsoft-Windows-Subsystem-Linux`, `VirtualMachinePlatform`,

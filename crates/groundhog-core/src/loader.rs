@@ -17,9 +17,9 @@ use crate::library;
 use crate::model::{
     App, BitLocker, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion,
     DefenderSetting, DesktopShortcut, DevSetting, EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirefoxExtension,
-    FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, InputLanguage, LanguageSetting, LockScreen, NetSetting,
-    NewTask, Password, PathEntry, PowerKnob, Presence, RegistryData, RegistryType, RegistryValue, RunAction,
-    ScreenSaver, Service, ServiceState, Shell, ShellSetting, SourceRef, SshSetting, StartPins, StartupItem,
+    FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, InputLanguage, JoinSetting, LanguageSetting, LockScreen,
+    NetSetting, NewTask, Password, PathEntry, PowerKnob, Presence, RegistryData, RegistryType, RegistryValue,
+    RunAction, ScreenSaver, Service, ServiceState, Shell, ShellSetting, SourceRef, SshSetting, StartPins, StartupItem,
     StartupType, SystemSetting, TaskRule, TaskState, TaskTrigger, Theme, ThemeMode, TrayIcon, User, Wallpaper,
     WallpaperStyle, raw,
 };
@@ -217,6 +217,11 @@ impl<'a> Loader<'a> {
         if let Some(Wallpaper { from: Some(from), sha256, .. }) = &mut file.wallpaper {
             from_github(from, sha256, &mut None)?;
         }
+        for j in &mut file.join {
+            if let JoinSetting::Entra { package, sha256, .. } = j {
+                from_github(package, sha256, &mut None)?;
+            }
+        }
         // Add-ons named by their addons.mozilla.org page: Firefox's policy wants their ids.
         for e in file.firefox_extensions.iter_mut().filter(|e| e.id.is_none()) {
             e.id = Some(amo_id(self.content.fetcher, &e.name)?);
@@ -279,6 +284,20 @@ impl<'a> Loader<'a> {
                 | RunAction::Plugin { plugin: url, sha256, resolved, .. } => resolve(url, sha256, resolved)?,
                 RunAction::Command { .. } => {}
             }
+        }
+        // groundhog:quiet-windows sets this, and it would make the prompt a dead end.
+        if file.join.contains(&JoinSetting::WorkAccount)
+            && file.registry.iter().any(|r| {
+                r.key.eq_ignore_ascii_case(WORKPLACE_JOIN_POLICY)
+                    && r.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("BlockAADWorkplaceJoin"))
+                    && r.state.is_present()
+                    && r.data == RegistryData::Dword(1)
+            })
+        {
+            bail!(
+                "join.work-account: this file also blocks work accounts (BlockAADWorkplaceJoin, which \
+                 groundhog:quiet-windows sets); set it to 0 in the registry section, or leave work-account out"
+            );
         }
         Ok(())
     }
@@ -518,6 +537,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         defender,
         bitlocker,
         edge,
+        join,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -569,6 +589,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     let shell = resolve_shell(terminal, powershell, &mut registry).context("terminal/powershell")?;
     let defender = defender.map(resolve_defender).transpose().context("defender")?.unwrap_or_default();
     let bitlocker = bitlocker.map(resolve_bitlocker).transpose().context("bitlocker")?;
+    let join = join.map(|j| resolve_join(base, j)).transpose().context("join")?.unwrap_or_default();
     if let Some(p) = privacy {
         resolve_privacy(p, &mut registry).context("privacy")?;
     }
@@ -709,6 +730,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         ssh,
         defender,
         bitlocker,
+        join,
         services,
         firewall,
         run,
@@ -2427,6 +2449,68 @@ fn resolve_privacy(p: raw::PrivacyFull, registry: &mut Vec<RegistryValue>) -> Re
     Ok(())
 }
 
+/// The policy that turns off adding work accounts to Windows.
+pub const WORKPLACE_JOIN_POLICY: &str = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WorkplaceJoin";
+
+/// `join:` as one step for each of the domain, Entra ID and the work account.
+fn resolve_join(base: &Url, j: raw::JoinFull) -> Result<Vec<JoinSetting>> {
+    let mut out = Vec::new();
+    match (j.domain, j.entra) {
+        (Some(_), Some(_)) => bail!("a machine joins a domain or Entra ID, not both"),
+        (Some(d), None) => {
+            let name = d.name.trim().to_owned();
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                bail!("domain: '{}' isn't a domain's name (corp.example.com)", d.name);
+            }
+            if d.user.trim().is_empty() {
+                bail!("domain: needs 'user', an account allowed to add computers to it");
+            }
+            let password = secret_name(d.password).context("domain")?;
+            if let Some(ou) = &d.ou
+                && !ou.to_ascii_uppercase().contains("DC=")
+            {
+                bail!(
+                    "domain: 'ou' is the unit's distinguished name ('OU=Labs,DC=corp,DC=example,DC=com'), not '{ou}'"
+                );
+            }
+            out.push(JoinSetting::Domain { name, user: d.user.trim().to_owned(), password, ou: d.ou });
+        }
+        (None, Some(e)) => {
+            let package = resolve_ref(base, &e.package)?;
+            if !package.path().to_ascii_lowercase().ends_with(".ppkg") {
+                bail!("entra: 'package' is a provisioning package (.ppkg) made with Windows Configuration Designer");
+            }
+            out.push(JoinSetting::Entra { package, sha256: pin(e.sha256)? });
+        }
+        (None, None) => {}
+    }
+    if let Some(raw::WorkAccount::Prompt) = j.work_account {
+        out.push(JoinSetting::WorkAccount);
+    }
+    if out.is_empty() {
+        bail!("needs at least one of domain, entra and work-account");
+    }
+    Ok(out)
+}
+
+/// A password given as `{ secret: NAME }` or `${secret:NAME}`: never the password itself.
+fn secret_name(v: raw::StringOr<raw::SecretRef>) -> Result<String> {
+    let name = match v {
+        raw::StringOr::Short(s) if matches!(secret::parse(&s).as_deref(), Ok([secret::Part::Secret(_)])) => {
+            secret::names(&s)?.into_iter().next().expect("one reference")
+        }
+        raw::StringOr::Short(_) => bail!(
+            "a password can't be written in a Groundhogfile; use ${{secret:NAME}} (or {{ secret: NAME }}) and \
+             supply NAME at run time"
+        ),
+        raw::StringOr::Full(r) => r.secret,
+    };
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        bail!("secret names use letters, digits and _ ('{name}')");
+    }
+    Ok(name)
+}
+
 /// Where Edge reads its machine policies from.
 const EDGE_POLICIES: &str = r"HKLM\SOFTWARE\Policies\Microsoft\Edge";
 
@@ -3178,6 +3262,15 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         base.defender.into_iter().filter(|b| !top.defender.iter().any(|t| t.key() == b.key())).collect();
     defender.extend(top.defender);
     let bitlocker = top.bitlocker.or(base.bitlocker);
+    // A machine is in a domain or Entra ID, not both: a top file naming one drops the other.
+    let organization = |s: &JoinSetting| matches!(s, JoinSetting::Domain { .. } | JoinSetting::Entra { .. });
+    let top_names_one = top.join.iter().any(organization);
+    let mut join: Vec<JoinSetting> = base
+        .join
+        .into_iter()
+        .filter(|b| !top.join.iter().any(|t| t.key() == b.key()) && !(top_names_one && organization(b)))
+        .collect();
+    join.extend(top.join);
     // sshd_config keywords add up, the top file's winning; keys and known hosts add up too.
     let mut ssh = base.ssh;
     for t in top.ssh {
@@ -3237,6 +3330,7 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         ssh,
         defender,
         bitlocker,
+        join,
         services,
         firewall,
         run,
@@ -3838,6 +3932,40 @@ firewall:
         assert_eq!(value("WindowsAI", "DisableAIDataAnalysis"), Some(RegistryData::Dword(1)));
         assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
         assert!(load_with(&f, "https://cfg.test/empty.yaml", dir.path()).is_err());
+    }
+
+    #[test]
+    fn join_settings() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/base.yaml",
+                "join:\n  domain: { name: corp.example, user: 'CORP\\joiner', password: '${secret:JOIN_PW}', ou: 'OU=Labs,DC=corp,DC=example' }\n  work-account: prompt",
+            )
+            .with("https://cfg.test/top.yaml", "extends: base.yaml\njoin: { entra: { package: tenant.ppkg } }")
+            .with("https://cfg.test/both.yaml", "join: { domain: { name: a.b, user: u, password: { secret: P } }, entra: { package: t.ppkg } }")
+            .with("https://cfg.test/plain.yaml", "join: { domain: { name: a.b, user: u, password: hunter2 } }")
+            .with("https://cfg.test/notppkg.yaml", "join: { entra: { package: t.zip } }")
+            .with(
+                "https://cfg.test/blocked.yaml",
+                "extends: base.yaml\nregistry:\n  - { key: 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WorkplaceJoin', name: BlockAADWorkplaceJoin, type: dword, value: 1 }",
+            );
+        let dir = tempfile::tempdir().unwrap();
+        let base = load_with(&f, "https://cfg.test/base.yaml", dir.path()).unwrap().file;
+        assert!(matches!(&base.join[0], JoinSetting::Domain { password, ou: Some(_), .. } if password == "JOIN_PW"));
+        assert!(required_secrets(&base).contains("JOIN_PW"));
+        let plan = crate::engine::plan(&base);
+        let at = |t: &str| plan.iter().position(|s| s.title.starts_with(t)).unwrap();
+        assert!(at("join the corp.example domain") < at("ask for a work or school account"));
+
+        // An Entra ID join in the extending file replaces the domain; the prompt stays.
+        let top = load_with(&f, "https://cfg.test/top.yaml", dir.path()).unwrap().file;
+        let keys: Vec<&str> = top.join.iter().map(JoinSetting::key).collect();
+        assert_eq!(keys, ["work-account", "entra"]);
+
+        for bad in ["both", "plain", "notppkg", "blocked"] {
+            let err = load_with(&f, &format!("https://cfg.test/{bad}.yaml"), dir.path()).unwrap_err();
+            assert!(!format!("{err:#}").contains("hunter2"), "{bad}: {err:#}");
+        }
     }
 
     #[test]

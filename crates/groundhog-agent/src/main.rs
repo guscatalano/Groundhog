@@ -9,6 +9,7 @@ mod defaults;
 mod dev;
 mod ensure;
 mod exec;
+mod join;
 mod net;
 mod secrets;
 mod security;
