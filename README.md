@@ -208,7 +208,9 @@ Pin a download with `sha256` to lock it to one build; leave the pin off to follo
 [When steps run again](docs/groundhogfile.md#when-steps-run-again).
 
 When a step needs a restart, `apply` exits with **3010**. With `--reboot`, it restarts and
-continues by itself at the next logon.
+continues by itself at the next logon, with no window: `groundhog-agent status` and the log in
+`%ProgramData%\groundhog\last-run` follow it. The task it continues from deletes itself when the
+run is done.
 
 ## Drift, undo and capture
 

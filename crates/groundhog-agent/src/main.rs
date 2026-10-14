@@ -61,7 +61,11 @@ enum Command {
     /// Show the steps a Groundhogfile would run, without changing anything.
     Plan(PlanArgs),
     /// Apply the bootstrap file (`<home>\pending.json`) if there is one. Meant for a logon task.
-    RunPending,
+    RunPending {
+        /// Delete the logon task once the run succeeds or fails (a run continuing after a restart).
+        #[arg(long)]
+        once: bool,
+    },
     /// Install this agent into <home>\bin and register a logon task that runs `run-pending`.
     InstallTask,
     /// Show the last result for each Groundhogfile applied on this machine.
@@ -245,7 +249,7 @@ fn run(home: &Path, command: Command) -> Result<i32> {
             print_plan(home, &pending, args.check)?;
             Ok(0)
         }
-        Command::RunPending => run_pending(home),
+        Command::RunPending { once } => run_pending(home, once),
         Command::InstallTask => {
             let exe = install_self(home)?;
             let mut args = "run-pending".to_owned();
@@ -423,6 +427,12 @@ fn apply(home: &Path, p: &Pending, fresh: bool, verbose: bool) -> Result<Applied
     let content = ContentStore { fetcher: &session.fetcher, cache: &session.cache };
     if let update::Outcome::HandedOver(code) = update::run(&settings, home, &content, reporter) {
         return Ok(Applied::HandedOver(code));
+    }
+    // Earlier agents' logon tasks opened a console window at every logon.
+    match tasks::make_logon_task_windowless() {
+        Ok(true) => reporter.log(&format!("moved task '{}' to a console with no window", tasks::TASK_NAME)),
+        Ok(false) => {}
+        Err(e) => reporter.log(&format!("warning: {e:#}")),
     }
 
     let loaded = session.load(home, p).and_then(|(url, loaded)| match &loaded.file.requires_agent {
@@ -603,10 +613,13 @@ fn copy_start_pins(out: &Path) -> Result<usize> {
     Ok(bytes.len())
 }
 
-fn run_pending(home: &Path) -> Result<i32> {
+fn run_pending(home: &Path, once: bool) -> Result<i32> {
     let path = home.join(PENDING_FILE);
     let Ok(bytes) = std::fs::read(&path) else {
         println!("nothing pending ({} not found)", path.display());
+        if once {
+            tasks::remove_logon_task(&mut |l| println!("{l}"))?;
+        }
         return Ok(0);
     };
     let mut pending: Pending = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
@@ -630,15 +643,20 @@ fn run_pending(home: &Path) -> Result<i32> {
         RunStatus::Failed => std::fs::rename(&path, home.join("pending.failed.json"))?,
         RunStatus::Running => {}
     }
+    if once && matches!(state.status, RunStatus::Succeeded | RunStatus::Failed) {
+        // Its job is done: don't start again at every sign-in.
+        tasks::remove_logon_task(&mut |l| println!("{l}"))?;
+    }
     Ok(exit_code(state.status))
 }
 
-/// Makes `apply --reboot` continue by itself after the restart.
+/// Makes `apply --reboot` continue by itself after the restart, through a logon task that
+/// deletes itself when the run is over.
 fn schedule_continuation(home: &Path, p: &Pending) -> Result<()> {
     // Secrets were saved encrypted when the run paused; the plain-text file never holds them.
     engine::write_json_atomic(&home.join(PENDING_FILE), &Pending { secrets: Default::default(), ..p.clone() })?;
     let exe = install_self(home)?;
-    let mut args = "run-pending".to_owned();
+    let mut args = "run-pending --once".to_owned();
     if home != default_home() {
         args = format!(r#"--home "{}" {args}"#, home.display());
     }

@@ -63,7 +63,9 @@ does the work as the user, elevated.
 A step can return "done, restart needed" (for example MSI 3010) or "restart, then retry" (winget's
 `REBOOT_REQUIRED_FOR_INSTALL`). The run stops with status `reboot-pending` and exit code 3010.
 With `--reboot`, or from a pending file, the agent writes `pending.json`, installs its logon
-task, restarts, and continues. It gives up after 5 restarts in one run.
+task, restarts, and continues, without a window (the task runs the agent in a headless console
+host). A task made by `--reboot` deletes itself once the run succeeds or fails; one made by
+`install-task` stays. It gives up after 5 restarts in one run.
 
 ## Roadmap
 

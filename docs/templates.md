@@ -20,7 +20,8 @@ while installing from ISO (`--mode install`) or on every clone of a sysprepped t
    groundhog-agent install-task
    ```
    This copies the agent to `%ProgramData%\groundhog\bin` and registers the logon task
-   `Groundhog\RunPending`, which runs elevated in the user's session 15 seconds after logon.
+   `Groundhog\RunPending`, which runs elevated in the user's session 15 seconds after logon, with no window.
+   `groundhog-agent status` shows how a run is going.
 4. **Proxmox:** install the virtio drivers and the **QEMU guest agent** from the virtio-win ISO,
    and enable the guest agent in the VM options. That lets the host write files into clones.
 5. Generalize if needed (sysprep with an unattend file that keeps autologon), then convert to a

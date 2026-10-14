@@ -4,6 +4,20 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.33.0] - 2026-10-13
+
+### Fixed
+- **No more agent window at sign-in.** After `apply --reboot`, the logon task that continues
+  the run now runs the agent with no window, and deletes itself once the run succeeds or fails.
+  Before, the task stayed, and opened a console window (or a Terminal tab) at every sign-in,
+  even with nothing left to do.
+  - `groundhog-agent status` and the log in `%ProgramData%\groundhog\last-run` follow a run
+    that continues after a restart.
+  - `install-task`'s task (for templates) also runs with no window, and stays.
+  - The next `apply` moves a task left by an earlier agent to run with no window too.
+- Removing a per-user app, which winget only does unelevated, no longer flashes a command
+  window.
+
 ## [0.32.0] - 2026-10-13
 
 ### Added
