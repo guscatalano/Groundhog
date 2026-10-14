@@ -425,6 +425,7 @@ pub fn before(exec: &mut WinExecutor, step: &Step, store: &Store) -> Result<Vec<
         Action::BitLocker(_) => not("BitLocker isn't turned off by undo (set bitlocker.system-drive: false)"),
         Action::User(_) => not("accounts aren't deleted or put back"),
         Action::Join(_) => not("leaving a domain or Entra ID, or removing a work account, is done in Settings"),
+        Action::DomainController(_) => not("a domain controller isn't demoted (Uninstall-ADDSDomainController)"),
         Action::Run(_) => not("commands can't be undone"),
         Action::RemoveApp { .. } => not("removed apps aren't reinstalled"),
         Action::Verify(_) | Action::EnsureWinget | Action::RestartExplorer { .. } => Vec::new(),

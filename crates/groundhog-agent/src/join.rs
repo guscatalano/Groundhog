@@ -1,9 +1,9 @@
 //! `join:` steps: an Active Directory domain, Entra ID from a provisioning package, and the
-//! prompt for a work or school account.
+//! prompt for a work or school account; and `domain-controller:`, a new domain to join.
 
 use anyhow::{Context, Result, bail};
 use groundhog_core::fetch::{Fetcher, normalize_sha256, sha256_hex};
-use groundhog_core::model::{JoinSetting, Shell};
+use groundhog_core::model::{DomainController, JoinSetting, Shell};
 use groundhog_win::process::Proc;
 
 use crate::exec::powershell;
@@ -107,6 +107,55 @@ pub fn join_entra(j: &JoinSetting, fetcher: &dyn Fetcher, log: &mut dyn FnMut(&s
              %ProgramData%\\Microsoft\\Provisioning",
             out.code
         );
+    }
+    Ok(true)
+}
+
+/// The environment variable the Directory Services Restore Mode password reaches PowerShell in.
+const SAFE_MODE_VAR: &str = "GROUNDHOG_SAFE_MODE_PASSWORD";
+
+/// Whether this machine isn't yet a domain controller of `d`'s domain (DomainRole 4 and 5 are
+/// backup and primary domain controllers).
+pub fn dc_differs(d: &DomainController) -> Result<bool> {
+    differs_by(&format!(
+        "$cs = Get-CimInstance Win32_ComputerSystem\n\
+         if ($cs.DomainRole -ge 4 -and $cs.Domain -eq {}) {{ 'same' }} else {{ 'differs' }}",
+        quote(&d.domain)
+    ))
+}
+
+/// Adds Active Directory Domain Services and makes this server the first domain controller of
+/// a new forest, with a DNS server. It's a domain controller after the restart that follows.
+pub fn promote(d: &DomainController, password: String, log: &mut dyn FnMut(&str)) -> Result<bool> {
+    if !dc_differs(d)? {
+        return Ok(false);
+    }
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         if ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 1) {{\n\
+         \x20 throw 'a domain controller needs Windows Server, and this is Windows client: give domain-controller a when: {{ os: server }}'\n\
+         }}\n\
+         $cs = Get-CimInstance Win32_ComputerSystem\n\
+         if ($cs.DomainRole -ge 4) {{ throw \"this server is already a domain controller, of $($cs.Domain)\" }}\n\
+         if ($cs.PartOfDomain) {{ throw \"this server is in the $($cs.Domain) domain; a new forest's first domain controller can't be\" }}\n\
+         $f = Install-WindowsFeature AD-Domain-Services -IncludeManagementTools\n\
+         if (-not $f.Success) {{ throw 'adding Active Directory Domain Services failed' }}\n\
+         'added Active Directory Domain Services'\n\
+         Import-Module ADDSDeployment\n\
+         $pw = ConvertTo-SecureString $env:{SAFE_MODE_VAR} -AsPlainText -Force\n\
+         $r = Install-ADDSForest -DomainName {domain} -DomainNetbiosName {netbios} -SafeModeAdministratorPassword $pw `\n\
+         \x20 -InstallDns -NoRebootOnCompletion -Force -WarningAction SilentlyContinue\n\
+         if ($r.Status -ne 'Success') {{ throw \"promoting failed: $($r.Message)\" }}\n\
+         'promoted; it becomes the domain controller of {plain} after a restart'",
+        domain = quote(&d.domain),
+        netbios = quote(&d.netbios),
+        plain = d.domain,
+    );
+    let mut proc = powershell(Shell::Powershell, &script);
+    proc.env.push((SAFE_MODE_VAR.to_owned(), password));
+    let out = proc.run(log)?;
+    if out.code != 0 {
+        bail!("couldn't make this server a domain controller (PowerShell exited with {})", out.code);
     }
     Ok(true)
 }

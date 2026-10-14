@@ -16,12 +16,12 @@ use crate::github;
 use crate::library;
 use crate::model::{
     App, BitLocker, CURRENT_VERSION, Capability, CertScope, CertStore, Certificate, Check, DefenderExclusion,
-    DefenderSetting, DesktopShortcut, DevSetting, EnvScope, EnvVar, ExclusionKind, Feature, FileCopy, FirefoxExtension,
-    FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, InputLanguage, JoinSetting, LanguageSetting, LockScreen,
-    NetSetting, NewTask, Password, PathEntry, PowerKnob, Presence, RegistryData, RegistryType, RegistryValue,
-    RunAction, ScreenSaver, Service, ServiceState, Shell, ShellSetting, SourceRef, SshSetting, StartPins, StartupItem,
-    StartupType, SystemSetting, TaskRule, TaskState, TaskTrigger, Theme, ThemeMode, TrayIcon, User, Wallpaper,
-    WallpaperStyle, raw,
+    DefenderSetting, DesktopShortcut, DevSetting, DomainController, EnvScope, EnvVar, ExclusionKind, Feature, FileCopy,
+    FirefoxExtension, FirewallProtocol, FirewallRule, Groundhogfile, HiveScope, InputLanguage, JoinSetting,
+    LanguageSetting, LockScreen, NetSetting, NewTask, Password, PathEntry, PowerKnob, Presence, RegistryData,
+    RegistryType, RegistryValue, RunAction, ScreenSaver, Service, ServiceState, Shell, ShellSetting, SourceRef,
+    SshSetting, StartPins, StartupItem, StartupType, SystemSetting, TaskRule, TaskState, TaskTrigger, Theme, ThemeMode,
+    TrayIcon, User, Wallpaper, WallpaperStyle, raw,
 };
 use crate::secret;
 use crate::update::{self, Version};
@@ -285,6 +285,21 @@ impl<'a> Loader<'a> {
                 RunAction::Command { .. } => {}
             }
         }
+        // A forest's first domain controller is in its own domain and nothing else.
+        if let Some(dc) = &file.domain_controller
+            && let Some(other) =
+                file.join.iter().find(|j| matches!(j, JoinSetting::Domain { .. } | JoinSetting::Entra { .. }))
+        {
+            bail!(
+                "domain-controller makes this machine the domain controller of {}, so it can't also join {}; \
+                 give each a when: (like {{ os: server }} and {{ os: client }}) to use one file for both",
+                dc.domain,
+                match other {
+                    JoinSetting::Domain { name, .. } => format!("the {name} domain"),
+                    _ => "Entra ID".to_owned(),
+                }
+            );
+        }
         // groundhog:quiet-windows sets this, and it would make the prompt a dead end.
         if file.join.contains(&JoinSetting::WorkAccount)
             && file.registry.iter().any(|r| {
@@ -538,6 +553,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         bitlocker,
         edge,
         join,
+        domain_controller,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -590,6 +606,8 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     let defender = defender.map(resolve_defender).transpose().context("defender")?.unwrap_or_default();
     let bitlocker = bitlocker.map(resolve_bitlocker).transpose().context("bitlocker")?;
     let join = join.map(|j| resolve_join(base, j)).transpose().context("join")?.unwrap_or_default();
+    let domain_controller =
+        domain_controller.map(resolve_domain_controller).transpose().context("domain-controller")?;
     if let Some(p) = privacy {
         resolve_privacy(p, &mut registry).context("privacy")?;
     }
@@ -731,6 +749,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         defender,
         bitlocker,
         join,
+        domain_controller,
         services,
         firewall,
         run,
@@ -2493,6 +2512,38 @@ fn resolve_join(base: &Url, j: raw::JoinFull) -> Result<Vec<JoinSetting>> {
     Ok(out)
 }
 
+/// `domain-controller:`: a new forest named `domain`, its NetBIOS name its first label unless given.
+fn resolve_domain_controller(d: raw::DomainControllerFull) -> Result<DomainController> {
+    let domain = d.domain.trim().to_ascii_lowercase();
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    if !domain.contains('.') || !domain.split('.').all(label_ok) {
+        bail!(
+            "'{}' isn't a domain name for a new forest: use a full DNS name you control, like corp.example.com \
+             (a single label like 'corp' isn't supported by Windows)",
+            d.domain
+        );
+    }
+    let netbios = match d.netbios {
+        Some(n) => n.trim().to_ascii_uppercase(),
+        None => domain.split('.').next().expect("checked above").to_ascii_uppercase(),
+    };
+    if netbios.is_empty()
+        || netbios.len() > 15
+        || !netbios.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        || netbios.chars().all(|c| c.is_ascii_digit())
+    {
+        bail!("the NetBIOS name '{netbios}' needs 1 to 15 letters, digits or -, not all digits (set 'netbios')");
+    }
+    let safe_mode_password = secret_name(d.safe_mode_password).context("safe-mode-password")?;
+    Ok(DomainController { domain, netbios, safe_mode_password })
+}
+
 /// A password given as `{ secret: NAME }` or `${secret:NAME}`: never the password itself.
 fn secret_name(v: raw::StringOr<raw::SecretRef>) -> Result<String> {
     let name = match v {
@@ -3271,6 +3322,7 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         .filter(|b| !top.join.iter().any(|t| t.key() == b.key()) && !(top_names_one && organization(b)))
         .collect();
     join.extend(top.join);
+    let domain_controller = top.domain_controller.or(base.domain_controller);
     // sshd_config keywords add up, the top file's winning; keys and known hosts add up too.
     let mut ssh = base.ssh;
     for t in top.ssh {
@@ -3331,6 +3383,7 @@ pub fn merge(base: Groundhogfile, mut top: Groundhogfile) -> Groundhogfile {
         defender,
         bitlocker,
         join,
+        domain_controller,
         services,
         firewall,
         run,
@@ -3965,6 +4018,49 @@ firewall:
         for bad in ["both", "plain", "notppkg", "blocked"] {
             let err = load_with(&f, &format!("https://cfg.test/{bad}.yaml"), dir.path()).unwrap_err();
             assert!(!format!("{err:#}").contains("hunter2"), "{bad}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn domain_controller_on_servers_and_joining_it_on_clients() {
+        let one_file = "domain-controller:\n  domain: Lab.Example.com\n  safe-mode-password: { secret: DSRM_PW }\n  when: { os: server }\n\
+                        join:\n  domain: { name: lab.example.com, user: 'LAB\\Administrator', password: { secret: JOIN_PW }, when: { os: client } }";
+        let f = MapFetcher::default()
+            .with("https://cfg.test/lab.yaml", one_file)
+            .with(
+                "https://cfg.test/both.yaml",
+                "domain-controller: { domain: a.example, safe-mode-password: { secret: P } }\njoin: { entra: { package: t.ppkg } }",
+            )
+            .with("https://cfg.test/single.yaml", "domain-controller: { domain: corp, safe-mode-password: { secret: P } }")
+            .with(
+                "https://cfg.test/longnb.yaml",
+                "domain-controller: { domain: averyverylongfirstlabel.example, safe-mode-password: { secret: P } }",
+            );
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::default();
+        let content = ContentStore { fetcher: &f, cache: &cache };
+        let load = |os: &str, url: &str| {
+            Loader::new(&content, dir.path().join("b"))
+                .with_facts(Facts { arch: "x64".into(), build: 26100, os: os.into() })
+                .load(&source_ref(url, None, dir.path()).unwrap())
+        };
+        let server = load("server", "https://cfg.test/lab.yaml").unwrap().file;
+        assert_eq!(
+            server.domain_controller,
+            Some(DomainController {
+                domain: "lab.example.com".into(),
+                netbios: "LAB".into(),
+                safe_mode_password: "DSRM_PW".into()
+            })
+        );
+        assert!(server.join.is_empty());
+        assert!(required_secrets(&server).contains("DSRM_PW"));
+        let client = load("client", "https://cfg.test/lab.yaml").unwrap().file;
+        assert!(client.domain_controller.is_none());
+        assert!(matches!(&client.join[..], [JoinSetting::Domain { .. }]));
+
+        for bad in ["both", "single", "longnb"] {
+            assert!(load("server", &format!("https://cfg.test/{bad}.yaml")).is_err(), "{bad}");
         }
     }
 

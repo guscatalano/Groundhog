@@ -238,10 +238,11 @@ env:
     when: { build: "<22000" }
 ```
 
-**`when:`** on any list entry, or an `env` value, keeps it only on machines that match every
-condition: `arch` (`x64`, `arm64`, `x86`, or a list), `build` (the Windows build number, exact
+**`when:`** on any list entry, map entry (an `env` value, `join: { domain: ... }`) or whole
+section (`domain-controller: { ..., when: { os: server } }`) keeps it only on machines that
+match every condition: `arch` (`x64`, `arm64`, `x86`, or a list), `build` (the Windows build number, exact
 or with `>=`, `<=`, `>`, `<`), `os` (`client` or `server`). An entry that doesn't match is left
-out, as if it weren't written.
+out, as if it weren't written, and so is a section left with nothing in it.
 
 **`${var:NAME}`** works in any string. Values come from, strongest first:
 1. the caller: `groundhog-agent apply … --var port=9000`, or `vars` in `pending.json`
@@ -464,6 +465,43 @@ fails to load until that value is set to 0.
 
 None of these are undone by `undo`: leave a domain or Entra ID, or remove a work account, in
 Settings.
+
+## `domain-controller`
+
+Makes a Windows Server the first domain controller of a new Active Directory forest, with its
+DNS server: a domain for a lab, to join the other machines to.
+
+```yaml
+domain-controller:
+  domain: lab.example.com                  # a full DNS name; a single label like 'lab' isn't supported
+  netbios: LAB                             # optional: the first label, upper-cased
+  safe-mode-password: { secret: DSRM_PASSWORD }   # Directory Services Restore Mode
+  when: { os: server }
+```
+
+It adds Active Directory Domain Services and promotes the server, then restarts: the run
+continues afterwards with `--reboot`, as with any restart. Give it its name first
+(`system.computer-name`), since a domain controller keeps the name it was promoted with; the
+rename's restart is taken before promoting. A server that's already in a domain isn't promoted:
+the step fails and says so. On Windows client the step fails too, so a file shared by servers
+and clients gives this section `when: { os: server }`, and its `join.domain` `when: { os: client }`:
+
+```yaml
+domain-controller:
+  domain: lab.example.com
+  safe-mode-password: { secret: DSRM_PASSWORD }
+  when: { os: server }
+join:
+  domain:
+    name: lab.example.com
+    user: LAB\Administrator
+    password: { secret: LAB_ADMIN_PASSWORD }
+    when: { os: client }
+```
+
+The server's local accounts become the domain's: its Administrator is `LAB\Administrator`, with
+the same password. Clients join it once they can find it, so give them the domain controller's
+address as their DNS server (`network.dns`). `undo` doesn't demote a domain controller.
 
 ## `features` and `capabilities`
 

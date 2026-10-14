@@ -70,30 +70,27 @@ const OPEN: &str = "${var:";
 /// Applies `when:` and `${var:...}` to a whole document. `vars` itself is left as written.
 pub fn preprocess(doc: &mut Value, vars: &BTreeMap<String, String>, facts: &Facts) -> Result<()> {
     let Value::Object(top) = doc else { return Ok(()) };
-    for (key, value) in top.iter_mut() {
+    let mut keep = serde_json::Map::new();
+    for (key, mut value) in std::mem::take(top) {
         if key == "vars" {
+            keep.insert(key, value);
             continue;
         }
-        if key == "env"
-            && let Value::Object(env) = value
-        {
-            // env is a map, so its entries are values rather than list items.
-            let mut keep = serde_json::Map::new();
-            for (name, mut v) in std::mem::take(env) {
-                if take_when(&mut v, facts).with_context(|| format!("env {name}"))? {
-                    walk(&mut v, vars, facts)?;
-                    keep.insert(name, v);
-                }
-            }
-            *env = keep;
+        // A whole section can have a `when:` too: `domain-controller: { ..., when: { os: server } }`.
+        if !take_when(&mut value, facts).with_context(|| format!("in {key}"))? {
             continue;
         }
-        walk(value, vars, facts).with_context(|| format!("in {key}"))?;
+        if !walk(&mut value, vars, facts).with_context(|| format!("in {key}"))? {
+            keep.insert(key, value);
+        }
     }
+    *top = keep;
     Ok(())
 }
 
-fn walk(value: &mut Value, vars: &BTreeMap<String, String>, facts: &Facts) -> Result<()> {
+/// Returns true when `when:` conditions left a map with nothing in it: it goes too, as if it
+/// weren't written (`join:` whose only entry is for other machines).
+fn walk(value: &mut Value, vars: &BTreeMap<String, String>, facts: &Facts) -> Result<bool> {
     match value {
         Value::String(s) => *s = substitute(s, vars)?,
         Value::Array(items) => {
@@ -107,13 +104,22 @@ fn walk(value: &mut Value, vars: &BTreeMap<String, String>, facts: &Facts) -> Re
             *items = keep;
         }
         Value::Object(map) => {
-            for v in map.values_mut() {
-                walk(v, vars, facts)?;
+            // Map entries can have a `when:` like list items: an env value, `join: { domain: ... }`.
+            let mut keep = serde_json::Map::new();
+            let mut dropped = false;
+            for (name, mut v) in std::mem::take(map) {
+                if take_when(&mut v, facts).with_context(|| name.clone())? && !walk(&mut v, vars, facts)? {
+                    keep.insert(name, v);
+                } else {
+                    dropped = true;
+                }
             }
+            *map = keep;
+            return Ok(dropped && map.is_empty());
         }
         _ => {}
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Removes a `when:` from an entry and says whether the entry applies to this machine.
@@ -227,6 +233,26 @@ mod tests {
         preprocess(&mut doc, &BTreeMap::new(), &facts()).unwrap();
         assert_eq!(doc["apps"], serde_json::json!(["always", {"id": "arm-only"}, {"id": "new"}]));
         assert_eq!(doc["env"], serde_json::json!({"B": "2"}));
+    }
+
+    #[test]
+    fn when_on_a_section_or_a_setting_in_one() {
+        let mut doc: Value = serde_json::from_str(
+            r#"{
+              "domain-controller": {"domain": "corp.example", "when": {"os": "server"}},
+              "join": {"domain": {"name": "corp.example", "when": {"os": "client"}}, "work-account": {"x": 1, "when": {"arch": "x64"}}},
+              "system": {"x": {"when": {"os": "server"}}},
+              "edge": {"first-run": false},
+              "privacy": {}
+            }"#,
+        )
+        .unwrap();
+        preprocess(&mut doc, &BTreeMap::new(), &facts()).unwrap();
+        assert_eq!(
+            doc,
+            serde_json::json!({"join": {"domain": {"name": "corp.example"}}, "edge": {"first-run": false}, "privacy": {}}),
+            "a section emptied by when goes; one written empty stays (and is an error later)"
+        );
     }
 
     #[test]

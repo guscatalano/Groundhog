@@ -54,6 +54,7 @@ pub struct Groundhogfile {
     pub defender: Vec<DefenderSetting>,
     pub bitlocker: Option<BitLocker>,
     pub join: Vec<JoinSetting>,
+    pub domain_controller: Option<DomainController>,
     pub services: Vec<Service>,
     pub firewall: Vec<FirewallRule>,
     pub run: Vec<RunAction>,
@@ -344,6 +345,16 @@ pub enum JoinSetting {
     /// Settings' "Access work or school" opened for the agent's user to add a work account,
     /// since only that person can sign in to it.
     WorkAccount,
+}
+
+/// A Windows Server made the first domain controller of a new Active Directory forest, with
+/// its DNS server.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DomainController {
+    pub domain: String,
+    pub netbios: String,
+    /// The secret holding the Directory Services Restore Mode password.
+    pub safe_mode_password: String,
 }
 
 impl JoinSetting {
@@ -1237,6 +1248,16 @@ pub(crate) mod raw {
         pub powershell: Option<PowerShellFull>,
         pub edge: Option<EdgeFull>,
         pub join: Option<JoinFull>,
+        pub domain_controller: Option<DomainControllerFull>,
+    }
+
+    /// `domain-controller:`.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct DomainControllerFull {
+        pub domain: String,
+        pub netbios: Option<String>,
+        pub safe_mode_password: StringOr<SecretRef>,
     }
 
     /// `join:`.

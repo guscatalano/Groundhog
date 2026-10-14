@@ -4,6 +4,16 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.35.0] - 2026-10-14
+
+### Added
+- **`domain-controller:`**: makes a Windows Server the first domain controller of a new
+  Active Directory forest, with its DNS server, then restarts. One file can set up a whole lab:
+  servers become the domain controller, and clients join it.
+- **`when:` on a whole section or a map entry**, not only on list entries. For example,
+  `domain-controller: { ..., when: { os: server } }` or `join: { domain: { ..., when: { os: client } } }`.
+  A section that `when:` leaves empty is dropped, as if it weren't written.
+
 ## [0.34.0] - 2026-10-14
 
 ### Added

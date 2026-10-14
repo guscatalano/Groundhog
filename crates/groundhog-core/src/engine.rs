@@ -16,10 +16,10 @@ use crate::fetch::{file_name, sha256_hex};
 use crate::loader::LoadedSource;
 use crate::model::{
     App, BitLocker, Capability, CertScope, Certificate, Check, DefenderExclusion, DefenderSetting, DesktopShortcut,
-    DevSetting, EnvScope, Feature, FileCopy, FirefoxExtension, FirewallRule, Groundhogfile, JoinSetting,
-    LanguageSetting, LockScreen, NetSetting, NewTask, PowerKnob, Presence, RegistryData, RegistryValue, RunAction,
-    ScreenSaver, Service, ServiceState, ShellSetting, SshSetting, StartPins, StartupItem, SystemSetting, TaskRule,
-    TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
+    DevSetting, DomainController, EnvScope, Feature, FileCopy, FirefoxExtension, FirewallRule, Groundhogfile,
+    JoinSetting, LanguageSetting, LockScreen, NetSetting, NewTask, PowerKnob, Presence, RegistryData, RegistryValue,
+    RunAction, ScreenSaver, Service, ServiceState, ShellSetting, SshSetting, StartPins, StartupItem, SystemSetting,
+    TaskRule, TaskState, Theme, ThemeMode, TrayIcon, User, Wallpaper,
 };
 use crate::report::Reporter;
 use crate::secret::{self, Redactor};
@@ -94,6 +94,7 @@ pub enum Action {
     DefenderSetting(DefenderSetting),
     BitLocker(BitLocker),
     Join(JoinSetting),
+    DomainController(DomainController),
 }
 
 impl Action {
@@ -233,6 +234,9 @@ fn title(action: &Action) -> String {
         Action::Join(JoinSetting::Domain { name, .. }) => format!("join the {name} domain (after a restart)"),
         Action::Join(JoinSetting::Entra { package, .. }) => format!("join Entra ID with {}", file_name(package)),
         Action::Join(JoinSetting::WorkAccount) => "ask for a work or school account".to_owned(),
+        Action::DomainController(d) => {
+            format!("make this server the domain controller of a new {} domain (restarts)", d.domain)
+        }
         Action::Ssh(s) => match s {
             SshSetting::ServerConfig { values } => {
                 let set: Vec<String> = values.iter().map(|(k, v)| format!("{k} {v}")).collect();
@@ -443,6 +447,8 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     // The machine's own settings next: a new name, like a feature, takes a restart, which is
     // best taken with theirs and before long installs.
     actions.extend(file.system.iter().cloned().map(Action::System));
+    // A domain controller keeps its name for good: promoted after a new name's restart.
+    actions.extend(file.domain_controller.iter().cloned().map(Action::DomainController));
     // Joining after the name, whose restart comes first, so the machine joins under its new name.
     actions.extend(file.join.iter().filter(|j| **j != JoinSetting::WorkAccount).cloned().map(Action::Join));
     actions.extend(file.remove_apps.iter().map(|name| Action::RemoveApp { name: name.clone() }));
@@ -579,6 +585,7 @@ pub fn secrets_in(action: &Action) -> BTreeSet<String> {
         Action::Run(RunAction::Script { args: Some(a), .. }) => vec![a],
         Action::Network(NetSetting::Wifi { password: Some(p), .. }) => vec![p],
         Action::Join(JoinSetting::Domain { password, .. }) => return BTreeSet::from([password.clone()]),
+        Action::DomainController(d) => return BTreeSet::from([d.safe_mode_password.clone()]),
         _ => vec![],
     };
     // Validated when the file was loaded, so a parse error can't happen here.
@@ -613,6 +620,7 @@ pub fn section(action: &Action) -> &'static str {
         Action::DefenderSetting(_) => "defender",
         Action::BitLocker(_) => "bitlocker",
         Action::Join(_) => "join",
+        Action::DomainController(_) => "domain controller",
         Action::User(_) => "users",
         Action::RemoveApp { .. } => "remove apps",
         Action::EnsureWinget | Action::App(_) => "apps",

@@ -215,6 +215,11 @@ impl WinExecutor<'_> {
                 let changed = crate::join::join_entra(j, self.content.fetcher, log)?;
                 Ok(if changed { self.restart_later_if(true) } else { Outcome::Done { changed: false } })
             }
+            Action::DomainController(d) => {
+                // Now, not at the end of the section: everything after expects the domain.
+                let changed = crate::join::promote(d, secret_value(&self.secrets, &d.safe_mode_password)?, log)?;
+                Ok(if changed { Outcome::RebootRequired } else { Outcome::Done { changed: false } })
+            }
             Action::Join(j @ JoinSetting::WorkAccount) => {
                 crate::join::prompt_work_account(j, log).map(|changed| Outcome::Done { changed })
             }
@@ -372,6 +377,7 @@ impl WinExecutor<'_> {
             Action::DefenderSetting(d) => would(crate::security::defender_differs(d)?),
             Action::BitLocker(b) => would(crate::security::bitlocker_differs(b)?),
             Action::Join(j) => would(crate::join::differs(j)?),
+            Action::DomainController(d) => would(crate::join::dc_differs(d)?),
             Action::DefaultApps(map) => would(crate::defaults::differs(map)?),
             Action::Network(n) => would(crate::net::differs(n)?),
             Action::FirefoxExtension(e) => {
