@@ -314,6 +314,22 @@ impl<'a> Loader<'a> {
                  groundhog:quiet-windows sets); set it to 0 in the registry section, or leave work-account out"
             );
         }
+        let named = |key: &str, name: &str, r: &&RegistryValue| {
+            r.key.eq_ignore_ascii_case(key)
+                && r.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name))
+                && r.state.is_present()
+        };
+        if file.registry.iter().any(|r| named(INSIDER_APPLICABILITY, "BranchName", &r))
+            && file
+                .registry
+                .iter()
+                .any(|r| named(DATA_COLLECTION_POLICY, "AllowTelemetry", &r) && r.data != RegistryData::Dword(3))
+        {
+            bail!(
+                "insider: Insider builds need optional diagnostic data, and this file limits it \
+                 (privacy.diagnostic-data, or AllowTelemetry in the registry section)"
+            );
+        }
         Ok(())
     }
 
@@ -555,6 +571,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         join,
         domain_controller,
         windows_365_boot,
+        insider,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -618,6 +635,10 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     if let Some(w) = windows_365_boot {
         resolve_windows_365_boot(w, &mut registry, &mut apps).context("windows-365-boot")?;
     }
+    let insider_run = match insider {
+        Some(i) => resolve_insider(i, &mut registry).context("insider")?,
+        None => Vec::new(),
+    };
     let default_apps = match default_apps {
         Some(d) => resolve_default_apps(d).context("default-apps")?,
         None => BTreeMap::new(),
@@ -644,7 +665,8 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
             }
             raw::RunAction::Full(r) => resolve_run(base, r).with_context(|| format!("run[{i}]")),
         })
-        .collect::<Result<_>>()?;
+        .collect::<Result<Vec<_>>>()?;
+    let run: Vec<RunAction> = run.into_iter().chain(insider_run).collect();
 
     let verify = verify
         .into_iter()
@@ -2606,6 +2628,127 @@ fn resolve_windows_365_boot(
     Ok(())
 }
 
+/// Where Windows keeps the Insider channel Settings picks; Windows Update reads it from here.
+pub const INSIDER_APPLICABILITY: &str = r"HKLM\SOFTWARE\Microsoft\WindowsSelfHost\Applicability";
+const INSIDER_SELECTION: &str = r"HKLM\SOFTWARE\Microsoft\WindowsSelfHost\UI\Selection";
+/// The diagnostic data policy, which Insider builds need at optional.
+pub const DATA_COLLECTION_POLICY: &str = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection";
+
+/// `insider:` as the values Settings writes when it enrolls the machine in a channel (as the
+/// OfflineInsiderEnroll script does, without a Microsoft account), and optional diagnostic data.
+/// Not documented by Microsoft; `off` takes them out again. Returns the commands that let the boot
+/// loader trust Insider builds and have Windows Update look for them now rather than at its next
+/// scheduled scan.
+fn resolve_insider(i: raw::InsiderFull, registry: &mut Vec<RegistryValue>) -> Result<Vec<RunAction>> {
+    let machine = [HiveScope::CurrentUser];
+    let text = |key: &str, name: &str, value: &str| RegistryValue {
+        key: key.to_owned(),
+        name: Some(name.to_owned()),
+        kind: RegistryType::String,
+        data: RegistryData::String(value.to_owned()),
+        scope: machine.to_vec(),
+        state: Presence::Present,
+        group_policy: false,
+    };
+    let custom = i.ring.is_some() || i.content_type.is_some();
+    let branch = match (i.channel, i.branch) {
+        (Some(_), Some(_)) => bail!("give a channel or a branch, not both"),
+        (None, None) => bail!("needs a channel (canary, dev, beta, release-preview or off) or a branch"),
+        (Some(_), None) if custom => bail!("'ring' and 'content-type' go with 'branch'"),
+        (Some(raw::InsiderChannel::Off), None) => None,
+        (Some(c), None) => Some(
+            match c {
+                raw::InsiderChannel::Canary => "CanaryChannel",
+                raw::InsiderChannel::Dev => "Dev",
+                raw::InsiderChannel::Beta => "Beta",
+                raw::InsiderChannel::ReleasePreview => "ReleasePreview",
+                raw::InsiderChannel::Off => unreachable!(),
+            }
+            .to_owned(),
+        ),
+        (None, Some(b)) => Some(b),
+    };
+    let word = |field: &str, v: &str| -> Result<String> {
+        let v = v.trim();
+        if v.is_empty() || !v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+            bail!("{field}: '{v}' isn't a name (letters, digits, _ - .)");
+        }
+        Ok(v.to_owned())
+    };
+    let dwords: [(&str, &str, u32); 7] = [
+        (INSIDER_APPLICABILITY, "EnablePreviewBuilds", 2),
+        (INSIDER_APPLICABILITY, "IsBuildFlightingEnabled", 1),
+        (INSIDER_APPLICABILITY, "IsConfigSettingsFlightingEnabled", 1),
+        (INSIDER_APPLICABILITY, "IsConfigExpFlightingEnabled", 0),
+        (INSIDER_APPLICABILITY, "TestFlags", 32),
+        (INSIDER_APPLICABILITY, "RingId", 11),
+        (INSIDER_SELECTION, "UIOptin", 1),
+    ];
+    let Some(branch) = branch else {
+        let names = dwords.iter().map(|(k, n, _)| (*k, *n)).chain([
+            (INSIDER_APPLICABILITY, "Ring"),
+            (INSIDER_APPLICABILITY, "ContentType"),
+            (INSIDER_APPLICABILITY, "BranchName"),
+            (INSIDER_SELECTION, "UIRing"),
+            (INSIDER_SELECTION, "UIContentType"),
+            (INSIDER_SELECTION, "UIBranch"),
+        ]);
+        for (key, name) in names {
+            let mut v = text(key, name, "");
+            v.state = Presence::Absent;
+            registry.push(v);
+        }
+        // Flight signing stays on: a machine already on an Insider build needs it to start.
+        return Ok(vec![update_scan("check again, out of the Insider program")]);
+    };
+    let branch = word("branch", &branch)?;
+    let ring = word("ring", i.ring.as_deref().unwrap_or("External"))?;
+    let content = word("content-type", i.content_type.as_deref().unwrap_or("Mainline"))?;
+    for (key, name, value) in dwords {
+        registry.push(dword(key, name, value, &machine));
+    }
+    for (key, name, value) in [
+        (INSIDER_APPLICABILITY, "Ring", &ring),
+        (INSIDER_APPLICABILITY, "ContentType", &content),
+        (INSIDER_APPLICABILITY, "BranchName", &branch),
+        (INSIDER_SELECTION, "UIRing", &ring),
+        (INSIDER_SELECTION, "UIContentType", &content),
+        (INSIDER_SELECTION, "UIBranch", &branch),
+    ] {
+        registry.push(text(key, name, value));
+    }
+    let telemetry = |r: &RegistryValue| {
+        r.key.eq_ignore_ascii_case(DATA_COLLECTION_POLICY)
+            && r.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("AllowTelemetry"))
+    };
+    if !registry.iter().any(telemetry) {
+        registry.push(dword(DATA_COLLECTION_POLICY, "AllowTelemetry", 3, &machine));
+    }
+    Ok(vec![command(FLIGHT_SIGNING), update_scan(&format!("look for {branch} builds"))])
+}
+
+/// Insider builds are signed for flighting, which Windows trusts only with flight signing on in
+/// the boot configuration; without it their download fails with 0x800B0109. Takes a restart, with
+/// BitLocker suspended for it so the changed boot configuration doesn't ask for the recovery key.
+const FLIGHT_SIGNING: &str = r"# flight signing, so Windows trusts Insider builds (restarts)
+if (-not (bcdedit /enum '{current}' | Select-String '^flightsigning\s+Yes')) {
+    $os = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
+    if ($os.ProtectionStatus -eq 'On') { Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 1 | Out-Null }
+    bcdedit /set '{current}' flightsigning on
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    exit 3010
+}";
+
+fn command(command: &str) -> RunAction {
+    RunAction::Command { command: command.to_owned(), shell: Shell::Powershell, timeout_ms: None, always: false }
+}
+
+/// A Windows Update scan, as Settings' "Check for updates" starts; the comment names what it's
+/// for (the step's title), so a different channel is a different step and scans again.
+fn update_scan(what: &str) -> RunAction {
+    command(&format!("# Windows Update: {what}\nUsoClient StartInteractiveScan"))
+}
+
 /// A password given as `{ secret: NAME }` or `${secret:NAME}`: never the password itself.
 fn secret_name(v: raw::StringOr<raw::SecretRef>) -> Result<String> {
     let name = match v {
@@ -4150,6 +4293,59 @@ firewall:
         assert_eq!(dedicated.apps.len(), 1);
         assert!(has(&dedicated, "BootToCloudMode") && !has(&dedicated, "18"));
         assert!(load_with(&f, "https://cfg.test/slow.yaml", dir.path()).is_err());
+    }
+
+    #[test]
+    fn insider_channels_and_branches() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/dev.yaml", "insider: { channel: dev }")
+            .with("https://cfg.test/sigma.yaml", "insider: { branch: rs_sigma, ring: Internal }")
+            .with("https://cfg.test/off.yaml", "extends: dev.yaml\ninsider: { channel: off }")
+            .with("https://cfg.test/required.yaml", "extends: dev.yaml\nprivacy: { diagnostic-data: required }")
+            .with("https://cfg.test/both.yaml", "insider: { channel: dev, branch: rs_sigma }")
+            .with("https://cfg.test/ring.yaml", "insider: { channel: beta, ring: Internal }")
+            .with("https://cfg.test/odd.yaml", "insider: { branch: 'rs sigma' }");
+        let dir = tempfile::tempdir().unwrap();
+        let value = |g: &Groundhogfile, name: &str| {
+            g.registry.iter().find(|r| r.name.as_deref() == Some(name)).map(|r| (r.state.is_present(), r.data.clone()))
+        };
+        let text = |s: &str| Some((true, RegistryData::String(s.to_owned())));
+
+        let dev = load_with(&f, "https://cfg.test/dev.yaml", dir.path()).unwrap().file;
+        assert_eq!(value(&dev, "BranchName"), text("Dev"));
+        assert_eq!(value(&dev, "UIBranch"), text("Dev"));
+        assert_eq!(value(&dev, "Ring"), text("External"));
+        assert_eq!(value(&dev, "AllowTelemetry"), Some((true, RegistryData::Dword(3))));
+        let plan = crate::engine::plan(&dev);
+        let scan = plan.iter().position(|s| s.title.starts_with("run: Windows Update: look for")).expect("a scan");
+        assert!(plan[scan].title.contains("Dev builds"));
+        assert!(plan.iter().position(|s| s.title.ends_with("BranchName")).unwrap() < scan, "scans after the values");
+        let signing = plan.iter().position(|s| s.title.contains("flight signing")).expect("flight signing");
+        assert!(signing < scan, "the boot loader trusts the builds before Windows Update downloads one");
+
+        let sigma = load_with(&f, "https://cfg.test/sigma.yaml", dir.path()).unwrap().file;
+        assert_eq!(value(&sigma, "BranchName"), text("rs_sigma"));
+        assert_eq!(value(&sigma, "UIRing"), text("Internal"));
+        assert_eq!(value(&sigma, "ContentType"), text("Mainline"));
+
+        // off takes the values out, and leaves diagnostic data as the base file set it.
+        let off = load_with(&f, "https://cfg.test/off.yaml", dir.path()).unwrap().file;
+        assert_eq!(value(&off, "BranchName").map(|v| v.0), Some(false));
+        assert_eq!(value(&off, "EnablePreviewBuilds").map(|v| v.0), Some(false));
+        assert_eq!(value(&off, "AllowTelemetry"), Some((true, RegistryData::Dword(3))));
+        let commands: Vec<&str> = off
+            .run
+            .iter()
+            .filter_map(|r| match r {
+                RunAction::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(commands.iter().any(|c| c.contains("out of the Insider program")));
+
+        for bad in ["required", "both", "ring", "odd"] {
+            assert!(load_with(&f, &format!("https://cfg.test/{bad}.yaml"), dir.path()).is_err(), "{bad}");
+        }
     }
 
     #[test]

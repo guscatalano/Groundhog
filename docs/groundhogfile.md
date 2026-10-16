@@ -512,6 +512,47 @@ run:
   - '& "$env:ProgramData\groundhog\bin\groundhog-agent.exe" undo C:\setup\w365.groundhog.yaml'
 ```
 
+## `insider`
+
+Puts the machine in a Windows Insider channel, without a Microsoft account, and has Windows
+Update look for its builds now.
+
+```yaml
+insider:
+  channel: dev                       # canary | dev | beta | release-preview | off
+```
+
+Or a branch by name, written as given (instead of `channel`):
+
+```yaml
+insider:
+  branch: rs_sigma
+  ring: External                     # optional (External)
+  content-type: Mainline             # optional (Mainline)
+```
+
+It writes the values Settings writes when it enrolls the machine (under
+`HKLM\SOFTWARE\Microsoft\WindowsSelfHost`, as the OfflineInsiderEnroll script does), and the
+Insider page in Settings shows the channel. They aren't documented by Microsoft, so a Windows
+release can change them. With them:
+- diagnostic data is set to optional, which Insider builds need; a file that limits it
+  (`privacy.diagnostic-data: required`) is refused;
+- flight signing is turned on in the boot configuration, so Windows trusts the builds (without it
+  their download fails with 0x800B0109). That takes a restart, with BitLocker suspended for it;
+  the run continues afterwards with `--reboot`, as with any restart;
+- a Windows Update scan starts, as **Check for updates** would. Windows Update downloads and
+  installs the build like any other update, on its own schedule, and restarts outside active
+  hours.
+
+Whether a branch is offered is up to Windows Update: a name it doesn't serve to the machine finds
+nothing, and the machine stays on its build. A build that is offered installs only on hardware
+its setup accepts: on a processor Windows 11 doesn't list (some virtual machines' CPU models), setup
+stops at "This PC doesn't currently meet Windows 11 system requirements".
+
+`off` (or `undo`) takes the values out, so no more Insider builds are offered. It doesn't take the
+machine back to a release build (that's a reinstall, or waiting for a release to catch up), and
+it leaves flight signing on, which a machine on an Insider build needs to start.
+
 ## `domain-controller`
 
 Makes a Windows Server the first domain controller of a new Active Directory forest, with its

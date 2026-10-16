@@ -4,6 +4,15 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.37.0] - 2026-10-16
+
+### Added
+- **`insider:`**: puts the machine in a Windows Insider channel (`canary`, `dev`, `beta`,
+  `release-preview`), or a branch by name, without a Microsoft account. It writes the values
+  Settings writes, sets diagnostic data to optional, turns on flight signing (one restart, with
+  BitLocker suspended for it) so the builds' download isn't refused, and starts a Windows Update
+  scan, so nothing needs clicking. `channel: off` stops Insider builds.
+
 ## [0.36.0] - 2026-10-14
 
 ### Added

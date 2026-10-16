@@ -1254,6 +1254,27 @@ pub(crate) mod raw {
         pub join: Option<JoinFull>,
         pub domain_controller: Option<DomainControllerFull>,
         pub windows_365_boot: Option<Windows365BootFull>,
+        pub insider: Option<InsiderFull>,
+    }
+
+    /// `insider:`: a Windows Insider channel, or a branch by name.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct InsiderFull {
+        pub channel: Option<InsiderChannel>,
+        pub branch: Option<String>,
+        pub ring: Option<String>,
+        pub content_type: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum InsiderChannel {
+        Canary,
+        Dev,
+        Beta,
+        ReleasePreview,
+        Off,
     }
 
     /// `windows-365-boot:`.
