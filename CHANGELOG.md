@@ -4,6 +4,24 @@ What changed in each release, written for people using Groundhog. The release wo
 publishes each version's section below as its GitHub release notes, and refuses to publish a
 version that has no section here.
 
+## [0.38.0] - 2026-10-17
+
+### Added
+- **`onedrive: { sync: false, folder-backup: false }`**: OneDrive's Group Policy settings, so it
+  doesn't sync (or start) for any account, and it never asks to back up the known folders.
+- **`domain-controller: passwords-expire: false`**: the domain's passwords never expire. The step
+  writes it into the Default Domain Policy itself, which domain controllers otherwise put back
+  over any other change. It checks the policy on every apply.
+- **`boot:`**: switches in the boot configuration: `test-signing`, `flight-signing`,
+  `integrity-checks`, `kernel-debug` and `hypervisor`. Each changes only when it differs, then
+  restarts (with BitLocker suspended for that restart) and the run continues. With Secure Boot on,
+  the switches it protects stop with a message saying to turn it off in the firmware first.
+- **`desktop: build-version: true`**: the edition and build number in the desktop's corner, per
+  user. Explorer is restarted so the agent's own account shows it at once.
+- **`privacy: diagnostic-data: off`**: the "Diagnostic data off" level, next to `required` and
+  `optional`. Only Enterprise, Education, Server and IoT editions honor it; Home and Pro send
+  required diagnostic data instead.
+
 ## [0.37.0] - 2026-10-16
 
 ### Added

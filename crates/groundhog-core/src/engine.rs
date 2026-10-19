@@ -496,12 +496,13 @@ pub fn plan_with_secrets(file: &Groundhogfile, fingerprint: &dyn Fn(&str) -> Opt
     for f in file.files.iter().filter(|f| f.to == crate::loader::TASKBAR_POLICY_FILE) {
         shows.push_str(f.content.as_deref().unwrap_or_default());
     }
-    let desktop = |k: &str| {
-        k == crate::loader::DESKTOP_ICONS_KEY
-            || k == crate::loader::DESKTOP_VIEW_KEY
-            || k == crate::loader::TASKBAR_DEVELOPER_KEY
+    let desktop = |r: &RegistryValue| {
+        r.key == crate::loader::DESKTOP_ICONS_KEY
+            || r.key == crate::loader::DESKTOP_VIEW_KEY
+            || r.key == crate::loader::TASKBAR_DEVELOPER_KEY
+            || (r.key == crate::loader::DESKTOP_KEY && r.name.as_deref() == Some(crate::loader::BUILD_VERSION))
     };
-    for r in file.registry.iter().filter(|r| desktop(&r.key)) {
+    for r in file.registry.iter().filter(|r| desktop(r)) {
         shows.push_str(&format!("{}={:?};", r.name.as_deref().unwrap_or_default(), r.data));
     }
     if !shows.is_empty() {

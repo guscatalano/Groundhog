@@ -1255,6 +1255,27 @@ pub(crate) mod raw {
         pub domain_controller: Option<DomainControllerFull>,
         pub windows_365_boot: Option<Windows365BootFull>,
         pub insider: Option<InsiderFull>,
+        pub boot: Option<BootFull>,
+        pub onedrive: Option<OneDriveFull>,
+    }
+
+    /// `onedrive:`: whether OneDrive syncs, and whether it asks to back up the known folders.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct OneDriveFull {
+        pub sync: Option<bool>,
+        pub folder_backup: Option<bool>,
+    }
+
+    /// `boot:`: switches in the boot configuration (bcdedit) of the Windows that's running.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    pub struct BootFull {
+        pub test_signing: Option<bool>,
+        pub flight_signing: Option<bool>,
+        pub integrity_checks: Option<bool>,
+        pub kernel_debug: Option<bool>,
+        pub hypervisor: Option<bool>,
     }
 
     /// `insider:`: a Windows Insider channel, or a branch by name.
@@ -1300,6 +1321,8 @@ pub(crate) mod raw {
         pub domain: String,
         pub netbios: Option<String>,
         pub safe_mode_password: StringOr<SecretRef>,
+        /// `false`: the domain's passwords never expire (the Default Domain Policy's 42 days).
+        pub passwords_expire: Option<bool>,
     }
 
     /// `join:`.
@@ -1457,6 +1480,8 @@ pub(crate) mod raw {
     #[derive(Debug, Clone, Copy, Deserialize)]
     #[serde(rename_all = "kebab-case")]
     pub enum DiagnosticData {
+        /// Security: honored on Enterprise, Education, Server and IoT; other editions send required.
+        Off,
         Required,
         Optional,
     }
@@ -1769,6 +1794,7 @@ pub(crate) mod raw {
         pub notifications: Option<NotificationsFull>,
         pub tray: Option<TrayFull>,
         pub icons: Option<IconsFull>,
+        pub build_version: Option<bool>,
         pub scope: Option<OneOrMany<HiveScope>>,
     }
 

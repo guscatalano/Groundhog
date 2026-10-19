@@ -553,6 +553,32 @@ stops at "This PC doesn't currently meet Windows 11 system requirements".
 machine back to a release build (that's a reinstall, or waiting for a release to catch up), and
 it leaves flight signing on, which a machine on an Insider build needs to start.
 
+## `boot`
+
+Switches in the boot configuration of the Windows that's running (`bcdedit /set {current} …`).
+
+```yaml
+boot:
+  test-signing: true        # load drivers signed with a test certificate
+  flight-signing: true      # trust Insider (flight) signed builds and drivers
+  integrity-checks: false   # load unsigned drivers (nointegritychecks)
+  kernel-debug: true        # the kernel debugger (debug on; set it up with bcdedit /dbgsettings)
+  hypervisor: false         # don't start the hypervisor: no Hyper-V, WSL 2, Sandbox or VBS
+```
+
+Each is a step that reads the current value and changes it only when it differs. A change takes
+effect at the next start, so the step restarts the machine (with BitLocker suspended for that
+restart, so the changed boot configuration doesn't ask for the recovery key) and the run continues
+afterwards with `--reboot`, as with any restart. A switch left out is left alone.
+
+**Secure Boot** refuses the three that weaken it: `test-signing: true`, `integrity-checks:
+false` and `kernel-debug: true`. With Secure Boot on, those steps fail with a message saying to
+turn it off in the firmware (UEFI) settings first; Groundhog can't do that. Turning them back
+the other way always works. With test signing on, Windows shows "Test Mode" on the desktop.
+
+`flight-signing: false` together with `insider` (other than `off`) is refused, since Insider
+builds need it.
+
 ## `domain-controller`
 
 Makes a Windows Server the first domain controller of a new Active Directory forest, with its
@@ -563,6 +589,7 @@ domain-controller:
   domain: lab.example.com                  # a full DNS name; a single label like 'lab' isn't supported
   netbios: LAB                             # optional: the first label, upper-cased
   safe-mode-password: { secret: DSRM_PASSWORD }   # Directory Services Restore Mode
+  passwords-expire: false                  # optional: the domain's passwords never expire
   when: { os: server }
 ```
 
@@ -589,6 +616,17 @@ join:
 The server's local accounts become the domain's: its Administrator is `LAB\Administrator`, with
 the same password. Clients join it once they can find it, so give them the domain controller's
 address as their DNS server (`network.dns`). `undo` doesn't demote a domain controller.
+
+A new forest's Default Domain Policy makes every domain password expire after 42 days, which then
+has to be changed at the next sign-in: a lab's accounts, the Administrator among them, are made
+to pick new passwords every few weeks. `passwords-expire: false` writes "never" into that
+policy, and `true` puts back the 42 days. It has to be the Default Domain Policy itself: domain
+controllers put its password age back over a change made anywhere else
+(`Set-ADDefaultDomainPasswordPolicy`, `net accounts`, a member's local policy), which is why the
+prompt keeps coming back. The step runs after the promotion's restart, waits for Active
+Directory to answer, and runs again on every apply; it changes nothing when the policy already
+says so. Passwords that had already expired stop being expired at once. A password set to be
+changed at the next sign-in (by "User must change password at next logon") still is.
 
 ## `features` and `capabilities`
 
@@ -937,6 +975,7 @@ desktop:
       - { name: Logs, target: '%SystemRoot%\explorer.exe', args: 'C:\Logs', icon: '%SystemRoot%\System32\shell32.dll,4' }
     remove: [Microsoft Edge]        # shortcuts taken off, by name
     auto-arrange: true              # the default when icons are set here
+  build-version: true               # the edition and build number in the desktop's corner
   scope: [current-user, default-user]
 ```
 
@@ -995,6 +1034,11 @@ on the desktop every account shares (`C:\Users\Public\Desktop`), with `%VARS%` i
 desktop. Removing `Microsoft Edge` also sets Edge's update policy that otherwise puts the
 shortcut back at each Edge update. With icons coming and going, the desktop is set to
 auto-arrange them in order (`auto-arrange: false` to keep them where they are).
+
+**`build-version: true`** writes the edition and build number (for example "Windows 11 Pro
+Build 26220") in the desktop's lower right corner, per user, as `PaintDesktopVersion` does.
+Explorer paints it from its next start, so for the agent's own account Explorer is restarted
+along with the icons; other accounts see it at their next sign-in. `false` takes it off again.
 
 **Start's pinned apps** come from a layout file. Windows 11 takes a pin *list* only from MDM
 (Intune and the like): it ignores one written as a policy or into the Default profile, and
@@ -1285,7 +1329,7 @@ privacy:
     microphone: true
     contacts: false                  # also: calendar, call-history, email, messaging, radios,
                                      # documents, pictures, videos, file-system, account-info
-  diagnostic-data: required          # required | optional
+  diagnostic-data: required          # off | required | optional
   activity-history: false
   advertising-id: false
   inking-and-typing: false           # sending inking and typing data to Microsoft
@@ -1299,6 +1343,32 @@ Each is the machine-wide value Settings or Group Policy writes, so it's the same
 account and, where it's a policy, Settings shows it as managed by your organization. `app-access`
 is the machine's switch for each permission: `false` turns it off for every app and account,
 `true` lets each account decide. A later file overrides the settings it names.
+
+`diagnostic-data` is the level of diagnostic data Windows sends Microsoft, as the "Allow
+diagnostic data" policy sets it (`AllowTelemetry`), and Settings then shows the level as managed:
+- `optional`: required plus what Microsoft uses to improve Windows (browsing, app and feature use,
+  more crash data). Insider builds need it, so `insider` sets it, and refuses a file that lowers it;
+- `required`: what Microsoft says keeps Windows secure and up to date (device, update and basic
+  error data);
+- `off` ("Diagnostic data off", formerly Security): only on Enterprise, Education, Server and IoT
+  editions. Home and Pro treat it as `required`, and Windows Update for Business reports and other
+  services that rely on the data stop working.
+
+## `onedrive`
+
+```yaml
+onedrive:
+  sync: false               # OneDrive doesn't sync, or start, for any account
+  folder-backup: false      # it never asks to back up Desktop, Documents and Pictures
+```
+
+Both are OneDrive's own Group Policy settings, for the whole machine, and OneDrive's updates
+leave them alone. `sync: false` leaves OneDrive installed but unused: it stops running the next
+time it starts (sign out and back in, or restart). Files already synced stay where they are, in
+the OneDrive folder, and are no longer kept in sync. `folder-backup: false` keeps OneDrive
+syncing but stops its prompts to back up the known folders, and stops anyone turning that on.
+`true` turns either one back. To take OneDrive off the machine instead, use
+`remove-apps: [OneDrive]`.
 
 ## `startup` and `scheduled-tasks`
 

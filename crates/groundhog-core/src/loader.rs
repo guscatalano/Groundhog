@@ -572,6 +572,8 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
         domain_controller,
         windows_365_boot,
         insider,
+        boot,
+        onedrive,
         ..
     } = raw;
     let requires_agent = agent.as_deref().map(update::parse_requirement).transpose()?;
@@ -624,6 +626,8 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     let defender = defender.map(resolve_defender).transpose().context("defender")?.unwrap_or_default();
     let bitlocker = bitlocker.map(resolve_bitlocker).transpose().context("bitlocker")?;
     let join = join.map(|j| resolve_join(base, j)).transpose().context("join")?.unwrap_or_default();
+    let dc_run: Vec<RunAction> =
+        domain_controller.as_ref().and_then(|d| d.passwords_expire).map(domain_password_age).into_iter().collect();
     let domain_controller =
         domain_controller.map(resolve_domain_controller).transpose().context("domain-controller")?;
     if let Some(p) = privacy {
@@ -632,9 +636,17 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
     if let Some(e) = edge {
         resolve_edge(e, &mut registry).context("edge")?;
     }
+    if let Some(o) = onedrive {
+        resolve_onedrive(o, &mut registry).context("onedrive")?;
+    }
     if let Some(w) = windows_365_boot {
         resolve_windows_365_boot(w, &mut registry, &mut apps).context("windows-365-boot")?;
     }
+    let insider_on = insider.as_ref().is_some_and(|i| i.channel != Some(raw::InsiderChannel::Off));
+    let boot_run = match boot {
+        Some(b) => resolve_boot(b, insider_on).context("boot")?,
+        None => Vec::new(),
+    };
     let insider_run = match insider {
         Some(i) => resolve_insider(i, &mut registry).context("insider")?,
         None => Vec::new(),
@@ -666,7 +678,7 @@ fn resolve(base: &Url, raw: raw::File) -> Result<Groundhogfile> {
             raw::RunAction::Full(r) => resolve_run(base, r).with_context(|| format!("run[{i}]")),
         })
         .collect::<Result<Vec<_>>>()?;
-    let run: Vec<RunAction> = run.into_iter().chain(insider_run).collect();
+    let run: Vec<RunAction> = run.into_iter().chain(dc_run).chain(boot_run).chain(insider_run).collect();
 
     let verify = verify
         .into_iter()
@@ -1193,6 +1205,9 @@ fn resolve_desktop(base: &Url, d: raw::Desktop) -> Result<DesktopParts> {
     let mut shortcuts = Vec::new();
     if let Some(i) = d.icons {
         resolve_icons(i, &scope, &mut registry, &mut shortcuts).context("icons")?;
+    }
+    if let Some(on) = d.build_version {
+        registry.push(dword(DESKTOP_KEY, BUILD_VERSION, u32::from(on), &scope));
     }
 
     Ok(DesktopParts {
@@ -2441,6 +2456,7 @@ fn resolve_privacy(p: raw::PrivacyFull, registry: &mut Vec<RegistryValue>) -> Re
     let policies = r"HKLM\SOFTWARE\Policies\Microsoft";
     if let Some(d) = p.diagnostic_data {
         let level = match d {
+            raw::DiagnosticData::Off => 0,
             raw::DiagnosticData::Required => 1,
             raw::DiagnosticData::Optional => 3,
         };
@@ -2581,6 +2597,78 @@ fn resolve_domain_controller(d: raw::DomainControllerFull) -> Result<DomainContr
     let safe_mode_password = secret_name(d.safe_mode_password).context("safe-mode-password")?;
     Ok(DomainController { domain, netbios, safe_mode_password })
 }
+
+/// `domain-controller: passwords-expire:` as a step that writes the maximum password age into the
+/// Default Domain Policy itself, since a domain controller puts that policy back over a change
+/// made anywhere else (`Set-ADDefaultDomainPasswordPolicy`, `net accounts`). It runs on every
+/// apply and changes nothing when the policy already says so.
+fn domain_password_age(expire: bool) -> RunAction {
+    // -1 is "never" in a security template; 42 days is the policy a new forest starts with.
+    let (what, days) = if expire { ("expire after 42 days", "42") } else { ("never expire", "-1") };
+    let script = DOMAIN_PASSWORD_AGE.replace("<what>", what).replace("<days>", days);
+    RunAction::Command { command: script, shell: Shell::Powershell, timeout_ms: None, always: true }
+}
+
+const DOMAIN_PASSWORD_AGE: &str = r#"# domain passwords <what>
+$ErrorActionPreference = 'Stop'
+if ((Get-CimInstance Win32_ComputerSystem).DomainRole -lt 4) { throw 'this server isn''t a domain controller' }
+Import-Module ActiveDirectory
+# Active Directory takes a few minutes to answer after the restart that made this a domain controller.
+for ($i = 0; -not $d; $i++) {
+    try { $d = Get-ADDomain } catch { if ($i -ge 30) { throw }; Start-Sleep 10 }
+}
+$want = <days>
+function Applied {
+    $age = (Get-ADDefaultDomainPasswordPolicy).MaxPasswordAge
+    if ($want -lt 0) { $age -le [TimeSpan]::Zero } else { $age.TotalDays -eq $want }
+}
+$guid = '{31B2F340-016D-11D2-945F-00C04FB984F9}'   # the Default Domain Policy, in every domain
+$sysvol = (Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters).SysVol
+$gpt = Join-Path $sysvol "$($d.DNSRoot)\Policies\$guid"
+$inf = "$gpt\MACHINE\Microsoft\Windows NT\SecEdit\GptTmpl.inf"
+$text = [IO.File]::ReadAllText($inf)
+$line = "MaximumPasswordAge = $want"
+if ($text -match "(?m)^MaximumPasswordAge\s*=\s*$want\s*$") {
+    if (Applied) { exit 0 }
+} else {
+    if ($text -match '(?m)^MaximumPasswordAge\s*=') {
+        $text = $text -replace '(?m)^MaximumPasswordAge\s*=[^\r\n]*', $line
+    } elseif ($text -match '(?m)^\[System Access\]') {
+        $text = $text -replace '(?m)^\[System Access\][^\r\n]*', "[System Access]`r`n$line"
+    } else {
+        $text = $text.TrimEnd() + "`r`n[System Access]`r`n$line`r`n"
+    }
+    [IO.File]::WriteAllText($inf, $text, [Text.Encoding]::Unicode)
+    # A new version is how domain controllers and members know the policy changed.
+    $ini = "$gpt\GPT.INI"
+    $lines = Get-Content $ini
+    $version = [int](($lines | Select-String '^Version=(\d+)').Matches[0].Groups[1].Value) + 1
+    $lines -replace '^Version=\d+', "Version=$version" | Set-Content $ini -Encoding Ascii
+    Set-ADObject "CN=$guid,CN=Policies,CN=System,$($d.DistinguishedName)" -Replace @{ versionNumber = $version }
+}
+gpupdate /target:computer /force | Out-Null
+if (-not (Applied)) { throw 'the Default Domain Policy says so, but the domain''s password policy didn''t follow it' }
+'the Default Domain Policy now has domain passwords <what>'"#;
+
+/// `onedrive:` as OneDrive's Group Policy values: `sync: false` stops it syncing (and starting)
+/// for every account; `folder-backup: false` stops it asking to back up Desktop, Documents and
+/// Pictures.
+fn resolve_onedrive(o: raw::OneDriveFull, registry: &mut Vec<RegistryValue>) -> Result<()> {
+    let machine = [HiveScope::CurrentUser];
+    if o.sync.is_none() && o.folder_backup.is_none() {
+        bail!("needs sync or folder-backup");
+    }
+    if let Some(on) = o.sync {
+        registry.push(dword(ONEDRIVE_SYNC_POLICY, "DisableFileSyncNGSC", u32::from(!on), &machine));
+    }
+    if let Some(on) = o.folder_backup {
+        registry.push(dword(ONEDRIVE_POLICY, "KFMBlockOptIn", u32::from(!on), &machine));
+    }
+    Ok(())
+}
+
+const ONEDRIVE_SYNC_POLICY: &str = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive";
+const ONEDRIVE_POLICY: &str = r"HKLM\SOFTWARE\Policies\Microsoft\OneDrive";
 
 /// Windows App, which Windows 365 Boot signs in to the Cloud PC with: winget's package, and
 /// the Microsoft Store's.
@@ -2724,20 +2812,83 @@ fn resolve_insider(i: raw::InsiderFull, registry: &mut Vec<RegistryValue>) -> Re
     if !registry.iter().any(telemetry) {
         registry.push(dword(DATA_COLLECTION_POLICY, "AllowTelemetry", 3, &machine));
     }
-    Ok(vec![command(FLIGHT_SIGNING), update_scan(&format!("look for {branch} builds"))])
+    Ok(vec![flight_signing_for_insider(), update_scan(&format!("look for {branch} builds"))])
 }
 
 /// Insider builds are signed for flighting, which Windows trusts only with flight signing on in
-/// the boot configuration; without it their download fails with 0x800B0109. Takes a restart, with
-/// BitLocker suspended for it so the changed boot configuration doesn't ask for the recovery key.
-const FLIGHT_SIGNING: &str = r"# flight signing, so Windows trusts Insider builds (restarts)
-if (-not (bcdedit /enum '{current}' | Select-String '^flightsigning\s+Yes')) {
-    $os = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
-    if ($os.ProtectionStatus -eq 'On') { Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 1 | Out-Null }
-    bcdedit /set '{current}' flightsigning on
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    exit 3010
-}";
+/// the boot configuration; without it their download fails with 0x800B0109.
+fn flight_signing_for_insider() -> RunAction {
+    bcd_switch("flight signing, so Windows trusts Insider builds", "flightsigning", "on", false)
+}
+
+/// `boot:`, each switch a step that changes the boot configuration only when it differs, and
+/// then restarts (exit 3010), with BitLocker suspended for that restart.
+fn resolve_boot(b: raw::BootFull, insider_on: bool) -> Result<Vec<RunAction>> {
+    if insider_on && b.flight_signing == Some(false) {
+        bail!("'flight-signing: false' would stop the Insider builds 'insider' asks for from installing");
+    }
+    let on = |yes: bool| if yes { "on" } else { "off" };
+    let mut out = Vec::new();
+    if let Some(yes) = b.test_signing {
+        out.push(bcd_switch(&format!("test signing {}", on(yes)), "testsigning", on(yes), yes));
+    }
+    if let Some(yes) = b.flight_signing {
+        out.push(bcd_switch(&format!("flight signing {}", on(yes)), "flightsigning", on(yes), false));
+    }
+    if let Some(yes) = b.integrity_checks {
+        let what = format!("driver signature checks {}", on(yes));
+        out.push(bcd_switch(&what, "nointegritychecks", on(!yes), !yes));
+    }
+    if let Some(yes) = b.kernel_debug {
+        out.push(bcd_switch(&format!("kernel debugging {}", on(yes)), "debug", on(yes), yes));
+    }
+    if let Some(yes) = b.hypervisor {
+        let what = format!("hypervisor {}", on(yes));
+        out.push(bcd_switch(&what, "hypervisorlaunchtype", if yes { "auto" } else { "off" }, false));
+    }
+    if out.is_empty() {
+        bail!("needs at least one of test-signing, flight-signing, integrity-checks, kernel-debug, hypervisor");
+    }
+    Ok(out)
+}
+
+/// One boot configuration element of the running Windows set to `value` (bcdedit shows on/off as
+/// Yes/No, and an element not there as off). Secure Boot refuses the ones that weaken it
+/// (`secure_boot`): the step says so instead of failing on bcdedit's error.
+fn bcd_switch(what: &str, element: &str, value: &str, secure_boot: bool) -> RunAction {
+    let shown = match value {
+        "on" => "Yes",
+        "off" => "No",
+        "auto" => "Auto",
+        other => other,
+    };
+    // An element bcdedit doesn't list is at its default, which is off for all of these.
+    let unset = if value == "off" { "$true" } else { "$false" };
+    let guard = if secure_boot { SECURE_BOOT_GUARD } else { "" };
+    let script = BCD_SWITCH
+        .replace("<guard>", guard)
+        .replace("<what>", what)
+        .replace("<element>", element)
+        .replace("<value>", value)
+        .replace("<shown>", shown)
+        .replace("<unset>", unset);
+    command(&script)
+}
+
+const BCD_SWITCH: &str = r"# <what> (restarts)
+$now = bcdedit /enum '{current}' | Select-String '^<element>\s+(\S+)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+if ($now -eq '<shown>' -or (-not $now -and <unset>)) { exit 0 }
+<guard>$os = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
+if ($os.ProtectionStatus -eq 'On') { Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 1 | Out-Null }
+bcdedit /set '{current}' <element> <value>
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+exit 3010";
+
+const SECURE_BOOT_GUARD: &str = r"if ((Confirm-SecureBootUEFI -ErrorAction SilentlyContinue) -eq $true) {
+    Write-Error 'Secure Boot is on, and it doesn''t allow <what>: turn Secure Boot off in the firmware (UEFI) settings first'
+    exit 1
+}
+";
 
 fn command(command: &str) -> RunAction {
     RunAction::Command { command: command.to_owned(), shell: Shell::Powershell, timeout_ms: None, always: false }
@@ -3213,6 +3364,9 @@ fn new_task(n: raw::NewTaskFull) -> Result<NewTask> {
 /// Where Explorer keeps which of Windows' own icons the desktop shows (0 shown, 1 hidden).
 pub(crate) const DESKTOP_ICONS_KEY: &str =
     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel";
+/// The edition and build in the desktop's corner, which Explorer paints from its next start.
+pub(crate) const DESKTOP_KEY: &str = r"HKCU\Control Panel\Desktop";
+pub(crate) const BUILD_VERSION: &str = "PaintDesktopVersion";
 /// The desktop's view settings (auto-arrange, align to grid), read when Explorer starts.
 pub(crate) const DESKTOP_VIEW_KEY: &str = r"HKCU\Software\Microsoft\Windows\Shell\Bags\1\Desktop";
 
@@ -4176,6 +4330,7 @@ firewall:
                 "https://cfg.test/p.yaml",
                 "privacy:\n  app-access: { location: false, Camera: true }\n  diagnostic-data: required\n  activity-history: false\n  advertising-id: false\n  recall: false",
             )
+            .with("https://cfg.test/off.yaml", "extends: p.yaml\nprivacy: { diagnostic-data: off }")
             .with("https://cfg.test/bad.yaml", "privacy: { app-access: { telepathy: false } }")
             .with("https://cfg.test/empty.yaml", "privacy: {}");
         let dir = tempfile::tempdir().unwrap();
@@ -4189,7 +4344,35 @@ firewall:
         assert_eq!(value(r"Windows\System", "PublishUserActivities"), Some(RegistryData::Dword(0)));
         assert_eq!(value("AdvertisingInfo", "DisabledByGroupPolicy"), Some(RegistryData::Dword(1)));
         assert_eq!(value("WindowsAI", "DisableAIDataAnalysis"), Some(RegistryData::Dword(1)));
+        let off = load_with(&f, "https://cfg.test/off.yaml", dir.path()).unwrap().file;
+        let telemetry = off.registry.iter().find(|r| r.name.as_deref() == Some("AllowTelemetry")).unwrap();
+        assert_eq!(telemetry.data, RegistryData::Dword(0), "a later file's level wins");
         assert!(load_with(&f, "https://cfg.test/bad.yaml", dir.path()).is_err());
+        assert!(load_with(&f, "https://cfg.test/empty.yaml", dir.path()).is_err());
+    }
+
+    #[test]
+    fn onedrive_settings() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/o.yaml", "onedrive: { sync: false, folder-backup: false }")
+            .with("https://cfg.test/on.yaml", "extends: o.yaml\nonedrive: { sync: true }")
+            .with("https://cfg.test/empty.yaml", "onedrive: {}");
+        let dir = tempfile::tempdir().unwrap();
+        let value = |url: &str, name: &str| {
+            let g = load_with(&f, url, dir.path()).unwrap().file;
+            g.registry.iter().find(|r| r.name.as_deref() == Some(name)).map(|r| (r.key.clone(), r.data.clone()))
+        };
+        assert_eq!(
+            value("https://cfg.test/o.yaml", "DisableFileSyncNGSC"),
+            Some((r"HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive".into(), RegistryData::Dword(1)))
+        );
+        assert_eq!(
+            value("https://cfg.test/o.yaml", "KFMBlockOptIn"),
+            Some((r"HKLM\SOFTWARE\Policies\Microsoft\OneDrive".into(), RegistryData::Dword(1)))
+        );
+        let on = value("https://cfg.test/on.yaml", "DisableFileSyncNGSC").unwrap();
+        assert_eq!(on.1, RegistryData::Dword(0), "a later file's word wins");
+        assert!(value("https://cfg.test/on.yaml", "KFMBlockOptIn").is_some(), "and the rest stays");
         assert!(load_with(&f, "https://cfg.test/empty.yaml", dir.path()).is_err());
     }
 
@@ -4229,7 +4412,7 @@ firewall:
 
     #[test]
     fn domain_controller_on_servers_and_joining_it_on_clients() {
-        let one_file = "domain-controller:\n  domain: Lab.Example.com\n  safe-mode-password: { secret: DSRM_PW }\n  when: { os: server }\n\
+        let one_file = "domain-controller:\n  domain: Lab.Example.com\n  safe-mode-password: { secret: DSRM_PW }\n  passwords-expire: false\n  when: { os: server }\n\
                         join:\n  domain: { name: lab.example.com, user: 'LAB\\Administrator', password: { secret: JOIN_PW }, when: { os: client } }";
         let f = MapFetcher::default()
             .with("https://cfg.test/lab.yaml", one_file)
@@ -4261,8 +4444,12 @@ firewall:
         );
         assert!(server.join.is_empty());
         assert!(required_secrets(&server).contains("DSRM_PW"));
+        let [RunAction::Command { command, always: true, .. }] = &server.run[..] else { panic!("{:?}", server.run) };
+        assert!(command.starts_with("# domain passwords never expire\n"), "{command}");
+        assert!(command.contains("$want = -1\n") && command.contains("GptTmpl.inf"));
         let client = load("client", "https://cfg.test/lab.yaml").unwrap().file;
         assert!(client.domain_controller.is_none());
+        assert!(client.run.is_empty(), "the policy step goes with the section");
         assert!(matches!(&client.join[..], [JoinSetting::Domain { .. }]));
 
         for bad in ["both", "single", "longnb"] {
@@ -4344,6 +4531,44 @@ firewall:
         assert!(commands.iter().any(|c| c.contains("out of the Insider program")));
 
         for bad in ["required", "both", "ring", "odd"] {
+            assert!(load_with(&f, &format!("https://cfg.test/{bad}.yaml"), dir.path()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn boot_switches() {
+        let f = MapFetcher::default()
+            .with(
+                "https://cfg.test/dev.yaml",
+                "boot: { test-signing: true, integrity-checks: false, kernel-debug: false, hypervisor: false }",
+            )
+            .with("https://cfg.test/insider.yaml", "insider: { channel: dev }\nboot: { flight-signing: false }")
+            .with("https://cfg.test/empty.yaml", "boot: {}");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/dev.yaml", dir.path()).unwrap().file;
+        let commands: Vec<&str> = g
+            .run
+            .iter()
+            .filter_map(|r| match r {
+                RunAction::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commands.len(), 4);
+        let test = commands[0];
+        assert!(test.starts_with("# test signing on (restarts)\n"));
+        assert!(test.contains("bcdedit /set '{current}' testsigning on\n"));
+        assert!(test.contains("if ($now -eq 'Yes' -or (-not $now -and $false)) { exit 0 }"));
+        assert!(test.contains("Confirm-SecureBootUEFI") && test.contains("doesn''t allow test signing on"));
+        assert!(commands[1].contains("nointegritychecks on") && commands[1].contains("Confirm-SecureBootUEFI"));
+        // Turning a switch off is never refused by Secure Boot, and an unlisted element is off.
+        assert!(!commands[2].contains("Confirm-SecureBootUEFI"));
+        assert!(commands[2].contains("(-not $now -and $true)"));
+        assert!(commands[3].contains("hypervisorlaunchtype off"));
+        let plan = crate::engine::plan(&g);
+        assert!(plan.iter().any(|s| s.title == "run: test signing on (restarts)"));
+
+        for bad in ["insider", "empty"] {
             assert!(load_with(&f, &format!("https://cfg.test/{bad}.yaml"), dir.path()).is_err(), "{bad}");
         }
     }
@@ -4694,6 +4919,20 @@ firewall:
 
         let bad = MapFetcher::default().with("https://cfg.test/b.yaml", "desktop: { icons: { remove: ['a/b'] } }");
         assert!(load_with(&bad, "https://cfg.test/b.yaml", dir.path()).is_err());
+    }
+
+    #[test]
+    fn desktop_build_version() {
+        let f = MapFetcher::default()
+            .with("https://cfg.test/v.yaml", "desktop:\n  build-version: true\n  scope: [current-user, default-user]");
+        let dir = tempfile::tempdir().unwrap();
+        let g = load_with(&f, "https://cfg.test/v.yaml", dir.path()).unwrap().file;
+        let v = g.registry.iter().find(|r| r.name.as_deref() == Some(BUILD_VERSION)).unwrap();
+        assert_eq!((v.key.as_str(), &v.data), (DESKTOP_KEY, &RegistryData::Dword(1)));
+        assert_eq!(v.scope, [HiveScope::CurrentUser, HiveScope::DefaultUser]);
+        // Explorer paints it from its next start: the one restart shows it now.
+        let plan = crate::engine::plan(&g);
+        assert!(plan.iter().any(|s| s.title.starts_with("restart Explorer")));
     }
 
     #[test]
